@@ -24,6 +24,7 @@ internal static partial class Program
         Run(nameof(ConcurrentDuplicateStagesAreSafe), ConcurrentDuplicateStagesAreSafe);
         Run(nameof(BlobPublishReadVerifyRoundTrip), BlobPublishReadVerifyRoundTrip);
         Run(nameof(PartialFinalBlobIsNeverVisible), PartialFinalBlobIsNeverVisible);
+        Run(nameof(DurableAuthorityIdsUseUuidV7Layout), DurableAuthorityIdsUseUuidV7Layout);
         Run(nameof(PendingTransactionIsDurableAndIdempotent), PendingTransactionIsDurableAndIdempotent);
         Run(nameof(SuccessfulTransactionCommitsMutationEventPointerAndMaterialization), SuccessfulTransactionCommitsMutationEventPointerAndMaterialization);
         Run(nameof(EveryPreCommitFaultRollsBackAuthorityMutation), EveryPreCommitFaultRollsBackAuthorityMutation);
@@ -135,6 +136,24 @@ internal static partial class Program
             () => project.BlobStore.Stage(source),
             "The injected streaming interruption was not observed.");
         AssertEqual(0L, CountFinalBlobs(project.BlobStore.ObjectsRoot), "A partial final blob became visible.");
+    }
+
+    private static void DurableAuthorityIdsUseUuidV7Layout()
+    {
+        using var project = Wp03Project.Create();
+        project.CreateAuthorityFixture();
+        var staged = Stage(project.BlobStore, BlobPayload);
+        var handle = project.Coordinator.Begin("test", "uuid-v7-key");
+
+        var persistedTransactionId = project.Scalar<string>(
+            "SELECT transaction_id FROM authority_transactions WHERE idempotency_key='uuid-v7-key';");
+        AssertEqual(handle.TransactionId, persistedTransactionId, "The returned transaction identity was not persisted.");
+        AssertUuidV7(persistedTransactionId, "Durable Authority transaction ID");
+
+        project.Coordinator.Commit(handle, CreateCommitRequest(project, staged.Digest), InsertFixtureMutation);
+        var materializationEventId = project.Scalar<string>(
+            "SELECT event_id FROM authority_events WHERE event_type='wp03.materialization_plan';");
+        AssertUuidV7(materializationEventId, "Durable Authority event ID");
     }
 
     private static void PendingTransactionIsDurableAndIdempotent()
@@ -560,6 +579,14 @@ internal static partial class Program
     {
         return Directory.EnumerateFiles(objectsRoot, "*", SearchOption.AllDirectories)
             .LongCount(path => !Path.GetFileName(path).StartsWith(".tmp-", StringComparison.Ordinal));
+    }
+
+    private static void AssertUuidV7(string value, string identityName)
+    {
+        AssertTrue(Guid.TryParseExact(value, "D", out var id), $"{identityName} is not canonical TEXT(36).");
+        var bytes = id.ToByteArray(bigEndian: true);
+        AssertEqual(7, bytes[6] >> 4, $"{identityName} must use UUIDv7.");
+        AssertEqual(0x80, bytes[8] & 0xc0, $"{identityName} must use the RFC variant.");
     }
 
     private sealed class Wp03Project : IDisposable

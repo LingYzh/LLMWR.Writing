@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Infrastructure.FileSystem;
+using LLMW.Writing.Infrastructure.Persistence;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 
 namespace LLMW.Writing.Infrastructure.Authority;
@@ -77,7 +78,7 @@ public sealed class AuthorityTransactionCoordinator : IAuthorityTransactionCoord
         }
 
         EnsureAuthorityIsWritable(connection, exceptTransactionId: null);
-        var transactionId = Guid.NewGuid().ToString();
+        var transactionId = DurableUuidV7.Create().ToString();
         using (var command = connection.CreateCommand())
         {
             command.CommandText =
@@ -335,7 +336,7 @@ public sealed class AuthorityTransactionCoordinator : IAuthorityTransactionCoord
             if (request.Materializations.Count > 0)
             {
                 var planEvent = new AuthorityEventData(
-                    Guid.NewGuid().ToString(),
+                    DurableUuidV7.Create().ToString(),
                     "authority_transaction",
                     transactionId,
                     MaterializationPlanEvent,
