@@ -2,6 +2,7 @@
   <PropertyGroup>
     <AssemblyName>LLMW.Writing.Domain.Tests</AssemblyName>
     <RootNamespace>LLMW.Writing.Domain.Tests</RootNamespace>
+    <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
