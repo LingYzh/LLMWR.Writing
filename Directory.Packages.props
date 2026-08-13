@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageTransitivePinningEnabled>false</CentralPackageTransitivePinningEnabled>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Data.Sqlite" Version="[8.0.29]" />
+    <!-- Security servicing pin: do not fall back to the provider's 2.1.6 minimum native bundle. -->
+    <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="[2.1.12]" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.Infrastructure.Tests</AssemblyName>
+    <RootNamespace>LLMW.Writing.Infrastructure.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

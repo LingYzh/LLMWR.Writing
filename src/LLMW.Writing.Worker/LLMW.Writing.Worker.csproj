@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>LLMW.Writing.Worker</AssemblyName>
+    <RootNamespace>LLMW.Writing.Worker</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+  </ItemGroup>
+</Project>

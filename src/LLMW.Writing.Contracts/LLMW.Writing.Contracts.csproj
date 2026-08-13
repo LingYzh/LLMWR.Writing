@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.Contracts</AssemblyName>
+    <RootNamespace>LLMW.Writing.Contracts</RootNamespace>
+  </PropertyGroup>
+</Project>

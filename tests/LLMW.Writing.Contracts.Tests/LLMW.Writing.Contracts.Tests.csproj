@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>LLMW.Writing.Contracts.Tests</AssemblyName>
+    <RootNamespace>LLMW.Writing.Contracts.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+  </ItemGroup>
+</Project>

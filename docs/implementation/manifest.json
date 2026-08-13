@@ -1,0 +1,42 @@
+{
+  "bundle": "LLMW.Writing Phase 4 Implementation Design v0.1",
+  "date": "2026-08-13",
+  "files": [
+    {
+      "name": "Agent_Runtime_Implementation_Spec.md",
+      "bytes": 4727
+    },
+    {
+      "name": "Coding_Agent_Execution_Plan.md",
+      "bytes": 3988
+    },
+    {
+      "name": "Database_Schema_v1.md",
+      "bytes": 18555
+    },
+    {
+      "name": "Editor_Implementation_Spec.md",
+      "bytes": 3320
+    },
+    {
+      "name": "IPC_Contract_v1.md",
+      "bytes": 3639
+    },
+    {
+      "name": "Implementation_Design_v0.1.md",
+      "bytes": 13077
+    },
+    {
+      "name": "Repository_Scaffold_Spec.md",
+      "bytes": 3464
+    },
+    {
+      "name": "Security_Enforcement_Design.md",
+      "bytes": 3991
+    },
+    {
+      "name": "Test_and_Fault_Injection_Plan.md",
+      "bytes": 4056
+    }
+  ]
+}

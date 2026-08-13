@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>LLMW.Writing.UI</AssemblyName>
+    <RootNamespace>LLMW.Writing.UI</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+  </ItemGroup>
+</Project>

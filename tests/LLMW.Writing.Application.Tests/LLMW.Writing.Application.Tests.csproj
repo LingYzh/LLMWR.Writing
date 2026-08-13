@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.Application.Tests</AssemblyName>
+    <RootNamespace>LLMW.Writing.Application.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
+  </ItemGroup>
+</Project>

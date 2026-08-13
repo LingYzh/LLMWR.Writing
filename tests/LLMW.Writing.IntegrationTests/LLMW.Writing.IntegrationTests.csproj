@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>LLMW.Writing.IntegrationTests</AssemblyName>
+    <RootNamespace>LLMW.Writing.IntegrationTests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
+    <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

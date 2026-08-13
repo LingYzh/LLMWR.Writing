@@ -1,0 +1,26 @@
+# .NET and Visual Studio
+[Bb]in/
+[Oo]bj/
+.vs/
+TestResults/
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# JavaScript tooling and generated editor assets
+node_modules/
+.pnpm-store/
+src/web-editor/dist/
+src/LLMW.Writing.UI/GeneratedAssets/
+
+# Project runtime state and generated diagnostics
+.llmw/
+*.db-shm
+*.db-wal
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini

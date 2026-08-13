@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>LLMW.Writing.Core</AssemblyName>
+    <RootNamespace>LLMW.Writing.Core</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.Application</AssemblyName>
+    <RootNamespace>LLMW.Writing.Application</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Domain\LLMW.Writing.Domain.csproj" />
+  </ItemGroup>
+</Project>

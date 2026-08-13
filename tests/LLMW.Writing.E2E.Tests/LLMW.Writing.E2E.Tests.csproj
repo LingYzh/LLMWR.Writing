@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.E2E.Tests</AssemblyName>
+    <RootNamespace>LLMW.Writing.E2E.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+  </ItemGroup>
+</Project>

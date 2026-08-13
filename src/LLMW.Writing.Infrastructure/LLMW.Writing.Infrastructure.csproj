@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>LLMW.Writing.Infrastructure</AssemblyName>
+    <RootNamespace>LLMW.Writing.Infrastructure</RootNamespace>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Infrastructure\Persistence\Sqlite\Migrations\0001_initial.sql"
+                      LogicalName="LLMW.Writing.Infrastructure.Persistence.Sqlite.Migrations.0001_initial.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Domain\LLMW.Writing.Domain.csproj" />
+  </ItemGroup>
+</Project>
