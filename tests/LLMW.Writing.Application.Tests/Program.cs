@@ -162,6 +162,10 @@ internal static class Program
 
         public NarrativeChangeSetSnapshot? LoadChangeSet(string changeSetId) => snapshot;
 
+        public NarrativeChangeFailure? ValidateApplyPreconditions(
+            NarrativeChangeSetSnapshot changeSet,
+            CancellationToken cancellationToken = default) => null;
+
         public StructuralDependencyAssessment AssessStructuralDependencies(NarrativeChangeSetSnapshot changeSet) => new([]);
 
         public NarrativeStoreResult<NarrativeImpactAnalysisRecord> PersistImpactAnalysis(PersistImpactAnalysisRequest request)

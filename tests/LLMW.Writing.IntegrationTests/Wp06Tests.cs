@@ -24,10 +24,12 @@ internal static partial class Program
         RunWp06(nameof(WorkingChangeSetIsDurableWithoutChangingCurrentNarrative), WorkingChangeSetIsDurableWithoutChangingCurrentNarrative);
         RunWp06(nameof(FourOperationsApplyAtomicallyAndPreserveHistory), FourOperationsApplyAtomicallyAndPreserveHistory);
         RunWp06(nameof(StaleMultiObjectChangeSetReturnsPreconditionChangedWithoutPartialApply), StaleMultiObjectChangeSetReturnsPreconditionChangedWithoutPartialApply);
+        RunWp06(nameof(FreshnessIsRecheckedInsideAuthorityTransaction), FreshnessIsRecheckedInsideAuthorityTransaction);
         RunWp06(nameof(StructuralDependencyTriggersAffectedAnalysisAndAtomicRevalidationMark), StructuralDependencyTriggersAffectedAnalysisAndAtomicRevalidationMark);
         RunWp06(nameof(SemanticFoundTriggersImpactWithoutStructuralEdge), SemanticFoundTriggersImpactWithoutStructuralEdge);
         RunWp06(nameof(SemanticUncertainIsDurableAndNonBlocking), SemanticUncertainIsDurableAndNonBlocking);
         RunWp06(nameof(FailedImpactIsTypedAndRetainsWorkingSet), FailedImpactIsTypedAndRetainsWorkingSet);
+        RunWp06(nameof(AgentDelegatedIsRejectedBeforeAssessmentOrAuthorityMutation), AgentDelegatedIsRejectedBeforeAssessmentOrAuthorityMutation);
         RunWp06(nameof(ApplyIsIdempotentAndUsesUuidV7DurableIdentities), ApplyIsIdempotentAndUsesUuidV7DurableIdentities);
         RunWp06(nameof(PreAndPostCommitFaultsRespectAuthorityBoundary), PreAndPostCommitFaultsRespectAuthorityBoundary);
 
@@ -115,11 +117,36 @@ internal static partial class Program
 
         var result = fixture.Service.Apply(Apply(created.ChangeSetId, "stale-set"));
         Wp06Failure(NarrativeChangeError.PreconditionChanged, result.Failure);
+        AssertWp06Equal(0, fixture.Semantic.Calls, "Stale Apply invoked semantic dependency assessment.");
+        AssertWp06Equal(0, fixture.Impact.Calls, "Stale Apply invoked impact analysis.");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM impact_analyses;");
+        fixture.AssertScalar(0L, $"SELECT COUNT(*) FROM narrative_change_sets WHERE change_set_id='{created.ChangeSetId}' AND impact_analysis_id IS NOT NULL;");
         AssertWp06Equal(Hash("A v1"), fixture.ReadCurrentState(ObjectA).Digest, "A was partially applied before the stale B check.");
         AssertWp06Equal(Hash("B v2 elsewhere"), fixture.ReadCurrentState(ObjectB).Digest, "Current baseline B was not preserved.");
         fixture.AssertScalar(1L, $"SELECT revision_no FROM objects WHERE object_id='{ObjectA}';");
         fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_events;");
         fixture.AssertScalar(0L, $"SELECT COUNT(*) FROM narrative_change_sets WHERE change_set_id='{created.ChangeSetId}' AND transaction_id IS NOT NULL;");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_transactions WHERE transaction_kind='narrative_change_apply';");
+    }
+
+    private static void FreshnessIsRecheckedInsideAuthorityTransaction()
+    {
+        var race = new Wp06ActionFaultInjector(AuthorityTransactionFaultPoint.BeforeSqliteTransaction);
+        using var fixture = Wp06Fixture.Create(race);
+        var a = fixture.SeedCurrent(ObjectA, "A v1");
+        var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A proposal")] )));
+        race.Action = () => fixture.ExternalAuthorityModify(ObjectA, "A v2 elsewhere");
+
+        var result = fixture.Service.Apply(Apply(created.ChangeSetId, "freshness-race"));
+        Wp06Failure(NarrativeChangeError.PreconditionChanged, result.Failure);
+        AssertWp06Equal(1, race.Calls, "The between-checks mutation hook was not invoked.");
+        AssertWp06Equal(1, fixture.Semantic.Calls, "Fresh Apply did not reach dependency assessment before the race.");
+        fixture.AssertScalar(Hash("A v2 elsewhere"),
+            "SELECT snapshot_digest FROM narrative_state_revisions WHERE scope_object_id='018f3e78-1234-7abc-8def-0123456789a1' ORDER BY created_at_ms DESC,state_revision_id DESC LIMIT 1;");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_events;");
+        fixture.AssertScalar(0L, $"SELECT COUNT(*) FROM narrative_change_sets WHERE change_set_id='{created.ChangeSetId}' AND transaction_id IS NOT NULL;");
+        fixture.AssertScalar("failed", "SELECT status FROM authority_transactions WHERE transaction_kind='narrative_change_apply';");
     }
 
     private static void StructuralDependencyTriggersAffectedAnalysisAndAtomicRevalidationMark()
@@ -195,6 +222,28 @@ internal static partial class Program
         fixture.AssertScalar("failed", "SELECT status FROM impact_analyses;");
         fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_transactions WHERE transaction_kind='narrative_change_apply';");
         AssertWp06Equal(Hash("A v1"), fixture.ReadCurrentState(ObjectA).Digest, "Failed impact changed Current Narrative.");
+    }
+
+    private static void AgentDelegatedIsRejectedBeforeAssessmentOrAuthorityMutation()
+    {
+        using var fixture = Wp06Fixture.Create();
+        var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
+            "storyline", "storyline-1", "agent", "agent-1", [Add(ObjectA, "character", "A proposal")] )));
+
+        var result = fixture.Service.Apply(new ApplyNarrativeChangeSetCommand(
+            created.ChangeSetId,
+            "delegated-not-yet-available",
+            NarrativeDecisionKind.AgentDelegated,
+            "agent-1"));
+        Wp06Failure(NarrativeChangeError.DecisionAuthorityNotAvailable, result.Failure);
+        AssertWp06Equal(0, fixture.Semantic.Calls, "Rejected delegated Apply invoked semantic assessment.");
+        AssertWp06Equal(0, fixture.Impact.Calls, "Rejected delegated Apply invoked impact analysis.");
+        fixture.AssertScalar("working", $"SELECT status FROM narrative_change_sets WHERE change_set_id='{created.ChangeSetId}';");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM impact_analyses;");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_transactions;");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM narrative_state_revisions;");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM authority_events;");
+        fixture.AssertScalar("proposed", $"SELECT status FROM objects WHERE object_id='{ObjectA}';");
     }
 
     private static void ApplyIsIdempotentAndUsesUuidV7DurableIdentities()
@@ -586,6 +635,31 @@ internal static partial class Program
             {
                 throw new InvalidOperationException($"Injected WP06 fault at {point}.");
             }
+        }
+    }
+
+    private sealed class Wp06ActionFaultInjector : ITransactionFaultInjector
+    {
+        private readonly AuthorityTransactionFaultPoint point;
+
+        public Wp06ActionFaultInjector(AuthorityTransactionFaultPoint point)
+        {
+            this.point = point;
+        }
+
+        public Action? Action { get; set; }
+
+        public int Calls { get; private set; }
+
+        public void Inject(AuthorityTransactionFaultPoint observed)
+        {
+            if (observed != point || Action is null)
+            {
+                return;
+            }
+
+            Calls++;
+            Action();
         }
     }
 

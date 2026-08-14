@@ -18,6 +18,7 @@ public enum NarrativeChangeError
     PayloadVerificationFailed,
     DependencyAssessmentFailed,
     ImpactAnalysisFailed,
+    DecisionAuthorityNotAvailable,
     AuthorityDirty,
     RecoveryRequired,
     PartialApplyForbidden,

@@ -105,6 +105,13 @@ public sealed class NarrativeChangeService
             return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(NarrativeChangeError.ChangeSetNotApplicable);
         }
 
+        if (command.DeciderKind != NarrativeDecisionKind.AuthorConfirmed)
+        {
+            return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                NarrativeChangeError.DecisionAuthorityNotAvailable,
+                command.DeciderKind.ToString());
+        }
+
         try
         {
             var changeSet = store.LoadChangeSet(command.ChangeSetId);
@@ -116,6 +123,12 @@ public sealed class NarrativeChangeService
             NarrativeImpactAnalysisRecord? analysis = null;
             if (!StringComparer.Ordinal.Equals(changeSet.Status, "applied"))
             {
+                var preconditionFailure = store.ValidateApplyPreconditions(changeSet, cancellationToken);
+                if (preconditionFailure is not null)
+                {
+                    return new NarrativeChangeResult<ApplyNarrativeChangeSetResult>(null, preconditionFailure);
+                }
+
                 var analysisResult = AssessAndPersistImpact(changeSet, cancellationToken);
                 if (!analysisResult.Succeeded)
                 {

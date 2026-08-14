@@ -22,6 +22,10 @@ public interface INarrativeChangeStore
 
     NarrativeChangeSetSnapshot? LoadChangeSet(string changeSetId);
 
+    NarrativeChangeFailure? ValidateApplyPreconditions(
+        NarrativeChangeSetSnapshot changeSet,
+        CancellationToken cancellationToken = default);
+
     StructuralDependencyAssessment AssessStructuralDependencies(NarrativeChangeSetSnapshot changeSet);
 
     NarrativeStoreResult<NarrativeImpactAnalysisRecord> PersistImpactAnalysis(PersistImpactAnalysisRequest request);

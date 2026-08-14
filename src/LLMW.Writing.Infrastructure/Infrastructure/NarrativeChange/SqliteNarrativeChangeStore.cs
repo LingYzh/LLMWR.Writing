@@ -160,6 +160,15 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
             changes);
     }
 
+    public NarrativeChangeFailure? ValidateApplyPreconditions(
+        NarrativeChangeSetSnapshot changeSet,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(changeSet);
+        using var connection = connectionFactory.OpenConfigured(databasePath);
+        return ValidateAllChanges(connection, transaction: null, changeSet.Changes, cancellationToken);
+    }
+
     public StructuralDependencyAssessment AssessStructuralDependencies(NarrativeChangeSetSnapshot changeSet)
     {
         ArgumentNullException.ThrowIfNull(changeSet);
