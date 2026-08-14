@@ -12,9 +12,12 @@ public sealed class ProjectFileMonitor : IDisposable
     private readonly ProjectReconcileEngine engine;
     private readonly ISelfWriteTracker selfWriteTracker;
     private readonly FileEventCoalescer coalescer;
+    private readonly NativeWatchSurfacePolicy watchSurfacePolicy;
     private readonly Func<DateTimeOffset> clock;
     private readonly TimeSpan pollingInterval;
-    private FileSystemWatcher? nativeWatcher;
+    private readonly TimeSpan configuredDebounce;
+    private readonly Dictionary<string, FileSystemWatcher> nativeWatchers =
+        new(StringComparer.OrdinalIgnoreCase);
     private Timer? pollingTimer;
     private Timer? debounceTimer;
     private long sequence;
@@ -33,13 +36,30 @@ public sealed class ProjectFileMonitor : IDisposable
         this.engine = engine ?? throw new ArgumentNullException(nameof(engine));
         this.selfWriteTracker = selfWriteTracker ?? throw new ArgumentNullException(nameof(selfWriteTracker));
         this.pollingInterval = pollingInterval ?? DefaultPollingInterval;
+        configuredDebounce = debounce ?? FileEventCoalescer.DefaultDebounce;
         this.clock = clock ?? (() => DateTimeOffset.UtcNow);
-        coalescer = new FileEventCoalescer(debounce, this.clock);
+        coalescer = new FileEventCoalescer(configuredDebounce, this.clock);
+        watchSurfacePolicy = new NativeWatchSurfacePolicy(engine.PathResolver);
     }
 
     public bool NativeWatcherAvailable { get; private set; }
 
     public long HeavyReconcilePassCount { get; private set; }
+
+    public TimeSpan ConfiguredDebounce => configuredDebounce;
+
+    public TimeSpan? LastScheduledDebounce { get; private set; }
+
+    public IReadOnlyList<string> NativeWatchRoots
+    {
+        get
+        {
+            lock (sync)
+            {
+                return nativeWatchers.Keys.OrderBy(value => value, StringComparer.OrdinalIgnoreCase).ToArray();
+            }
+        }
+    }
 
     public ReconcileScanReport? LastReport { get; private set; }
 
@@ -55,7 +75,7 @@ public sealed class ProjectFileMonitor : IDisposable
                 return;
             }
 
-            TryStartNativeWatcher();
+            RefreshNativeWatchers();
             pollingTimer = new Timer(
                 _ => SafePoll(),
                 null,
@@ -121,11 +141,12 @@ public sealed class ProjectFileMonitor : IDisposable
             batchKind = null;
         }
 
-        coalescer.DrainReady(force: true);
+        var events = coalescer.DrainReady(force: true);
         var report = RunScan(
             eventReliabilityUnknown ? FileEventSource.FullRescan : FileEventSource.Batch,
             batchSize,
-            cancellationToken);
+            cancellationToken,
+            eventReliabilityUnknown ? null : events);
         eventReliabilityUnknown = false;
         return ReconcileResults.Success(report);
     }
@@ -137,10 +158,15 @@ public sealed class ProjectFileMonitor : IDisposable
         string? observedDigest = null)
     {
         ThrowIfDisposed();
-        var normalized = engine.PathResolver.NormalizeRelativePath(relativePath, rejectReparsePoints: false);
+        var normalized = engine.PathResolver.NormalizeRelativePath(relativePath);
+        if (!watchSurfacePolicy.IsRelevantRelativePath(normalized))
+        {
+            return;
+        }
+
         var oldNormalized = oldRelativePath is null
             ? null
-            : engine.PathResolver.NormalizeRelativePath(oldRelativePath, rejectReparsePoints: false);
+            : engine.PathResolver.NormalizeRelativePath(oldRelativePath);
         Enqueue(kind, normalized, oldNormalized, observedDigest);
     }
 
@@ -174,7 +200,8 @@ public sealed class ProjectFileMonitor : IDisposable
         var report = RunScan(
             full ? FileEventSource.FullRescan : FileEventSource.NativeWatcher,
             batchSize,
-            cancellationToken);
+            cancellationToken,
+            full ? null : events);
         eventReliabilityUnknown = false;
         return ReconcileResults.Success<ReconcileScanReport?>(report);
     }
@@ -183,8 +210,12 @@ public sealed class ProjectFileMonitor : IDisposable
     {
         lock (sync)
         {
-            nativeWatcher?.Dispose();
-            nativeWatcher = null;
+            foreach (var watcher in nativeWatchers.Values)
+            {
+                watcher.Dispose();
+            }
+
+            nativeWatchers.Clear();
             pollingTimer?.Dispose();
             pollingTimer = null;
             debounceTimer?.Dispose();
@@ -205,49 +236,95 @@ public sealed class ProjectFileMonitor : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    private void TryStartNativeWatcher()
+    private void RefreshNativeWatchers()
     {
-        try
+        lock (sync)
         {
-            var watcher = new FileSystemWatcher(engine.PathResolver.ProjectRoot)
+            var desiredRoots = watchSurfacePolicy.ExistingWatchRoots()
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var staleRoot in nativeWatchers.Keys
+                         .Where(root => !desiredRoots.Contains(root))
+                         .ToArray())
             {
-                IncludeSubdirectories = true,
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName |
-                               NotifyFilters.LastWrite | NotifyFilters.Size,
-                InternalBufferSize = NativeBufferSize,
-                EnableRaisingEvents = false
-            };
-            watcher.Created += (_, args) => OnNativePath(FileEventKind.Created, args.FullPath);
-            watcher.Changed += (_, args) => OnNativePath(FileEventKind.Modified, args.FullPath);
-            watcher.Deleted += (_, args) => OnNativePath(FileEventKind.Deleted, args.FullPath);
-            watcher.Renamed += (_, args) => OnNativePath(FileEventKind.Renamed, args.FullPath, args.OldFullPath);
-            watcher.Error += (_, _) => MarkNativeWatcherUnreliable();
-            watcher.EnableRaisingEvents = true;
-            nativeWatcher = watcher;
-            NativeWatcherAvailable = true;
+                nativeWatchers[staleRoot].Dispose();
+                nativeWatchers.Remove(staleRoot);
+            }
+
+            foreach (var root in desiredRoots.OrderBy(value => value, StringComparer.OrdinalIgnoreCase))
+            {
+                if (nativeWatchers.ContainsKey(root))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var watcher = CreateWatcher(root);
+                    nativeWatchers.Add(root, watcher);
+                }
+                catch (Exception) when (!disposed)
+                {
+                    eventReliabilityUnknown = true;
+                }
+            }
+
+            NativeWatcherAvailable = desiredRoots.Count > 0 && nativeWatchers.Count == desiredRoots.Count;
         }
-        catch (Exception) when (!disposed)
+    }
+
+    private FileSystemWatcher CreateWatcher(string root)
+    {
+        var watcher = new FileSystemWatcher(root)
         {
-            nativeWatcher?.Dispose();
-            nativeWatcher = null;
+            IncludeSubdirectories = true,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName |
+                           NotifyFilters.LastWrite | NotifyFilters.Size,
+            InternalBufferSize = NativeBufferSize,
+            EnableRaisingEvents = false
+        };
+        watcher.Created += (_, args) => OnNativePath(FileEventKind.Created, args.FullPath);
+        watcher.Changed += (_, args) => OnNativePath(FileEventKind.Modified, args.FullPath);
+        watcher.Deleted += (_, args) => OnNativePath(FileEventKind.Deleted, args.FullPath);
+        watcher.Renamed += (_, args) => OnNativePath(FileEventKind.Renamed, args.FullPath, args.OldFullPath);
+        watcher.Error += (_, _) => OnNativeWatcherError(root);
+        watcher.EnableRaisingEvents = true;
+        return watcher;
+    }
+
+    private void OnNativeWatcherError(string root)
+    {
+        lock (sync)
+        {
+            if (nativeWatchers.Remove(root, out var watcher))
+            {
+                watcher.Dispose();
+            }
+
             NativeWatcherAvailable = false;
-            eventReliabilityUnknown = true;
         }
+
+        MarkNativeWatcherUnreliable();
     }
 
     private void OnNativePath(FileEventKind kind, string fullPath, string? oldFullPath = null)
     {
         try
         {
-            var relative = engine.PathResolver.FromFullPath(fullPath, rejectReparsePoints: false);
+            var relative = engine.PathResolver.FromFullPath(fullPath);
+            if (!watchSurfacePolicy.IsRelevantRelativePath(relative))
+            {
+                return;
+            }
+
             var oldRelative = oldFullPath is null
                 ? null
-                : engine.PathResolver.FromFullPath(oldFullPath, rejectReparsePoints: false);
+                : engine.PathResolver.FromFullPath(oldFullPath);
             Enqueue(kind, relative, oldRelative, null);
         }
-        catch (Exception exception) when (exception is UnauthorizedAccessException or ArgumentException)
+        catch (Exception exception) when (exception is UnauthorizedAccessException or ArgumentException or
+                                          IOException or System.Security.SecurityException)
         {
-            eventReliabilityUnknown = true;
+            MarkNativeWatcherUnreliable();
         }
     }
 
@@ -274,18 +351,29 @@ public sealed class ProjectFileMonitor : IDisposable
             selfWriteTracker.TryGetActiveToken(relativePath)));
         if (!inBatch)
         {
-            debounceTimer?.Change(FileEventCoalescer.DefaultDebounce, Timeout.InfiniteTimeSpan);
+            var timer = debounceTimer;
+            if (timer is not null)
+            {
+                LastScheduledDebounce = configuredDebounce;
+                timer.Change(LastScheduledDebounce.Value, Timeout.InfiniteTimeSpan);
+            }
         }
     }
 
     private ReconcileScanReport RunScan(
         FileEventSource source,
         int batchSize,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<FileEventRecord>? eventRecords = null)
     {
-        var report = engine.Scan(source, batchSize, cancellationToken);
+        var report = engine.Scan(source, batchSize, eventRecords, cancellationToken);
         LastReport = report;
         HeavyReconcilePassCount++;
+        if (pollingTimer is not null)
+        {
+            RefreshNativeWatchers();
+        }
+
         return report;
     }
 

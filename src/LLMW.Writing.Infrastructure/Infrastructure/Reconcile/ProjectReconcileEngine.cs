@@ -21,6 +21,7 @@ public sealed class ProjectReconcileEngine
     private readonly NarrativeProjectionPlanner projectionPlanner;
     private readonly ProjectionFrontmatterParser parser;
     private readonly ISelfWriteTracker selfWriteTracker;
+    private readonly SafeProjectFileEnumerator fileEnumerator;
     private readonly Func<long> clock;
     private readonly object observationSync = new();
     private readonly Dictionary<string, ReconcileObservation> observations =
@@ -35,6 +36,7 @@ public sealed class ProjectReconcileEngine
         ISelfWriteTracker selfWriteTracker,
         SqliteDatabaseConnectionFactory? connectionFactory = null,
         ProjectionFrontmatterParser? parser = null,
+        SafeProjectFileEnumerator? fileEnumerator = null,
         Func<long>? clock = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
@@ -45,6 +47,7 @@ public sealed class ProjectReconcileEngine
         paths = new ProjectPathResolver(projectRoot);
         projectionPlanner = new NarrativeProjectionPlanner(this.databasePath, blobStore, this.connectionFactory);
         this.parser = parser ?? new ProjectionFrontmatterParser();
+        this.fileEnumerator = fileEnumerator ?? new SafeProjectFileEnumerator();
         this.clock = clock ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
@@ -53,6 +56,13 @@ public sealed class ProjectReconcileEngine
     public ReconcileScanReport Scan(
         FileEventSource source,
         int batchSize = DefaultScanBatchSize,
+        CancellationToken cancellationToken = default) =>
+        Scan(source, batchSize, eventRecords: null, cancellationToken);
+
+    public ReconcileScanReport Scan(
+        FileEventSource source,
+        int batchSize,
+        IReadOnlyList<FileEventRecord>? eventRecords,
         CancellationToken cancellationToken = default)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(batchSize);
@@ -65,12 +75,13 @@ public sealed class ProjectReconcileEngine
             item => paths.NormalizeRelativePath(item.TargetRelativePath, rejectReparsePoints: false),
             StringComparer.OrdinalIgnoreCase);
         var projectionBaselineExists = registryRows.Count > 0 || expectedProjection.Keys.Any(ProjectionFileExists);
+        var eventTokens = EventTokensByPath(eventRecords);
 
         List<ReconcileObservation> scanned = [];
         foreach (var row in registryRows.OrderBy(item => item.RelativePath, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            scanned.Add(ClassifyRegistry(row));
+            scanned.Add(ClassifyRegistry(row, eventTokens.GetValueOrDefault(row.RelativePath)));
         }
 
         if (projectionBaselineExists)
@@ -80,14 +91,17 @@ public sealed class ProjectReconcileEngine
                          .OrderBy(item => item.TargetRelativePath, StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                scanned.Add(ClassifyMachineProjection(artifact));
+                var relativePath = paths.NormalizeRelativePath(
+                    artifact.TargetRelativePath,
+                    rejectReparsePoints: false);
+                scanned.Add(ClassifyMachineProjection(artifact, eventTokens.GetValueOrDefault(relativePath)));
             }
         }
 
         foreach (var row in manuscriptRows.OrderBy(item => item.RelativePath, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();
-            scanned.Add(ClassifyManuscript(row));
+            scanned.Add(ClassifyManuscript(row, eventTokens.GetValueOrDefault(row.RelativePath)));
         }
 
         var knownPaths = registryRows.Select(item => item.RelativePath)
@@ -202,7 +216,7 @@ public sealed class ProjectReconcileEngine
         }
     }
 
-    private ReconcileObservation ClassifyRegistry(RegistryRow row)
+    private ReconcileObservation ClassifyRegistry(RegistryRow row, string? operationToken)
     {
         var read = ReadPhysical(row.RelativePath, includeBytes: true);
         if (read.Status == PhysicalReadStatus.Missing)
@@ -231,7 +245,7 @@ public sealed class ProjectReconcileEngine
                 [read.Error ?? "The file is temporarily unavailable."]);
         }
 
-        var suppressed = selfWriteTracker.ShouldSuppress(null, row.RelativePath, read.Digest);
+        var suppressed = selfWriteTracker.ShouldSuppress(operationToken, row.RelativePath, read.Digest);
         if (suppressed || StringComparer.Ordinal.Equals(row.TrustedPhysicalDigest, read.Digest))
         {
             return Observation(
@@ -258,14 +272,14 @@ public sealed class ProjectReconcileEngine
             ["External bytes differ from the trusted physical baseline; the trusted digest was preserved."]);
     }
 
-    private ReconcileObservation ClassifyMachineProjection(ProjectionArtifact artifact)
+    private ReconcileObservation ClassifyMachineProjection(ProjectionArtifact artifact, string? operationToken)
     {
         var relativePath = paths.NormalizeRelativePath(artifact.TargetRelativePath, rejectReparsePoints: false);
         var read = ReadPhysical(relativePath, includeBytes: false);
         var missing = read.Status == PhysicalReadStatus.Missing;
         var unavailable = read.Status == PhysicalReadStatus.Unavailable;
         var suppressed = read.Status == PhysicalReadStatus.Available &&
-                         selfWriteTracker.ShouldSuppress(null, relativePath, read.Digest);
+                         selfWriteTracker.ShouldSuppress(operationToken, relativePath, read.Digest);
         var unchanged = suppressed || StringComparer.Ordinal.Equals(artifact.PhysicalDigest, read.Digest);
         var classification = missing
             ? ReconcileClassification.ProjectionMissing
@@ -299,11 +313,11 @@ public sealed class ProjectReconcileEngine
             warnings);
     }
 
-    private ReconcileObservation ClassifyManuscript(ManuscriptRow row)
+    private ReconcileObservation ClassifyManuscript(ManuscriptRow row, string? operationToken)
     {
         var read = ReadPhysical(row.RelativePath, includeBytes: false);
         var suppressed = read.Status == PhysicalReadStatus.Available &&
-                         selfWriteTracker.ShouldSuppress(null, row.RelativePath, read.Digest);
+                         selfWriteTracker.ShouldSuppress(operationToken, row.RelativePath, read.Digest);
         var classification = read.Status switch
         {
             PhysicalReadStatus.Missing => ReconcileClassification.ManuscriptMaterializationMissing,
@@ -530,7 +544,7 @@ public sealed class ProjectReconcileEngine
         }
 
         List<string> result = [];
-        foreach (var file in Directory.EnumerateFiles(narrativeRoot, "*", SearchOption.AllDirectories))
+        foreach (var file in fileEnumerator.EnumerateFiles(narrativeRoot, cancellationToken))
         {
             cancellationToken.ThrowIfCancellationRequested();
             var relative = paths.FromFullPath(file);
@@ -541,6 +555,24 @@ public sealed class ProjectReconcileEngine
         }
 
         return result.OrderBy(item => item, StringComparer.Ordinal).ToArray();
+    }
+
+    private static Dictionary<string, string> EventTokensByPath(
+        IReadOnlyList<FileEventRecord>? eventRecords)
+    {
+        if (eventRecords is null || eventRecords.Count == 0)
+        {
+            return new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        return eventRecords
+            .Where(record => !string.IsNullOrWhiteSpace(record.SelfWriteOperationToken))
+            .OrderBy(record => record.Sequence)
+            .GroupBy(record => record.RelativePath, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Last().SelfWriteOperationToken!,
+                StringComparer.OrdinalIgnoreCase);
     }
 
     private List<RegistryRow> ReadRegistryRows()

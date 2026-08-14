@@ -24,6 +24,10 @@ internal static partial class Program
         RunWp08(nameof(MonitorHandlesPollingOverflowBatchStormAndCancellation), MonitorHandlesPollingOverflowBatchStormAndCancellation);
         RunWp08(nameof(FreshAuthorityGateClosesDebounceRaceAndIgnoresDrafts), FreshAuthorityGateClosesDebounceRaceAndIgnoresDrafts);
         RunWp08(nameof(CurrentManuscriptExternalEditBlocksChapterSubmissionAndRestores), CurrentManuscriptExternalEditBlocksChapterSubmissionAndRestores);
+        RunWp08(nameof(NativeWatcherIsolatesInternalStateAndUsesConfiguredDebounce), NativeWatcherIsolatesInternalStateAndUsesConfiguredDebounce);
+        RunWp08(nameof(MissingWatchSurfacesUsePollingAndReattach), MissingWatchSurfacesUsePollingAndReattach);
+        RunWp08(nameof(FullScanSkipsOutsideReparseTargetsAndLoops), FullScanSkipsOutsideReparseTargetsAndLoops);
+        RunWp08(nameof(NativeEventTokenReachesPrimarySuppression), NativeEventTokenReachesPrimarySuppression);
 
         Console.WriteLine($"WP08 integration tests passed ({Wp08PassedTests.Count}).");
         foreach (var test in Wp08PassedTests)
@@ -316,6 +320,178 @@ internal static partial class Program
             "Restoring Current Manuscript did not clear the Authority health gate.");
     }
 
+    private static void NativeWatcherIsolatesInternalStateAndUsesConfiguredDebounce()
+    {
+        using var environment = Wp08Environment.Create();
+        Wp08Success(environment.Fixture.Apply(
+            environment.Fixture.CreateAdd(Wp07ObjectA, "character", "nativewatchwp08"), "wp08-native-watch"));
+        Directory.CreateDirectory(Path.Combine(environment.Fixture.Directory, "Manuscript", "current"));
+        Directory.CreateDirectory(Path.Combine(environment.Fixture.Directory, ".llmw"));
+        Directory.CreateDirectory(Path.Combine(environment.Fixture.Directory, "Draft"));
+        var configuredDebounce = TimeSpan.FromSeconds(2);
+        using var monitor = new ProjectFileMonitor(
+            environment.Engine,
+            environment.Tracker,
+            pollingInterval: TimeSpan.FromHours(1),
+            debounce: configuredDebounce);
+        monitor.Start();
+
+        Wp08True(monitor.NativeWatcherAvailable,
+            "Relevant native watcher surfaces were not available after Start.");
+        Wp08Equal(2, monitor.NativeWatchRoots.Count,
+            "Native monitor did not attach exactly the two existing reconcile surfaces.");
+        Wp08True(monitor.NativeWatchRoots.Any(root => StringComparer.OrdinalIgnoreCase.Equals(
+                root, Path.Combine(environment.Fixture.Directory, "Narrative"))),
+            "Narrative native watcher root is missing.");
+        Wp08True(monitor.NativeWatchRoots.Any(root => StringComparer.OrdinalIgnoreCase.Equals(
+                root, Path.Combine(environment.Fixture.Directory, "Manuscript", "current"))),
+            "Current Manuscript native watcher root is missing.");
+        Wp08False(monitor.NativeWatchRoots.Any(root => StringComparer.OrdinalIgnoreCase.Equals(
+                root, environment.Fixture.Directory)),
+            "Project-root catch-all native watcher is still active.");
+        Wp08False(monitor.NativeWatchRoots.Any(root => root.Contains(".llmw", StringComparison.OrdinalIgnoreCase)),
+            "Internal .llmw state is still a native watcher root.");
+        Wp08False(monitor.NativeWatchRoots.Any(root => root.Contains("Draft", StringComparison.OrdinalIgnoreCase)),
+            "Draft is still a native watcher root.");
+
+        environment.Engine.Scan(FileEventSource.FullRescan);
+        using (var internalBytes = new MemoryStream(Encoding.UTF8.GetBytes("internal blob activity"), writable: false))
+        {
+            environment.Fixture.BlobStore.Stage(internalBytes);
+        }
+
+        monitor.InjectNativeEvent(FileEventKind.Modified, ".llmw/project.db");
+        monitor.InjectNativeEvent(FileEventKind.Modified, "Draft/chapter.md");
+        Wp08False(SpinWait.SpinUntil(
+                () => monitor.PendingEventCount > 0,
+                TimeSpan.FromMilliseconds(250)),
+            "Core DB/WAL/blob or ignored Draft activity entered the native event queue.");
+
+        var projectionPath = environment.Fixture.ObjectProjectionPath("character", Wp07ObjectA);
+        File.AppendAllText(projectionPath, "external", new UTF8Encoding(false));
+        Wp08True(SpinWait.SpinUntil(
+                () => monitor.PendingEventCount > 0,
+                TimeSpan.FromSeconds(3)),
+            "Narrative external modification did not enter the native watcher path.");
+        Wp08Equal(configuredDebounce, monitor.ConfiguredDebounce,
+            "Monitor did not retain the custom debounce.");
+        Wp08Equal(configuredDebounce, monitor.LastScheduledDebounce,
+            "Native event scheduling did not use the configured debounce value.");
+        Wp08Equal(0L, monitor.HeavyReconcilePassCount,
+            "Internal Core activity formed a native reconcile feedback chain.");
+    }
+
+    private static void FullScanSkipsOutsideReparseTargetsAndLoops()
+    {
+        using var environment = Wp08Environment.Create();
+        Wp08Success(environment.Fixture.Apply(
+            environment.Fixture.CreateAdd(Wp07ObjectA, "character", "reparsewp08"), "wp08-reparse"));
+        var outside = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP08.Outside", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        var outsideSecret = Path.Combine(outside, "outside-secret.md");
+        File.WriteAllText(outsideSecret, "outside-secret-wp08", new UTF8Encoding(false));
+        var narrativeRoot = Path.Combine(environment.Fixture.Directory, "Narrative");
+        var outsideLink = Path.Combine(narrativeRoot, "outside-link");
+        var loopLink = Path.Combine(narrativeRoot, "loop");
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(outsideLink, outside);
+                Directory.CreateSymbolicLink(loopLink, narrativeRoot);
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or PlatformNotSupportedException)
+            {
+                return;
+            }
+
+            var report = environment.Engine.Scan(FileEventSource.FullRescan);
+            Wp08False(report.Observations.Any(observation =>
+                    observation.RelativePath.Contains("outside-link", StringComparison.OrdinalIgnoreCase) ||
+                    observation.RelativePath.Contains("outside-secret", StringComparison.OrdinalIgnoreCase)),
+                "Full scan traversed a reparse target outside the project.");
+            Wp08False(report.Observations.Any(observation =>
+                    observation.RelativePath.Contains("/loop/", StringComparison.OrdinalIgnoreCase)),
+                "Full scan recursed through a symbolic-link loop.");
+            using var monitor = new ProjectFileMonitor(environment.Engine, environment.Tracker);
+            Wp08Throws<UnauthorizedAccessException>(
+                () => monitor.InjectNativeEvent(FileEventKind.Modified, "Narrative/outside-link/outside-secret.md"),
+                "Native event validation accepted an existing reparse traversal.");
+            Wp08Equal(0, monitor.PendingEventCount,
+                "Rejected reparse traversal entered the native event queue.");
+        }
+        finally
+        {
+            DeleteDirectoryLinkIfPresent(outsideLink);
+            DeleteDirectoryLinkIfPresent(loopLink);
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    private static void MissingWatchSurfacesUsePollingAndReattach()
+    {
+        using var fixture = Wp07Fixture.Create();
+        var tracker = new SelfWriteTracker();
+        var engine = new ProjectReconcileEngine(
+            fixture.Directory, fixture.DatabasePath, fixture.BlobStore, tracker);
+        using var monitor = new ProjectFileMonitor(
+            engine,
+            tracker,
+            pollingInterval: TimeSpan.FromHours(1));
+        monitor.Start();
+        Wp08False(monitor.NativeWatcherAvailable,
+            "Native watcher reported available when no relevant surface existed.");
+        Wp08Equal(0, monitor.NativeWatchRoots.Count,
+            "Monitor created or attached a semantic directory that did not exist.");
+        Wp08False(Directory.Exists(Path.Combine(fixture.Directory, "Narrative")),
+            "Monitor Start created the Narrative semantic directory.");
+        Wp08False(Directory.Exists(Path.Combine(fixture.Directory, "Manuscript", "current")),
+            "Monitor Start created the Current Manuscript semantic directory.");
+
+        Directory.CreateDirectory(Path.Combine(fixture.Directory, "Narrative"));
+        monitor.PollOnce();
+        Wp08True(monitor.NativeWatcherAvailable,
+            "Polling fallback did not reattach after a relevant surface appeared.");
+        Wp08Equal(1, monitor.NativeWatchRoots.Count,
+            "Polling fallback attached an unexpected native watcher set.");
+    }
+
+    private static void NativeEventTokenReachesPrimarySuppression()
+    {
+        using var fixture = Wp07Fixture.Create();
+        Wp08Success(fixture.Apply(
+            fixture.CreateAdd(Wp07ObjectA, "character", "tokenwp08"), "wp08-token"));
+        var recording = new RecordingSelfWriteTracker { ActiveToken = "wp08-primary-token" };
+        var engine = new ProjectReconcileEngine(
+            fixture.Directory, fixture.DatabasePath, fixture.BlobStore, recording);
+        using var monitor = new ProjectFileMonitor(engine, recording);
+        var relativePath = Wp08Relative(
+            fixture.Directory,
+            fixture.ObjectProjectionPath("character", Wp07ObjectA));
+        monitor.InjectNativeEvent(FileEventKind.Modified, relativePath);
+        Wp08Success(monitor.FlushPending(force: true));
+        Wp08True(recording.SuppressionCalls.Any(call =>
+                StringComparer.OrdinalIgnoreCase.Equals(call.RelativePath, relativePath) &&
+                StringComparer.Ordinal.Equals(call.OperationToken, "wp08-primary-token")),
+            "Coalesced native event token did not reach classifier suppression.");
+
+        recording.SuppressionCalls.Clear();
+        recording.ActiveToken = null;
+        monitor.PollOnce();
+        Wp08True(recording.SuppressionCalls.Any(call =>
+                StringComparer.OrdinalIgnoreCase.Equals(call.RelativePath, relativePath) &&
+                call.OperationToken is null),
+            "Polling/offline scan did not use token-absent path+digest fallback semantics.");
+    }
+
+    private static void DeleteDirectoryLinkIfPresent(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            Directory.Delete(path);
+        }
+    }
+
     private static void RunWp08(string name, Action test)
     {
         test();
@@ -456,6 +632,36 @@ internal static partial class Program
             }
 
             return result;
+        }
+    }
+
+    private sealed class RecordingSelfWriteTracker : ISelfWriteTracker
+    {
+        public string? ActiveToken { get; set; }
+
+        public List<(string? OperationToken, string RelativePath, string? Digest)> SuppressionCalls { get; } = [];
+
+        public ISelfWriteOperation BeginOperation(IReadOnlyList<SelfWriteExpectation> expectations) =>
+            new RecordingSelfWriteOperation();
+
+        public string? TryGetActiveToken(string relativePath) => ActiveToken;
+
+        public bool ShouldSuppress(
+            string? operationToken,
+            string relativePath,
+            string? observedPhysicalDigest)
+        {
+            SuppressionCalls.Add((operationToken, relativePath, observedPhysicalDigest));
+            return false;
+        }
+
+        private sealed class RecordingSelfWriteOperation : ISelfWriteOperation
+        {
+            public string Token => "recording-operation";
+
+            public void Dispose()
+            {
+            }
         }
     }
 }

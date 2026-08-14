@@ -3,6 +3,7 @@ using System.Text;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.Reconcile;
 using LLMW.Writing.Infrastructure.FileSystem;
+using LLMW.Writing.Infrastructure.Reconcile;
 
 namespace LLMW.Writing.Infrastructure.Tests;
 
@@ -21,6 +22,9 @@ internal static partial class Program
         Run(nameof(AtomicMaterializerRegistersExpectedSelfWrites), AtomicMaterializerRegistersExpectedSelfWrites);
         Run(nameof(ProjectPathResolverRejectsEscape), ProjectPathResolverRejectsEscape);
         Run(nameof(ProjectPathResolverRejectsReparseTraversal), ProjectPathResolverRejectsReparseTraversal);
+        Run(nameof(NativeWatchPolicyIncludesOnlyExistingReconcileSurfaces), NativeWatchPolicyIncludesOnlyExistingReconcileSurfaces);
+        Run(nameof(SafeEnumerationPolicyNeverTraversesReparseDirectories), SafeEnumerationPolicyNeverTraversesReparseDirectories);
+        Run(nameof(CustomDebounceControlsCoalescerCutoff), CustomDebounceControlsCoalescerCutoff);
     }
 
     private static void NativeHintsNormalizeWithoutLeakingFileSystemEventArgs()
@@ -163,5 +167,72 @@ internal static partial class Program
             Directory.Delete(root, recursive: true);
             Directory.Delete(outside, recursive: true);
         }
+    }
+
+    private static void NativeWatchPolicyIncludesOnlyExistingReconcileSurfaces()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP08.WatchPolicy", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, "Narrative"));
+        Directory.CreateDirectory(Path.Combine(root, "Manuscript", "current"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        Directory.CreateDirectory(Path.Combine(root, "Draft"));
+        try
+        {
+            var policy = new NativeWatchSurfacePolicy(new ProjectPathResolver(root));
+            var roots = policy.ExistingWatchRoots();
+            AssertEqual(2, roots.Count, "Native watcher policy returned an unexpected root count.");
+            AssertTrue(roots.Any(path => StringComparer.OrdinalIgnoreCase.Equals(
+                    path, Path.Combine(root, "Narrative"))),
+                "Narrative native surface was omitted.");
+            AssertTrue(roots.Any(path => StringComparer.OrdinalIgnoreCase.Equals(
+                    path, Path.Combine(root, "Manuscript", "current"))),
+                "Current Manuscript native surface was omitted.");
+            AssertFalse(roots.Any(path => StringComparer.OrdinalIgnoreCase.Equals(path, root)),
+                "Project root catch-all watcher was admitted.");
+            AssertFalse(roots.Any(path => path.Contains(".llmw", StringComparison.OrdinalIgnoreCase)),
+                "Internal .llmw state was admitted as a native watcher root.");
+            AssertFalse(roots.Any(path => path.Contains("Draft", StringComparison.OrdinalIgnoreCase)),
+                "Draft was admitted as a native watcher root.");
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    private static void SafeEnumerationPolicyNeverTraversesReparseDirectories()
+    {
+        AssertFalse(SafeProjectFileEnumerator.CanTraverse(
+                FileAttributes.Directory | FileAttributes.ReparsePoint),
+            "Safe enumeration policy permits reparse-directory traversal.");
+        AssertTrue(SafeProjectFileEnumerator.CanTraverse(FileAttributes.Directory),
+            "Safe enumeration policy rejects an ordinary directory.");
+        AssertFalse(SafeProjectFileEnumerator.CanTraverse(FileAttributes.Normal),
+            "Safe enumeration policy treats a file as a traversable directory.");
+    }
+
+    private static void CustomDebounceControlsCoalescerCutoff()
+    {
+        var now = DateTimeOffset.UnixEpoch;
+        var configured = TimeSpan.FromMilliseconds(875);
+        var coalescer = new FileEventCoalescer(configured, () => now);
+        coalescer.Enqueue(new FileEventRecord(
+            1,
+            "Narrative/a.md",
+            null,
+            FileEventKind.Modified,
+            null,
+            FileEventSource.NativeWatcher,
+            now));
+        AssertEqual(configured, coalescer.ConfiguredDebounce,
+            "Coalescer did not retain the configured debounce.");
+        AssertEqual(0, coalescer.DrainReady().Count,
+            "Event drained before the configured debounce elapsed.");
+        now += configured - TimeSpan.FromTicks(1);
+        AssertEqual(0, coalescer.DrainReady().Count,
+            "Event drained before the exact custom cutoff.");
+        now += TimeSpan.FromTicks(1);
+        AssertEqual(1, coalescer.DrainReady().Count,
+            "Event did not drain at the configured custom cutoff.");
     }
 }

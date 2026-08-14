@@ -33,6 +33,8 @@ public sealed class FileEventCoalescer
         }
     }
 
+    public TimeSpan ConfiguredDebounce => debounce;
+
     public void Enqueue(FileEventRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
