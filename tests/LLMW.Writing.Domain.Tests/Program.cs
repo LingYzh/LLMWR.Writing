@@ -5,10 +5,11 @@ using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
 using LLMW.Writing.Domain.Authority.RevisionBarrier;
 using LLMW.Writing.Domain.Authority.Storyline;
+using LLMW.Writing.Domain.Narrative;
 
 namespace LLMW.Writing.Domain.Tests;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly AcceptanceDecisionContext AuthorDecision =
         new(true, DecisionAuthorityKind.AuthorConfirmed, NarrativeOversightMode.Manual, false);
@@ -39,6 +40,7 @@ internal static class Program
             Run(nameof(DelegatedAuthoritySharesStateButPreservesProvenance), DelegatedAuthoritySharesStateButPreservesProvenance);
             Run(nameof(BypassAndAutoCannotRewriteAuthorityRules), BypassAndAutoCannotRewriteAuthorityRules);
             Run(nameof(AuthorityScopesUseIndependentTypes), AuthorityScopesUseIndependentTypes);
+            RunWp06NarrativeChangeDomainTests();
 
             Console.WriteLine($"Domain Authority FSM tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)
