@@ -14,7 +14,11 @@ The current checkout stores the Architecture FROZEN document as `docs/architectu
 2. Modify only directories assigned to the active work package.
 3. Run the required tests and report their results.
 4. Do not add dependencies without human approval and an entry in `docs/implementation/dependency-register.md` covering purpose, license, security/update owner, and replacement boundary.
-5. Do not automatically commit or push Git changes.
+5. Never commit or push directly to master.
+   For a dedicated work-package feature branch, an agent may create and push
+   a checkpoint commit only when the active user instruction explicitly
+   authorizes it and all required verification passes.
+   Never amend/rebase accepted history or force-push.
 6. Treat schema, IPC, FSM, and security-boundary changes as review-sensitive.
 7. Preserve fault-injection hooks and test fixtures.
 8. Keep the assembly boundaries intact: Domain and Contracts do not take UI, database, IPC, provider, Git, OpenXML, or Windows-sandbox dependencies; executable projects never reference another executable implementation.
