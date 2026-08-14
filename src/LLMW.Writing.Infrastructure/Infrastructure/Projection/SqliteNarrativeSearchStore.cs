@@ -41,6 +41,14 @@ public sealed class SqliteNarrativeSearchStore : INarrativeSearchStore
                        documents.title,documents.body,documents.current_status,bm25(search_fts) AS rank
                 FROM search_fts
                 JOIN search_documents documents ON documents.search_rowid=search_fts.rowid
+                JOIN objects
+                  ON objects.object_id=documents.object_id AND objects.status='current'
+                JOIN narrative_state_revisions current_state
+                  ON current_state.scope_object_id=objects.object_id
+                 AND current_state.snapshot_digest=documents.artifact_digest
+                 AND NOT EXISTS(
+                     SELECT 1 FROM narrative_state_revisions successor
+                     WHERE successor.supersedes_state_revision_id=current_state.state_revision_id)
                 JOIN object_paths paths
                   ON paths.object_id=documents.object_id AND paths.is_canonical=1
                 JOIN registry_entries registry
@@ -54,6 +62,7 @@ public sealed class SqliteNarrativeSearchStore : INarrativeSearchStore
                   AND paths.physical_digest=registry.trusted_physical_digest
                   AND paths.semantic_digest=registry.trusted_semantic_digest
                   AND documents.current_status='current'
+                  AND lower(objects.object_type)<>'raw'
                   AND lower(registry.object_type)<>'raw'
                 ORDER BY rank,documents.object_id,documents.section_key
                 LIMIT $limit;
@@ -124,11 +133,17 @@ public sealed class SqliteNarrativeSearchStore : INarrativeSearchStore
                   AND registry.trusted_semantic_digest IS NOT NULL
                   AND paths.physical_digest=registry.trusted_physical_digest
                   AND paths.semantic_digest=registry.trusted_semantic_digest
-                  AND NOT EXISTS(
-                      SELECT 1 FROM search_documents documents
-                      WHERE documents.object_id=objects.object_id
-                        AND documents.artifact_digest=state.snapshot_digest
-                        AND documents.current_status='current'));
+                  AND (
+                      NOT EXISTS(
+                          SELECT 1 FROM search_documents documents
+                          WHERE documents.object_id=objects.object_id
+                            AND documents.artifact_digest=state.snapshot_digest
+                            AND documents.current_status='current')
+                      OR EXISTS(
+                          SELECT 1 FROM search_documents documents
+                          WHERE documents.object_id=objects.object_id
+                            AND documents.current_status='current'
+                            AND documents.artifact_digest<>state.snapshot_digest)));
             """;
         return Convert.ToInt64(command.ExecuteScalar(), System.Globalization.CultureInfo.InvariantCulture) != 0;
     }

@@ -6,6 +6,7 @@ using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Application.Projection;
 using LLMW.Writing.Application.Registry;
 using LLMW.Writing.Domain.Narrative;
+using LLMW.Writing.Domain.Registry;
 using LLMW.Writing.Infrastructure.Authority;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.NarrativeChange;
@@ -71,6 +72,25 @@ internal static partial class Program
 
         var raw = fixture.CreateAdd(Wp07ObjectB, "raw", "rawonlywpseven");
         Wp07Success(fixture.Apply(raw, "wp07-raw"));
+        var rawPath = fixture.ObjectProjectionPath("raw", Wp07ObjectB);
+        fixture.AssertRegistryTrusted(Wp07ObjectB, rawPath, "unavailable");
+        var rawRegistration = fixture.Scalar<string>(
+            "SELECT registration_state FROM registry_entries WHERE object_id=$id;",
+            ("$id", Wp07ObjectB));
+        var rawAvailability = fixture.Scalar<string>(
+            "SELECT retrieval_availability FROM registry_entries WHERE object_id=$id;",
+            ("$id", Wp07ObjectB));
+        var rawReconcile = fixture.Scalar<string>(
+            "SELECT reconcile_state FROM registry_entries WHERE object_id=$id;",
+            ("$id", Wp07ObjectB));
+        var rawEligibility = RegistryRetrievalEligibility.Evaluate(new RegistryEligibilityInput(
+            Enum.Parse<RegistryRegistrationState>(rawRegistration, ignoreCase: true),
+            Enum.Parse<RegistryRetrievalAvailability>(rawAvailability, ignoreCase: true),
+            Enum.Parse<RegistryReconcileState>(rawReconcile, ignoreCase: true),
+            TrustedPhysicalBaselinePresent: true,
+            TrustedSemanticBaselinePresent: true));
+        AssertWp07False(rawEligibility.Eligible, "Persisted Raw Registry state was eligible for Normal Retrieval.");
+        AssertWp07Equal(RegistryEligibilityDenial.Unavailable, rawEligibility.Denial, "Raw Registry denial reason changed.");
         AssertWp07Equal(0, Wp07SearchSuccess(fixture.Search("rawonlywpseven")).Count, "Raw object bypassed the retrieval exclusion.");
         AssertWp07Equal(SqliteNarrativeSearchIndex.BaselineTokenizerProfile, "unicode61", "Tokenizer baseline changed.");
     }
@@ -152,6 +172,17 @@ internal static partial class Program
             ("$id", Wp07ObjectC), ("$digest", new string('a', 64)));
         fixture.Execute("INSERT INTO search_fts(search_fts) VALUES('rebuild');");
         AssertWp07Equal(0, Wp07SearchSuccess(fixture.Search("ftsinjectedwpseven")).Count, "Direct FTS injection bypassed the Registry/object_paths JOIN gate.");
+
+        var authorityBeforeDerivedCorruption = fixture.AuthoritySignature();
+        fixture.Execute(
+            "INSERT INTO search_documents(search_rowid,object_id,artifact_digest,section_key,title,body,current_status) VALUES(9002,$id,$digest,'same-object-forged','Injected','poisonedartifactwpseven','current');",
+            ("$id", Wp07ObjectA), ("$digest", new string('b', 64)));
+        fixture.Execute("INSERT INTO search_fts(search_fts) VALUES('rebuild');");
+        Wp07RegistryFailure(RegistryQueryError.SearchIndexDirty, fixture.Search("poisonedartifactwpseven").Failure);
+        fixture.SearchIndex.Rebuild();
+        AssertWp07Equal(0, Wp07SearchSuccess(fixture.Search("poisonedartifactwpseven")).Count, "Forged same-object content survived Authority-derived FTS rebuild.");
+        AssertWp07Equal(1, Wp07SearchSuccess(fixture.Search("trustedgatewpseven")).Count, "Valid Current Authority search did not recover after FTS rebuild.");
+        AssertWp07Equal(authorityBeforeDerivedCorruption, fixture.AuthoritySignature(), "Search index repair mutated Authority tables.");
 
         var authorityBefore = fixture.AuthoritySignature();
         var path = fixture.ObjectProjectionPath("character", Wp07ObjectA);
@@ -392,11 +423,14 @@ internal static partial class Program
 
         public string CurrentDigest(string objectId) => CurrentState(objectId).Digest;
 
-        public void AssertRegistryTrusted(string objectId, string fullPath)
+        public void AssertRegistryTrusted(
+            string objectId,
+            string fullPath,
+            string expectedAvailability = "available")
         {
             var physical = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(fullPath))).ToLowerInvariant();
             AssertWp07Equal("registered", Scalar<string>("SELECT registration_state FROM registry_entries WHERE object_id=$id;", ("$id", objectId)), "Registry entry is not registered.");
-            AssertWp07Equal("available", Scalar<string>("SELECT retrieval_availability FROM registry_entries WHERE object_id=$id;", ("$id", objectId)), "Registry entry is not available.");
+            AssertWp07Equal(expectedAvailability, Scalar<string>("SELECT retrieval_availability FROM registry_entries WHERE object_id=$id;", ("$id", objectId)), "Registry entry has the wrong retrieval availability.");
             AssertWp07Equal("clean", Scalar<string>("SELECT reconcile_state FROM registry_entries WHERE object_id=$id;", ("$id", objectId)), "Registry entry is not clean.");
             AssertWp07Equal(physical, Scalar<string>("SELECT trusted_physical_digest FROM registry_entries WHERE object_id=$id;", ("$id", objectId)), "Trusted physical digest does not match verified bytes.");
             AssertWp07Equal(physical, Scalar<string>("SELECT physical_digest FROM object_paths WHERE object_id=$id;", ("$id", objectId)), "object_paths physical digest does not match verified bytes.");

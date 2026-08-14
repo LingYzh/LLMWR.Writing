@@ -136,17 +136,17 @@ public sealed class ProjectionAuthorityMaterializer : IAuthorityMaterializer
                         registration_state,retrieval_availability,trusted_physical_digest,
                         trusted_semantic_digest,reconcile_state,registered_at_ms,last_verified_at_ms,updated_at_ms)
                     VALUES($registry_entry_id,$object_id,$path_id,$object_type,$schema_version,
-                           'registered','available',$physical_digest,$semantic_digest,'clean',$now,$now,$now)
+                           $registration_state,$retrieval_availability,$physical_digest,$semantic_digest,$reconcile_state,$now,$now,$now)
                     ON CONFLICT(registry_entry_id) DO UPDATE SET
                         object_id=excluded.object_id,
                         path_id=excluded.path_id,
                         object_type=excluded.object_type,
                         schema_version=excluded.schema_version,
-                        registration_state='registered',
-                        retrieval_availability='available',
+                        registration_state=excluded.registration_state,
+                        retrieval_availability=excluded.retrieval_availability,
                         trusted_physical_digest=excluded.trusted_physical_digest,
                         trusted_semantic_digest=excluded.trusted_semantic_digest,
-                        reconcile_state='clean',
+                        reconcile_state=excluded.reconcile_state,
                         registered_at_ms=COALESCE(registry_entries.registered_at_ms,excluded.registered_at_ms),
                         last_verified_at_ms=excluded.last_verified_at_ms,
                         updated_at_ms=excluded.updated_at_ms;
@@ -156,8 +156,11 @@ public sealed class ProjectionAuthorityMaterializer : IAuthorityMaterializer
                     ("$path_id", registration.PathId),
                     ("$object_type", registration.ObjectType),
                     ("$schema_version", registration.SchemaVersion),
+                    ("$registration_state", registration.RegistrationState),
+                    ("$retrieval_availability", registration.RetrievalAvailability),
                     ("$physical_digest", registration.PhysicalDigest),
                     ("$semantic_digest", registration.SemanticDigest),
+                    ("$reconcile_state", registration.ReconcileState),
                     ("$now", now));
             }
 

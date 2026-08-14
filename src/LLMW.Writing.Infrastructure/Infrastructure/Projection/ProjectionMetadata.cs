@@ -17,7 +17,10 @@ internal sealed record ProjectionRegistrationMetadata(
     string PhysicalDigest,
     string SemanticDigest,
     string? ArtifactDigest,
-    string Status);
+    string Status,
+    string RegistrationState,
+    string RetrievalAvailability,
+    string ReconcileState);
 
 internal sealed record ProjectionRecoveryMetadata(IReadOnlyList<ProjectionRegistrationMetadata> Registrations);
 
@@ -50,7 +53,7 @@ internal static class ProjectionMetadataCodec
                }))
         {
             writer.WriteStartObject();
-            writer.WriteNumber("schemaVersion", 1);
+            writer.WriteNumber("schemaVersion", 2);
             writer.WriteStartArray("registrations");
             foreach (var item in metadata.Registrations
                          .OrderBy(value => value.ObjectId, StringComparer.Ordinal)
@@ -75,6 +78,9 @@ internal static class ProjectionMetadataCodec
                 }
 
                 writer.WriteString("status", item.Status);
+                writer.WriteString("registrationState", item.RegistrationState);
+                writer.WriteString("retrievalAvailability", item.RetrievalAvailability);
+                writer.WriteString("reconcileState", item.ReconcileState);
                 writer.WriteEndObject();
             }
 
@@ -89,7 +95,8 @@ internal static class ProjectionMetadataCodec
     public static ProjectionRecoveryMetadata Deserialize(string json)
     {
         using var document = JsonDocument.Parse(json);
-        if (document.RootElement.GetProperty("schemaVersion").GetInt32() != 1)
+        var schemaVersion = document.RootElement.GetProperty("schemaVersion").GetInt32();
+        if (schemaVersion is not 1 and not 2)
         {
             throw new InvalidOperationException("Unsupported projection recovery metadata version.");
         }
@@ -97,10 +104,11 @@ internal static class ProjectionMetadataCodec
         List<ProjectionRegistrationMetadata> registrations = [];
         foreach (var item in document.RootElement.GetProperty("registrations").EnumerateArray())
         {
+            var objectType = item.GetProperty("objectType").GetString()!;
             registrations.Add(new ProjectionRegistrationMetadata(
                 item.GetProperty("registryEntryId").GetString()!,
                 item.GetProperty("objectId").GetString()!,
-                item.GetProperty("objectType").GetString()!,
+                objectType,
                 item.GetProperty("objectSchemaVersion").GetInt32(),
                 item.GetProperty("pathId").GetString()!,
                 item.GetProperty("relativePath").GetString()!,
@@ -109,7 +117,12 @@ internal static class ProjectionMetadataCodec
                 item.GetProperty("artifactDigest").ValueKind == JsonValueKind.Null
                     ? null
                     : item.GetProperty("artifactDigest").GetString(),
-                item.GetProperty("status").GetString()!));
+                item.GetProperty("status").GetString()!,
+                schemaVersion == 1 ? "registered" : item.GetProperty("registrationState").GetString()!,
+                schemaVersion == 1
+                    ? StringComparer.OrdinalIgnoreCase.Equals(objectType, "raw") ? "unavailable" : "available"
+                    : item.GetProperty("retrievalAvailability").GetString()!,
+                schemaVersion == 1 ? "clean" : item.GetProperty("reconcileState").GetString()!));
         }
 
         return new ProjectionRecoveryMetadata(registrations);

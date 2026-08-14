@@ -296,7 +296,7 @@ internal sealed class NarrativeProjectionPlanner
                 "narrative_projection",
                 true,
                 "registered",
-                "available",
+                StringComparer.OrdinalIgnoreCase.Equals(item.ObjectType, "raw") ? "unavailable" : "available",
                 "clean",
                 artifact.PhysicalDigest,
                 artifact.SemanticDigest));
@@ -334,9 +334,12 @@ internal sealed class NarrativeProjectionPlanner
             .EnumerateArray()
             .ToDictionary(
                 value => value.GetProperty("objectId").GetString()!,
-                value => new ExistingRegistryRow(
+                value => new RegistryRecoveryRow(
                     value.GetProperty("registryEntryId").GetString()!,
-                    value.GetProperty("pathId").GetString()!),
+                    value.GetProperty("pathId").GetString()!,
+                    value.GetProperty("registrationState").GetString()!,
+                    value.GetProperty("retrievalAvailability").GetString()!,
+                    value.GetProperty("reconcileState").GetString()!),
                 StringComparer.Ordinal);
         var registrations = build.Artifacts
             .Where(value => value.Kind == ProjectionArtifactKind.NarrativeMarkdown)
@@ -353,7 +356,10 @@ internal sealed class NarrativeProjectionPlanner
                     value.PhysicalDigest,
                     value.SemanticDigest,
                     value.ArtifactDigest,
-                    value.Status!);
+                    value.Status!,
+                    registry.RegistrationState,
+                    registry.RetrievalAvailability,
+                    registry.ReconcileState);
             })
             .OrderBy(value => value.ObjectId, StringComparer.Ordinal)
             .ToArray();
@@ -381,4 +387,11 @@ internal sealed class NarrativeProjectionPlanner
         string? ArtifactDigest);
 
     private sealed record ExistingRegistryRow(string RegistryEntryId, string PathId);
+
+    private sealed record RegistryRecoveryRow(
+        string RegistryEntryId,
+        string PathId,
+        string RegistrationState,
+        string RetrievalAvailability,
+        string ReconcileState);
 }
