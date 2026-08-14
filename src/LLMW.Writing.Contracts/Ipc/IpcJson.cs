@@ -41,6 +41,10 @@ public static class IpcJson
 [JsonSerializable(typeof(IpcEnvelope<Heartbeat>), TypeInfoPropertyName = "HeartbeatEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<HeartbeatAck>), TypeInfoPropertyName = "HeartbeatAckEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<IpcError>), TypeInfoPropertyName = "ErrorEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<CreateRunSessionRequest>), TypeInfoPropertyName = "CreateRunSessionRequestEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<CreateRunSessionResponse>), TypeInfoPropertyName = "CreateRunSessionResponseEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<RevokeRunSessionRequest>), TypeInfoPropertyName = "RevokeRunSessionRequestEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<RevokeRunSessionResponse>), TypeInfoPropertyName = "RevokeRunSessionResponseEnvelope")]
 public sealed partial class IpcJsonContext : JsonSerializerContext;
 
 public sealed class IpcMessageTypeJsonConverter : JsonStringEnumConverter<IpcMessageType>

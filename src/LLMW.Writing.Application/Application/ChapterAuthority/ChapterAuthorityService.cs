@@ -4,6 +4,8 @@ using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
 using LLMW.Writing.Application.Reconcile;
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.ChapterAuthority;
 
@@ -17,19 +19,22 @@ public sealed class ChapterAuthorityService
     private readonly IChapterAuthorityStore store;
     private readonly IChapterReviewer reviewer;
     private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
+    private readonly IAuthorizationService authorizationService;
 
     public ChapterAuthorityService(
         IImmutableBlobStore blobStore,
         IAuthorityTransactionCoordinator transactionCoordinator,
         IChapterAuthorityStore store,
         IChapterReviewer reviewer,
-        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate)
+        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate,
+        IAuthorizationService? authorizationService = null)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.transactionCoordinator = transactionCoordinator ?? throw new ArgumentNullException(nameof(transactionCoordinator));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.reviewer = reviewer ?? throw new ArgumentNullException(nameof(reviewer));
         this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
+        this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
     }
 
     public ChapterAuthorityResult<SubmitChapterDraftResult> SubmitChapterDraft(
@@ -37,6 +42,14 @@ public sealed class ChapterAuthorityService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(command);
+        var authorization = Authorize<SubmitChapterDraftResult>(
+            command.Principal,
+            Capability.AuthoritySubmit);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
         if (!File.Exists(command.DraftPath))
         {
             return ChapterAuthorityResults.Fail<SubmitChapterDraftResult>(ChapterAuthorityError.DraftMissing);
@@ -134,6 +147,14 @@ public sealed class ChapterAuthorityService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(command);
+        var authorization = Authorize<ReviewChapterCandidateResult>(
+            command.Principal,
+            Capability.AuthorityReview);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
         var context = store.LoadReviewContext(command.CandidateId);
         if (context is null)
         {
@@ -214,6 +235,21 @@ public sealed class ChapterAuthorityService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(command);
+        var authorization = Authorize<AcceptChapterCandidateResult>(
+            command.Principal,
+            Capability.AuthorityAccept);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        if (command.Principal?.Kind != PrincipalKind.UserInteractive)
+        {
+            return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
+                ChapterAuthorityError.AcceptanceNotAuthorized,
+                "WP09 does not activate AgentDelegated acceptance.");
+        }
+
         var context = store.LoadAcceptanceContext(command.CandidateId);
         if (context is null)
         {
@@ -229,6 +265,15 @@ public sealed class ChapterAuthorityService
         {
             if (context.TransactionState is AuthorityTransactionState.CommittedButDirty or AuthorityTransactionState.Complete)
             {
+                var recoveryAuthorization = Authorize<AcceptChapterCandidateResult>(
+                    command.Principal,
+                    Capability.AuthorityAccept);
+                if (recoveryAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+                {
+                    return recoveryAuthorization ?? ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
+                        ChapterAuthorityError.AcceptanceNotAuthorized);
+                }
+
                 return ChapterAuthorityResults.Success(
                     store.RecoverAcceptance(context, cancellationToken));
             }
@@ -236,11 +281,6 @@ public sealed class ChapterAuthorityService
             if (context.TransactionState == AuthorityTransactionState.RecoveryRequired)
             {
                 return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(ChapterAuthorityError.RecoveryRequired);
-            }
-
-            if (!command.AcceptanceAuthorized || command.AuthorityKind != DecisionAuthorityKind.AuthorConfirmed)
-            {
-                return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(ChapterAuthorityError.AcceptanceNotAuthorized);
             }
 
             if (context.ReviewOutcome != ChapterReviewOutcome.Pass)
@@ -258,6 +298,14 @@ public sealed class ChapterAuthorityService
                 DecisionAuthorityKind.AuthorConfirmed,
                 command.OversightMode,
                 BypassPermissions: false);
+
+            var transitionAuthorization = Authorize<AcceptChapterCandidateResult>(
+                command.Principal,
+                Capability.AuthorityAccept);
+            if (transitionAuthorization is not null)
+            {
+                return transitionAuthorization;
+            }
 
             if (context.ProjectSubmissionState == ProjectSubmissionState.Resolving)
             {
@@ -335,6 +383,15 @@ public sealed class ChapterAuthorityService
                     FormatHealthFailure(health));
             }
 
+            var commitAuthorization = Authorize<AcceptChapterCandidateResult>(
+                command.Principal,
+                Capability.AuthorityAccept);
+            if (commitAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+            {
+                return commitAuthorization ?? ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
+                    ChapterAuthorityError.AcceptanceNotAuthorized);
+            }
+
             return ChapterAuthorityResults.Success(
                 store.CommitAcceptance(context, cancellationToken));
         }
@@ -361,6 +418,25 @@ public sealed class ChapterAuthorityService
 
     private static string FormatHealthFailure(AuthoritySurfaceHealth health) =>
         string.Join("; ", health.Issues.Select(issue => $"{issue.Kind}:{issue.RelativePath}:{issue.Detail}"));
+
+    private ChapterAuthorityResult<T>? Authorize<T>(
+        CallerPrincipal? principal,
+        Capability capability)
+    {
+        var decision = authorizationService.Authorize(
+            principal,
+            new AuthorizationRequest(capability));
+        return decision.Decision switch
+        {
+            CapabilityDecisionKind.Allowed => null,
+            CapabilityDecisionKind.RequiresApproval => ChapterAuthorityResults.Fail<T>(
+                ChapterAuthorityError.ApprovalRequired,
+                string.Join(',', decision.Reasons)),
+            _ => ChapterAuthorityResults.Fail<T>(
+                principal is null ? ChapterAuthorityError.InvalidPrincipal : ChapterAuthorityError.CapabilityDenied,
+                string.Join(',', decision.Reasons))
+        };
+    }
 
     private static ChapterAuthorityResult<T> TransitionFailure<T>(AuthorityRejection? rejection)
     {

@@ -1,5 +1,7 @@
 using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Domain.Registry;
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.Reconcile;
 
@@ -137,6 +139,9 @@ public enum ReconcileError
     NoActiveBatch,
     ReconcileNotSupported,
     PathOutsideProject,
+    InvalidPrincipal,
+    CapabilityDenied,
+    ApprovalRequired,
     InfrastructureFailure
 }
 

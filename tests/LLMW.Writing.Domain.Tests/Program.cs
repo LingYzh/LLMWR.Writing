@@ -42,6 +42,7 @@ internal static partial class Program
             Run(nameof(AuthorityScopesUseIndependentTypes), AuthorityScopesUseIndependentTypes);
             RunWp06NarrativeChangeDomainTests();
             RunWp07RegistryDomainTests();
+            RunWp09SecurityDomainTests();
 
             Console.WriteLine($"Domain Authority FSM tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

@@ -3,12 +3,16 @@ using System.Text;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Domain.Narrative;
+using LLMW.Writing.Application.Security;
 
 namespace LLMW.Writing.Application.Tests;
 
 internal static class Program
 {
     private const string ObjectId = "018f3e78-1234-7abc-8def-0123456789a1";
+    private static readonly CallerPrincipal UserPrincipal =
+        new TrustedNativePrincipalSource("application-tests").ResolveUserInteractive();
+    private static readonly CoreAuthorizationService Authorization = new(new TrustedTestSecurityPolicySource());
 
     private static int Main()
     {
@@ -17,7 +21,10 @@ internal static class Program
             NoEvidenceUsesLightweightAssessmentWithoutImpactAnalyzer();
             DuplicateNarrativeObjectIsRejectedBeforeWorkingSetPersistence();
             SearchNarrativeRejectsInvalidQueryBeforeStore();
-            Console.WriteLine("Application Narrative Change/Registry tests passed (3).");
+            TrustedPrincipalConstructionBoundariesAreExplicit();
+            AuthorizationDenialPrecedesSearchSideEffects();
+            MissingSecurityPolicyFailsClosed();
+            Console.WriteLine("Application Narrative Change/Registry/Security tests passed (6).");
             return 0;
         }
         catch (Exception exception)
@@ -33,12 +40,15 @@ internal static class Program
         var impact = new ImpactFake();
         var service = new NarrativeChangeService(
             new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), impact,
-            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            Authorization);
         var created = Success(service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
-            [new WorkingNarrativeChangeInput(ObjectId, "character", NarrativeChangeKind.Add, AfterPayload: Payload("A"))])));
+            [new WorkingNarrativeChangeInput(ObjectId, "character", NarrativeChangeKind.Add, AfterPayload: Payload("A"))],
+            UserPrincipal)));
         var applied = Success(service.Apply(new ApplyNarrativeChangeSetCommand(
-            created.ChangeSetId, "application-fast-path", NarrativeDecisionKind.AuthorConfirmed, "author-1")));
+            created.ChangeSetId, "application-fast-path", NarrativeDecisionKind.AuthorConfirmed, "author-1",
+            Principal: UserPrincipal)));
 
         AssertEqual(0, impact.Calls, "NO_EVIDENCE_FOUND incorrectly invoked the heavy impact analyzer.");
         AssertEqual(NarrativeImpactAnalysisStatus.NoRelevantDependency, store.LastImpactStatus!.Value,
@@ -51,13 +61,15 @@ internal static class Program
         var store = new FakeStore();
         var service = new NarrativeChangeService(
             new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), new ImpactFake(),
-            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            Authorization);
         var result = service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
             [
                 new WorkingNarrativeChangeInput(ObjectId, "character", NarrativeChangeKind.Add, AfterPayload: Payload("A")),
                 new WorkingNarrativeChangeInput(ObjectId, "character", NarrativeChangeKind.Add, AfterPayload: Payload("B"))
-            ]));
+            ],
+            UserPrincipal));
 
         AssertEqual(NarrativeChangeError.PartialApplyForbidden, result.Failure?.Code,
             "Duplicate object mutation was not rejected before persistence.");
@@ -67,12 +79,65 @@ internal static class Program
     private static void SearchNarrativeRejectsInvalidQueryBeforeStore()
     {
         var store = new SearchStoreFake();
-        var service = new LLMW.Writing.Application.Registry.SearchNarrativeService(store);
-        var result = service.Search(new LLMW.Writing.Application.Registry.SearchNarrativeQuery(" "));
+        var service = new LLMW.Writing.Application.Registry.SearchNarrativeService(store, Authorization);
+        var result = service.Search(new LLMW.Writing.Application.Registry.SearchNarrativeQuery(" ", Principal: UserPrincipal));
 
         AssertEqual(LLMW.Writing.Application.Registry.RegistryQueryError.SearchQueryInvalid, result.Failure?.Code,
             "An empty Normal Retrieval query was not rejected with a typed result.");
         AssertEqual(0, store.Calls, "An invalid search query reached Infrastructure.");
+    }
+
+    private static void TrustedPrincipalConstructionBoundariesAreExplicit()
+    {
+        AssertEqual(LLMW.Writing.Domain.Security.PrincipalKind.UserInteractive, UserPrincipal.Kind,
+            "Trusted Native composition did not create USER_INTERACTIVE.");
+        var publicCoreFactory = typeof(CallerPrincipal).GetMethods(System.Reflection.BindingFlags.Public |
+                                                                  System.Reflection.BindingFlags.Static)
+            .Any(method => method.Name.Contains("CoreInternal", StringComparison.Ordinal));
+        AssertEqual(false, publicCoreFactory, "CallerPrincipal exposes a public CORE_INTERNAL factory.");
+        AssertEqual(0, typeof(CallerPrincipal).GetConstructors().Length,
+            "CallerPrincipal has a public constructor that ordinary callers can use to select a trusted principal.");
+        AssertEqual(false, typeof(LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest).GetProperties()
+                .Any(property => property.Name.Contains("Role", StringComparison.OrdinalIgnoreCase) ||
+                                 property.Name.Contains("Capability", StringComparison.OrdinalIgnoreCase) ||
+                                 property.Name.Contains("Principal", StringComparison.OrdinalIgnoreCase)),
+            "RunSession request exposes caller-selected role/capability/principal.");
+        var commandTypes = new[]
+        {
+            typeof(LLMW.Writing.Application.ChapterAuthority.SubmitChapterDraftCommand),
+            typeof(LLMW.Writing.Application.ChapterAuthority.ReviewChapterCandidateCommand),
+            typeof(LLMW.Writing.Application.ChapterAuthority.AcceptChapterCandidateCommand),
+            typeof(CreateWorkingNarrativeChangeSetCommand),
+            typeof(ApplyNarrativeChangeSetCommand),
+            typeof(LLMW.Writing.Application.Registry.SearchNarrativeQuery)
+        };
+        AssertEqual(false, commandTypes.SelectMany(type => type.GetProperties())
+                .Any(property => property.Name.Contains("PermissionMode", StringComparison.OrdinalIgnoreCase) ||
+                                 property.Name.Contains("AcceptanceAuthorized", StringComparison.OrdinalIgnoreCase)),
+            "A public command can supply permission mode or an authorization boolean.");
+    }
+
+    private static void AuthorizationDenialPrecedesSearchSideEffects()
+    {
+        var store = new SearchStoreFake();
+        var service = new LLMW.Writing.Application.Registry.SearchNarrativeService(store, Authorization);
+        var result = service.Search(new LLMW.Writing.Application.Registry.SearchNarrativeQuery("authority", Principal: null));
+
+        AssertEqual(LLMW.Writing.Application.Registry.RegistryQueryError.InvalidPrincipal, result.Failure?.Code,
+            "Missing principal did not return a typed security error.");
+        AssertEqual(0, store.Calls, "Authorization denial occurred after the Registry store side effect.");
+    }
+
+    private static void MissingSecurityPolicyFailsClosed()
+    {
+        var decision = new CoreAuthorizationService().Authorize(
+            UserPrincipal,
+            new AuthorizationRequest(LLMW.Writing.Domain.Security.Capability.RegistryQuery));
+
+        AssertEqual(LLMW.Writing.Domain.Security.CapabilityDecisionKind.Denied, decision.Decision,
+            "The production/default authorization service allowed a missing policy source.");
+        AssertEqual(LLMW.Writing.Domain.Security.CapabilityDecisionReason.ProductDenied, decision.Reasons.Single(),
+            "Missing policy did not produce a structured fail-closed reason.");
     }
 
     private static T Success<T>(NarrativeChangeResult<T> result)
@@ -114,6 +179,20 @@ internal static class Program
     {
         public SemanticDependencyAssessment Assess(NarrativeChangeSetSnapshot changeSet, CancellationToken cancellationToken = default) =>
             new(SemanticDependencyFinding.NoEvidenceFound, "{\"evidence\":\"none\"}");
+    }
+
+    private sealed class TrustedTestSecurityPolicySource : ISecurityPolicySource
+    {
+        public SecurityPolicySnapshot Resolve(CallerPrincipal principal, LLMW.Writing.Domain.Security.Capability capability) =>
+            new(
+                ProductAllowed: true,
+                ToolGranted: true,
+                ExtensionGranted: true,
+                ProjectTrusted: true,
+                LLMW.Writing.Domain.Security.SecurityScopeClassification.InScope,
+                LLMW.Writing.Domain.Security.HardDeny.None,
+                NarrativeAuthorityAvailable: false,
+                ExplicitUserTask: false);
     }
 
     private sealed class ImpactFake : INarrativeImpactAnalyzer

@@ -46,7 +46,7 @@ internal static partial class Program
         var baseline = fixture.SeedCurrent(ObjectA, "A v1");
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
-            [Modify(ObjectA, baseline, "A proposal")])));
+            [Modify(ObjectA, baseline, "A proposal")], Wp09UserPrincipal)));
 
         fixture.AssertScalar(1L, "SELECT COUNT(*) FROM narrative_change_sets;");
         fixture.AssertScalar(1L, "SELECT COUNT(*) FROM narrative_changes;");
@@ -72,7 +72,7 @@ internal static partial class Program
                 Modify(ObjectA, a, "A v2"),
                 Remove(ObjectB, b),
                 Add(ObjectC, "character", "C v1")
-            ])));
+            ], Wp09UserPrincipal)));
 
         var applied = Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "multi-success")));
         AssertWp06Equal(AuthorityTransactionState.Complete, applied.TransactionState, "Multi-object Apply did not complete.");
@@ -97,7 +97,7 @@ internal static partial class Program
         var removedState = fixture.ReadCurrentState(ObjectB);
         var reintroduced = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
-            [Reintroduce(ObjectB, removedState, "B returned")])));
+            [Reintroduce(ObjectB, removedState, "B returned")], Wp09UserPrincipal)));
         Wp06Success(fixture.Service.Apply(Apply(reintroduced.ChangeSetId, "reintroduce")));
         fixture.AssertScalar("current", $"SELECT status FROM objects WHERE object_id='{ObjectB}';");
         fixture.AssertScalar(3L, $"SELECT revision_no FROM objects WHERE object_id='{ObjectB}';");
@@ -112,7 +112,7 @@ internal static partial class Program
         var b = fixture.SeedCurrent(ObjectB, "B v1");
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
-            [Modify(ObjectA, a, "A v2"), Modify(ObjectB, b, "B proposal")])));
+            [Modify(ObjectA, a, "A v2"), Modify(ObjectB, b, "B proposal")], Wp09UserPrincipal)));
         fixture.ExternalAuthorityModify(ObjectB, "B v2 elsewhere");
 
         var result = fixture.Service.Apply(Apply(created.ChangeSetId, "stale-set"));
@@ -135,7 +135,7 @@ internal static partial class Program
         using var fixture = Wp06Fixture.Create(race);
         var a = fixture.SeedCurrent(ObjectA, "A v1");
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A proposal")] )));
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A proposal")], Wp09UserPrincipal)));
         race.Action = () => fixture.ExternalAuthorityModify(ObjectA, "A v2 elsewhere");
 
         var result = fixture.Service.Apply(Apply(created.ChangeSetId, "freshness-race"));
@@ -157,7 +157,7 @@ internal static partial class Program
         fixture.AddDependencyEdge("018f3e78-1234-7abc-8def-0123456789d1", ObjectA, ObjectB);
         fixture.Impact.Next = AffectedImpact(ObjectB);
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")] )));
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")], Wp09UserPrincipal)));
 
         Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "structural-impact")));
         AssertWp06Equal(1, fixture.Impact.Calls, "Structural dependency did not invoke impact analysis.");
@@ -175,7 +175,7 @@ internal static partial class Program
         fixture.Semantic.Next = new SemanticDependencyAssessment(SemanticDependencyFinding.Found, "{\"evidence\":\"semantic\"}");
         fixture.Impact.Next = AffectedImpact();
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")] )));
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")], Wp09UserPrincipal)));
 
         Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "semantic-found")));
         AssertWp06Equal(1, fixture.Impact.Calls, "Semantic FOUND took the no-dependency fast path.");
@@ -192,7 +192,7 @@ internal static partial class Program
             "candidate retrieval did not cover the final arc",
             "chapters=1-3; final-arc=not-covered");
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")] )));
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")], Wp09UserPrincipal)));
 
         var applied = Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "semantic-uncertain")));
         AssertWp06Equal(0, fixture.Impact.Calls, "UNCERTAIN without a relevant dependency called heavy impact analysis.");
@@ -214,7 +214,7 @@ internal static partial class Program
         fixture.Impact.Next = new NarrativeImpactAnalysisResult(
             NarrativeImpactAnalysisStatus.Failed, [], [], "{\"failure\":\"fake\"}", []);
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")] )));
+            "storyline", "storyline-1", "author", "author-1", [Modify(ObjectA, a, "A v2")], Wp09UserPrincipal)));
 
         var result = fixture.Service.Apply(Apply(created.ChangeSetId, "impact-failed"));
         Wp06Failure(NarrativeChangeError.ImpactAnalysisFailed, result.Failure);
@@ -228,13 +228,14 @@ internal static partial class Program
     {
         using var fixture = Wp06Fixture.Create();
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "agent", "agent-1", [Add(ObjectA, "character", "A proposal")] )));
+            "storyline", "storyline-1", "agent", "agent-1", [Add(ObjectA, "character", "A proposal")], Wp09UserPrincipal)));
 
         var result = fixture.Service.Apply(new ApplyNarrativeChangeSetCommand(
             created.ChangeSetId,
             "delegated-not-yet-available",
             NarrativeDecisionKind.AgentDelegated,
-            "agent-1"));
+            "agent-1",
+            Principal: Wp09UserPrincipal));
         Wp06Failure(NarrativeChangeError.DecisionAuthorityNotAvailable, result.Failure);
         AssertWp06Equal(0, fixture.Semantic.Calls, "Rejected delegated Apply invoked semantic assessment.");
         AssertWp06Equal(0, fixture.Impact.Calls, "Rejected delegated Apply invoked impact analysis.");
@@ -250,7 +251,7 @@ internal static partial class Program
     {
         using var fixture = Wp06Fixture.Create();
         var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-            "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")] )));
+            "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")], Wp09UserPrincipal)));
 
         var first = Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "idempotent")));
         var retry = Wp06Success(fixture.Service.Apply(Apply(created.ChangeSetId, "idempotent")));
@@ -276,7 +277,7 @@ internal static partial class Program
         using (var fixture = Wp06Fixture.Create(preCommitFault))
         {
             var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-                "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")] )));
+                "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")], Wp09UserPrincipal)));
             var interrupted = fixture.Service.Apply(Apply(created.ChangeSetId, "pre-commit"));
             Wp06Failure(NarrativeChangeError.InfrastructureFailure, interrupted.Failure);
             fixture.AssertScalar("proposed", $"SELECT status FROM objects WHERE object_id='{ObjectA}';");
@@ -293,7 +294,7 @@ internal static partial class Program
         using (var fixture = Wp06Fixture.Create(postCommitFault))
         {
             var created = Wp06Success(fixture.Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-                "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")] )));
+                "storyline", "storyline-1", "author", "author-1", [Add(ObjectA, "character", "A v1")], Wp09UserPrincipal)));
             var interrupted = fixture.Service.Apply(Apply(created.ChangeSetId, "post-commit"));
             Wp06Failure(NarrativeChangeError.AuthorityDirty, interrupted.Failure);
             fixture.AssertScalar("current", $"SELECT status FROM objects WHERE object_id='{ObjectA}';");
@@ -323,7 +324,7 @@ internal static partial class Program
         new(objectId, "character", NarrativeChangeKind.Reintroduce, state.StateRevisionId, state.Digest, Payload(payload));
 
     private static ApplyNarrativeChangeSetCommand Apply(string changeSetId, string idempotencyKey) =>
-        new(changeSetId, idempotencyKey, NarrativeDecisionKind.AuthorConfirmed, "author-1");
+        new(changeSetId, idempotencyKey, NarrativeDecisionKind.AuthorConfirmed, "author-1", Principal: Wp09UserPrincipal);
 
     private static MemoryStream Payload(string value) => new(Encoding.UTF8.GetBytes(value));
 
@@ -438,7 +439,8 @@ internal static partial class Program
                 store,
                 semantic,
                 impact,
-                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+                Wp09Authorization);
             return new Wp06Fixture(directory, databasePath, blobStore, semantic, impact, service);
         }
 

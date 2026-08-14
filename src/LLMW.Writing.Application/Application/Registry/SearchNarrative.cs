@@ -1,3 +1,6 @@
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Security;
+
 namespace LLMW.Writing.Application.Registry;
 
 public enum RegistryQueryError
@@ -8,7 +11,10 @@ public enum RegistryQueryError
     RegistryNotTrusted,
     SearchIndexDirty,
     SearchIndexUnavailable,
-    SearchQueryInvalid
+    SearchQueryInvalid,
+    InvalidPrincipal,
+    CapabilityDenied,
+    ApprovalRequired
 }
 
 public sealed record RegistryQueryFailure(RegistryQueryError Code, string? Detail = null);
@@ -26,7 +32,10 @@ public static class RegistryQueryResults
         new(default, new RegistryQueryFailure(code, detail));
 }
 
-public sealed record SearchNarrativeQuery(string Text, int Limit = 20);
+public sealed record SearchNarrativeQuery(
+    string Text,
+    int Limit = 20,
+    CallerPrincipal? Principal = null);
 
 public sealed record NarrativeSearchHit(
     string ObjectId,
@@ -49,10 +58,12 @@ public sealed class SearchNarrativeService
     private const int MaximumQueryLength = 512;
     private const int MaximumResultLimit = 100;
     private readonly INarrativeSearchStore store;
+    private readonly IAuthorizationService authorizationService;
 
-    public SearchNarrativeService(INarrativeSearchStore store)
+    public SearchNarrativeService(INarrativeSearchStore store, IAuthorizationService? authorizationService = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
+        this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
     }
 
     public RegistryQueryResult<IReadOnlyList<NarrativeSearchHit>> Search(
@@ -60,6 +71,21 @@ public sealed class SearchNarrativeService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(query);
+        var decision = authorizationService.Authorize(
+            query.Principal,
+            new AuthorizationRequest(Capability.RegistryQuery));
+        if (decision.Decision != CapabilityDecisionKind.Allowed)
+        {
+            var code = query.Principal is null
+                ? RegistryQueryError.InvalidPrincipal
+                : decision.Decision == CapabilityDecisionKind.RequiresApproval
+                    ? RegistryQueryError.ApprovalRequired
+                    : RegistryQueryError.CapabilityDenied;
+            return RegistryQueryResults.Fail<IReadOnlyList<NarrativeSearchHit>>(
+                code,
+                string.Join(',', decision.Reasons));
+        }
+
         if (string.IsNullOrWhiteSpace(query.Text) || query.Text.Length > MaximumQueryLength ||
             query.Limit is < 1 or > MaximumResultLimit)
         {

@@ -3,6 +3,7 @@ using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
+using LLMW.Writing.Application.Security;
 
 namespace LLMW.Writing.Application.ChapterAuthority;
 
@@ -20,6 +21,9 @@ public enum ChapterAuthorityError
     ArtifactVerificationFailed,
     AuthorityDirty,
     RecoveryRequired,
+    InvalidPrincipal,
+    CapabilityDenied,
+    ApprovalRequired,
     InfrastructureFailure
 }
 
@@ -42,7 +46,8 @@ public sealed record SubmitChapterDraftCommand(
     string ChapterId,
     string DraftPath,
     string IdempotencyKey,
-    SubmissionEligibility Eligibility = SubmissionEligibility.Normal);
+    SubmissionEligibility Eligibility = SubmissionEligibility.Normal,
+    CallerPrincipal? Principal = null);
 
 public sealed record SubmitChapterDraftResult(
     string CandidateId,
@@ -62,7 +67,9 @@ public sealed record ChapterReviewDecision(
     string? DiagnosticsReference = null,
     string? RequestedChangesReference = null);
 
-public sealed record ReviewChapterCandidateCommand(string CandidateId);
+public sealed record ReviewChapterCandidateCommand(
+    string CandidateId,
+    CallerPrincipal? Principal = null);
 
 public sealed record ReviewChapterCandidateResult(
     string CandidateId,
@@ -72,10 +79,9 @@ public sealed record ReviewChapterCandidateResult(
 public sealed record AcceptChapterCandidateCommand(
     string CandidateId,
     string IdempotencyKey,
-    bool AcceptanceAuthorized,
-    DecisionAuthorityKind AuthorityKind,
     string AcceptedById,
-    NarrativeOversightMode OversightMode = NarrativeOversightMode.Manual);
+    NarrativeOversightMode OversightMode = NarrativeOversightMode.Manual,
+    CallerPrincipal? Principal = null);
 
 public sealed record AcceptChapterCandidateResult(
     string CandidateId,

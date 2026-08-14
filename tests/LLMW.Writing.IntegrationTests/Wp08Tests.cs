@@ -60,12 +60,12 @@ internal static partial class Program
             "Watcher evidence overwrote the trusted physical baseline.");
         Wp08Equal(0, Wp07SearchSuccess(environment.Fixture.Search("externalwp08")).Count,
             "External bytes entered Normal Retrieval.");
-        var inspection = Wp08Success(environment.Reconcile.Analyze(Wp08Relative(environment.Fixture.Directory, path)));
+        var inspection = Wp08Success(environment.Reconcile.Analyze(Wp08Relative(environment.Fixture.Directory, path), Wp09UserPrincipal));
         Wp08True(inspection.CurrentAuthorityBody!.Contains("trustedwp08", StringComparison.Ordinal),
             "Analyze did not retain the current Authority evidence.");
         Wp08True(inspection.ObservedBody!.Contains("externalwp08", StringComparison.Ordinal),
             "Analyze did not expose observed external evidence.");
-        var inspected = Wp08Success(environment.Reconcile.Inspect(Wp08Relative(environment.Fixture.Directory, path)));
+        var inspected = Wp08Success(environment.Reconcile.Inspect(Wp08Relative(environment.Fixture.Directory, path), Wp09UserPrincipal));
         Wp08Equal(inspection.Observation.TrustedPhysicalDigest, inspected.Observation.TrustedPhysicalDigest,
             "Inspect did not preserve Analyze evidence.");
         Wp08Equal(ReconcileClassification.UnregisteredNew,
@@ -73,11 +73,11 @@ internal static partial class Program
             "Unregistered Narrative file was not surfaced for confirmation.");
         Wp08Equal(0, Wp07SearchSuccess(environment.Fixture.Search("unregisteredwp08")).Count,
             "Unregistered file entered Normal Retrieval.");
-        var ignored = Wp08Success(environment.Reconcile.Ignore(Wp08Relative(environment.Fixture.Directory, unregistered)));
+        var ignored = Wp08Success(environment.Reconcile.Ignore(Wp08Relative(environment.Fixture.Directory, unregistered), Wp09UserPrincipal));
         Wp08Equal(ReconcileClassification.Ignored,
             Wp08Observation(ignored, unregistered, environment.Fixture.Directory).Classification,
             "Explicit Ignore did not remain restricted to runtime-only unregistered state.");
-        var cannotIgnoreRegistered = environment.Reconcile.Ignore(Wp08Relative(environment.Fixture.Directory, path));
+        var cannotIgnoreRegistered = environment.Reconcile.Ignore(Wp08Relative(environment.Fixture.Directory, path), Wp09UserPrincipal);
         Wp08Equal(ReconcileError.ReconcileNotSupported, cannotIgnoreRegistered.Failure!.Code,
             "Ignore bypassed a registered digest mismatch.");
         using (File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
@@ -106,16 +106,17 @@ internal static partial class Program
             environment.Fixture.Coordinator,
             enableProjection: true);
         var racingService = new NarrativeChangeService(
-            environment.Fixture.BlobStore, racingStore, new SemanticFake(), new ImpactFake(), racingGate);
+            environment.Fixture.BlobStore, racingStore, new SemanticFake(), new ImpactFake(), racingGate, Wp09Authorization);
         var racingReconcile = new NarrativeReconcileService(
             environment.Fixture.DatabasePath,
             environment.Engine,
             environment.Fixture.BlobStore,
             environment.Fixture.Rebuilder,
             racingService,
-            new AtomicAuthorityMaterializer(environment.Fixture.Directory, environment.Fixture.BlobStore, environment.Tracker));
+            new AtomicAuthorityMaterializer(environment.Fixture.Directory, environment.Fixture.BlobStore, environment.Tracker),
+            authorizationService: Wp09Authorization);
         var raced = racingReconcile.ConfirmNarrativeModify(
-            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-raced", "wp08-author");
+            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-raced", "wp08-author", Wp09UserPrincipal);
         Wp08Equal(ReconcileError.AuthoritySurfaceDirty, raced.Failure!.Code,
             "Confirmed reconcile did not reject bytes changed between its two fresh health checks.");
         Wp08Equal(revisionBefore, environment.Fixture.CurrentState(Wp07ObjectA).StateRevisionId,
@@ -125,7 +126,7 @@ internal static partial class Program
             new UTF8Encoding(false));
 
         var confirmed = Wp08Success(environment.Reconcile.ConfirmNarrativeModify(
-            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-modify", "wp08-author"));
+            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-modify", "wp08-author", Wp09UserPrincipal));
         Wp08True(confirmed.AuthorityChanged, "Confirmed Narrative modify did not traverse WP06 Apply.");
         Wp08True(environment.Fixture.CurrentState(Wp07ObjectA).StateRevisionId != revisionBefore,
             "Confirmed Narrative modify did not create a new state revision.");
@@ -136,7 +137,7 @@ internal static partial class Program
         var revisionAfter = environment.Fixture.CurrentState(Wp07ObjectA).StateRevisionId;
         File.AppendAllText(path, "\n", new UTF8Encoding(false));
         var equivalent = Wp08Success(environment.Reconcile.ConfirmNarrativeModify(
-            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-equivalent", "wp08-author"));
+            Wp08Relative(environment.Fixture.Directory, path), "wp08-confirm-equivalent", "wp08-author", Wp09UserPrincipal));
         Wp08False(equivalent.AuthorityChanged, "Semantically equivalent bytes created a needless Authority revision.");
         Wp08Equal(revisionAfter, environment.Fixture.CurrentState(Wp07ObjectA).StateRevisionId,
             "Equivalent reconcile changed the Authority revision.");
@@ -176,9 +177,9 @@ internal static partial class Program
             Wp08Observation(environment.Engine.Scan(FileEventSource.FullRescan), canonical, environment.Fixture.Directory).Classification,
             "Wrong-objectId move was incorrectly bound to the registered object.");
 
-        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, canonical)));
+        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, canonical), Wp09UserPrincipal));
         Wp08True(File.Exists(canonical), "Explicit Restore did not recreate the registered canonical projection.");
-        Wp08Success(environment.Reconcile.Delete(Wp08Relative(environment.Fixture.Directory, moved)));
+        Wp08Success(environment.Reconcile.Delete(Wp08Relative(environment.Fixture.Directory, moved), Wp09UserPrincipal));
         Wp08False(File.Exists(moved), "Explicit Delete did not remove the unregistered rename candidate.");
         var machine = Path.Combine(environment.Fixture.Directory, "Narrative", "state", "registry.json");
         File.AppendAllText(machine, " ", new UTF8Encoding(false));
@@ -186,7 +187,7 @@ internal static partial class Program
         Wp08Equal(ReconcileClassification.ProjectionModified,
             Wp08Observation(dirtyMachine, machine, environment.Fixture.Directory).Classification,
             "Machine JSON edit was not classified as a rebuild-only projection change.");
-        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, machine)));
+        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, machine), Wp09UserPrincipal));
         Wp08Equal(ReconcileClassification.Unchanged,
             Wp08Observation(environment.Engine.Scan(FileEventSource.FullRescan), machine, environment.Fixture.Directory).Classification,
             "Machine projection remained dirty after deterministic rebuild.");
@@ -199,7 +200,7 @@ internal static partial class Program
         Wp08Equal("missing", environment.Fixture.Scalar<string>(
             "SELECT registration_state FROM registry_entries WHERE object_id=$id;", ("$id", Wp07ObjectA)),
             "Missing registered path did not remain an explicit Registry state.");
-        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, canonical)));
+        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, canonical), Wp09UserPrincipal));
         environment.Fixture.AssertRegistryTrusted(Wp07ObjectA, canonical);
     }
 
@@ -274,16 +275,16 @@ internal static partial class Program
         var path = environment.Fixture.ObjectProjectionPath("character", Wp07ObjectA);
         File.AppendAllText(path, "race", new UTF8Encoding(false));
         var blocked = environment.GatedService.Apply(new ApplyNarrativeChangeSetCommand(
-            second, "wp08-gate-blocked", NarrativeDecisionKind.AuthorConfirmed, "wp08-author"));
+            second, "wp08-gate-blocked", NarrativeDecisionKind.AuthorConfirmed, "wp08-author", Principal: Wp09UserPrincipal));
         Wp08Equal(NarrativeChangeError.AuthorityDirty, blocked.Failure!.Code,
             "Apply passed while disk was dirty but the debounce queue had not fired.");
 
-        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, path)));
+        Wp08Success(environment.Reconcile.Restore(Wp08Relative(environment.Fixture.Directory, path), Wp09UserPrincipal));
         var draftDirectory = Path.Combine(environment.Fixture.Directory, "Draft", "chapter");
         Directory.CreateDirectory(draftDirectory);
         File.WriteAllText(Path.Combine(draftDirectory, "chapter.md"), "draft changes are working state", new UTF8Encoding(false));
         Wp08Success(environment.GatedService.Apply(new ApplyNarrativeChangeSetCommand(
-            second, "wp08-gate-clean", NarrativeDecisionKind.AuthorConfirmed, "wp08-author")));
+            second, "wp08-gate-clean", NarrativeDecisionKind.AuthorConfirmed, "wp08-author", Principal: Wp09UserPrincipal)));
         Wp08Equal(1, Wp07SearchSuccess(environment.Fixture.Search("gateblockedwp08")).Count,
             "Draft-only change blocked or corrupted a clean Authority commit.");
     }
@@ -293,8 +294,8 @@ internal static partial class Program
         using var fixture = Wp05Fixture.Create(ChapterReviewOutcome.Pass);
         File.WriteAllText(fixture.DraftPath, "manuscript baseline", new UTF8Encoding(false));
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "wp08-manuscript-base")));
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId)));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "wp08-manuscript-base", Principal: Wp09UserPrincipal)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
         Success(fixture.Service.AcceptChapterCandidate(AuthorAccept(submitted.CandidateId, "wp08-manuscript-base")));
 
         var tracker = new SelfWriteTracker();
@@ -305,10 +306,11 @@ internal static partial class Program
             fixture.Coordinator,
             new SqliteChapterAuthorityStore(fixture.DatabasePath, fixture.Coordinator),
             fixture.Reviewer,
-            gate);
+            gate,
+            Wp09Authorization);
         File.AppendAllText(fixture.CurrentManuscriptPath, "external", new UTF8Encoding(false));
         var blocked = guardedService.SubmitChapterDraft(new SubmitChapterDraftCommand(
-            fixture.ChapterId, fixture.DraftPath, "wp08-manuscript-blocked"));
+            fixture.ChapterId, fixture.DraftPath, "wp08-manuscript-blocked", Principal: Wp09UserPrincipal));
         Wp08Equal(ChapterAuthorityError.AuthorityDirty, blocked.Failure!.Code,
             "External Current Manuscript edit did not block chapter mutation.");
 
@@ -596,14 +598,15 @@ internal static partial class Program
             var store = new SqliteNarrativeChangeStore(
                 fixture.DatabasePath, fixture.BlobStore, fixture.Coordinator, enableProjection: true);
             var service = new NarrativeChangeService(
-                fixture.BlobStore, store, new SemanticFake(), new ImpactFake(), gate);
+                fixture.BlobStore, store, new SemanticFake(), new ImpactFake(), gate, Wp09Authorization);
             var reconcile = new NarrativeReconcileService(
                 fixture.DatabasePath,
                 engine,
                 fixture.BlobStore,
                 fixture.Rebuilder,
                 service,
-                new AtomicAuthorityMaterializer(fixture.Directory, fixture.BlobStore, tracker));
+                new AtomicAuthorityMaterializer(fixture.Directory, fixture.BlobStore, tracker),
+                authorizationService: Wp09Authorization);
             var monitor = new ProjectFileMonitor(engine, tracker);
             return new Wp08Environment(fixture, tracker, engine, service, reconcile, monitor);
         }

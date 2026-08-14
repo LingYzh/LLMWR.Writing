@@ -1,5 +1,6 @@
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Domain.Narrative;
+using LLMW.Writing.Application.Security;
 
 namespace LLMW.Writing.Application.NarrativeChange;
 
@@ -22,6 +23,9 @@ public enum NarrativeChangeError
     AuthorityDirty,
     RecoveryRequired,
     PartialApplyForbidden,
+    InvalidPrincipal,
+    CapabilityDenied,
+    ApprovalRequired,
     InfrastructureFailure
 }
 
@@ -54,7 +58,8 @@ public sealed record CreateWorkingNarrativeChangeSetCommand(
     string ScopeId,
     string ProposerKind,
     string? ProposerId,
-    IReadOnlyList<WorkingNarrativeChangeInput> Changes);
+    IReadOnlyList<WorkingNarrativeChangeInput> Changes,
+    CallerPrincipal? Principal = null);
 
 public sealed record CreateWorkingNarrativeChangeSetResult(
     string ChangeSetId,
@@ -72,7 +77,8 @@ public sealed record ApplyNarrativeChangeSetCommand(
     NarrativeDecisionKind DeciderKind,
     string? DeciderId,
     IReadOnlyList<string>? ResolvingReconcileObjectIds = null,
-    IReadOnlyDictionary<string, string>? ResolvingReconcilePhysicalDigests = null);
+    IReadOnlyDictionary<string, string>? ResolvingReconcilePhysicalDigests = null,
+    CallerPrincipal? Principal = null);
 
 public sealed record ApplyNarrativeChangeSetResult(
     string ChangeSetId,

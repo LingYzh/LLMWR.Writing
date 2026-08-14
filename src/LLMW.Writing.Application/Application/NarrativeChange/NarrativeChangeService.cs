@@ -2,6 +2,8 @@ using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Domain.Narrative;
 using LLMW.Writing.Application.Reconcile;
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.NarrativeChange;
 
@@ -12,19 +14,22 @@ public sealed class NarrativeChangeService
     private readonly ISemanticDependencyAssessor semanticDependencyAssessor;
     private readonly INarrativeImpactAnalyzer impactAnalyzer;
     private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
+    private readonly IAuthorizationService authorizationService;
 
     public NarrativeChangeService(
         IImmutableBlobStore blobStore,
         INarrativeChangeStore store,
         ISemanticDependencyAssessor semanticDependencyAssessor,
         INarrativeImpactAnalyzer impactAnalyzer,
-        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate)
+        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate,
+        IAuthorizationService? authorizationService = null)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.semanticDependencyAssessor = semanticDependencyAssessor ?? throw new ArgumentNullException(nameof(semanticDependencyAssessor));
         this.impactAnalyzer = impactAnalyzer ?? throw new ArgumentNullException(nameof(impactAnalyzer));
         this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
+        this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
     }
 
     public NarrativeChangeResult<CreateWorkingNarrativeChangeSetResult> CreateWorkingChangeSet(
@@ -32,6 +37,14 @@ public sealed class NarrativeChangeService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(command);
+        var authorization = Authorize<CreateWorkingNarrativeChangeSetResult>(
+            command.Principal,
+            Capability.StructuredWrite);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
         if (string.IsNullOrWhiteSpace(command.ScopeKind) || string.IsNullOrWhiteSpace(command.ScopeId) ||
             string.IsNullOrWhiteSpace(command.ProposerKind) || command.Changes.Count == 0)
         {
@@ -104,6 +117,21 @@ public sealed class NarrativeChangeService
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(command);
+        var authorization = Authorize<ApplyNarrativeChangeSetResult>(
+            command.Principal,
+            Capability.AuthorityAccept);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        if (command.Principal?.Kind != PrincipalKind.UserInteractive)
+        {
+            return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                NarrativeChangeError.DecisionAuthorityNotAvailable,
+                "WP09 does not activate AgentDelegated Narrative Authority.");
+        }
+
         if (string.IsNullOrWhiteSpace(command.ChangeSetId) || string.IsNullOrWhiteSpace(command.IdempotencyKey))
         {
             return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(NarrativeChangeError.ChangeSetNotApplicable);
@@ -166,6 +194,15 @@ public sealed class NarrativeChangeService
                 return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
                     NarrativeChangeError.AuthorityDirty,
                     FormatHealthFailure(finalHealth));
+            }
+
+            var commitAuthorization = Authorize<ApplyNarrativeChangeSetResult>(
+                command.Principal,
+                Capability.AuthorityAccept);
+            if (commitAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+            {
+                return commitAuthorization ?? NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                    NarrativeChangeError.DecisionAuthorityNotAvailable);
             }
 
             var applied = store.Apply(
@@ -399,4 +436,21 @@ public sealed class NarrativeChangeService
 
     private static string FormatHealthFailure(AuthoritySurfaceHealth health) =>
         string.Join("; ", health.Issues.Select(issue => $"{issue.Kind}:{issue.RelativePath}:{issue.Detail}"));
+
+    private NarrativeChangeResult<T>? Authorize<T>(
+        CallerPrincipal? principal,
+        Capability capability)
+    {
+        var decision = authorizationService.Authorize(principal, new AuthorizationRequest(capability));
+        return decision.Decision switch
+        {
+            CapabilityDecisionKind.Allowed => null,
+            CapabilityDecisionKind.RequiresApproval => NarrativeChangeResults.Fail<T>(
+                NarrativeChangeError.ApprovalRequired,
+                string.Join(',', decision.Reasons)),
+            _ => NarrativeChangeResults.Fail<T>(
+                principal is null ? NarrativeChangeError.InvalidPrincipal : NarrativeChangeError.CapabilityDenied,
+                string.Join(',', decision.Reasons))
+        };
+    }
 }

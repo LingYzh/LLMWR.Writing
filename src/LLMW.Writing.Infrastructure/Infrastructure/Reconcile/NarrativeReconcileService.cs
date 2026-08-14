@@ -7,6 +7,8 @@ using LLMW.Writing.Domain.Narrative;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Projection;
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Infrastructure.Reconcile;
 
@@ -20,6 +22,7 @@ public sealed class NarrativeReconcileService
     private readonly NarrativeChangeService narrativeChangeService;
     private readonly AtomicAuthorityMaterializer manuscriptMaterializer;
     private readonly SqliteDatabaseConnectionFactory connectionFactory;
+    private readonly IAuthorizationService authorizationService;
 
     public NarrativeReconcileService(
         string databasePath,
@@ -29,7 +32,8 @@ public sealed class NarrativeReconcileService
         NarrativeChangeService narrativeChangeService,
         AtomicAuthorityMaterializer manuscriptMaterializer,
         SqliteDatabaseConnectionFactory? connectionFactory = null,
-        ProjectionFrontmatterParser? parser = null)
+        ProjectionFrontmatterParser? parser = null,
+        IAuthorizationService? authorizationService = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         this.databasePath = Path.GetFullPath(databasePath);
@@ -40,12 +44,20 @@ public sealed class NarrativeReconcileService
         this.manuscriptMaterializer = manuscriptMaterializer ?? throw new ArgumentNullException(nameof(manuscriptMaterializer));
         this.connectionFactory = connectionFactory ?? new SqliteDatabaseConnectionFactory();
         this.parser = parser ?? new ProjectionFrontmatterParser();
+        this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
     }
 
     public ReconcileResult<ReconcileInspection> Analyze(
         string relativePath,
+        CallerPrincipal? principal = null,
         CancellationToken cancellationToken = default)
     {
+        var authorization = Authorize<ReconcileInspection>(principal, Capability.RegistryQuery);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
         string normalized;
         try
         {
@@ -113,13 +125,22 @@ public sealed class NarrativeReconcileService
 
     public ReconcileResult<ReconcileInspection> Inspect(
         string relativePath,
-        CancellationToken cancellationToken = default) => Analyze(relativePath, cancellationToken);
+        CallerPrincipal? principal = null,
+        CancellationToken cancellationToken = default) =>
+        Analyze(relativePath, principal, cancellationToken);
 
     public ReconcileResult<ReconcileScanReport> Ignore(
         string relativePath,
+        CallerPrincipal? principal = null,
         CancellationToken cancellationToken = default)
     {
-        var analyzed = Analyze(relativePath, cancellationToken);
+        var authorization = AuthorizeUserMutation<ReconcileScanReport>(principal, Capability.RegistryMutate);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        var analyzed = Analyze(relativePath, principal, cancellationToken);
         if (!analyzed.Succeeded)
         {
             return new ReconcileResult<ReconcileScanReport>(null, analyzed.Failure);
@@ -139,9 +160,16 @@ public sealed class NarrativeReconcileService
 
     public ReconcileResult<ReconcileScanReport> Delete(
         string relativePath,
+        CallerPrincipal? principal = null,
         CancellationToken cancellationToken = default)
     {
-        var analyzed = Analyze(relativePath, cancellationToken);
+        var authorization = AuthorizeUserMutation<ReconcileScanReport>(principal, Capability.StructuredWrite);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        var analyzed = Analyze(relativePath, principal, cancellationToken);
         if (!analyzed.Succeeded)
         {
             return new ReconcileResult<ReconcileScanReport>(null, analyzed.Failure);
@@ -174,9 +202,16 @@ public sealed class NarrativeReconcileService
 
     public ReconcileResult<ReconcileScanReport> Restore(
         string relativePath,
+        CallerPrincipal? principal = null,
         CancellationToken cancellationToken = default)
     {
-        var analyzed = Analyze(relativePath, cancellationToken);
+        var authorization = AuthorizeUserMutation<ReconcileScanReport>(principal, Capability.StructuredWrite);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        var analyzed = Analyze(relativePath, principal, cancellationToken);
         if (!analyzed.Succeeded)
         {
             return new ReconcileResult<ReconcileScanReport>(null, analyzed.Failure);
@@ -210,11 +245,20 @@ public sealed class NarrativeReconcileService
         string relativePath,
         string idempotencyKey,
         string acceptedById,
+        CallerPrincipal? principal = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(idempotencyKey);
         ArgumentException.ThrowIfNullOrWhiteSpace(acceptedById);
-        var analyzed = Analyze(relativePath, cancellationToken);
+        var authorization = AuthorizeUserMutation<ConfirmNarrativeReconcileResult>(
+            principal,
+            Capability.AuthorityAccept);
+        if (authorization is not null)
+        {
+            return authorization;
+        }
+
+        var analyzed = Analyze(relativePath, principal, cancellationToken);
         if (!analyzed.Succeeded)
         {
             return new ReconcileResult<ConfirmNarrativeReconcileResult>(null, analyzed.Failure);
@@ -319,7 +363,8 @@ public sealed class NarrativeReconcileService
                     NarrativeChangeKind.Modify,
                     authority.StateRevisionId,
                     authority.SnapshotDigest,
-                    payload)]),
+                    payload)],
+                principal),
             cancellationToken);
         if (!working.Succeeded)
         {
@@ -338,7 +383,8 @@ public sealed class NarrativeReconcileService
                 new Dictionary<string, string>(StringComparer.Ordinal)
                 {
                     [authority.ObjectId] = observedDigest
-                }),
+                },
+                principal),
             cancellationToken);
         if (!applied.Succeeded)
         {
@@ -353,6 +399,35 @@ public sealed class NarrativeReconcileService
             AuthorityChanged: true,
             applied.Value,
             scan));
+    }
+
+    private ReconcileResult<T>? Authorize<T>(
+        CallerPrincipal? principal,
+        Capability capability)
+    {
+        var decision = authorizationService.Authorize(principal, new AuthorizationRequest(capability));
+        return decision.Decision switch
+        {
+            CapabilityDecisionKind.Allowed => null,
+            CapabilityDecisionKind.RequiresApproval => ReconcileResults.Fail<T>(
+                ReconcileError.ApprovalRequired,
+                string.Join(',', decision.Reasons)),
+            _ => ReconcileResults.Fail<T>(
+                principal is null ? ReconcileError.InvalidPrincipal : ReconcileError.CapabilityDenied,
+                string.Join(',', decision.Reasons))
+        };
+    }
+
+    private ReconcileResult<T>? AuthorizeUserMutation<T>(
+        CallerPrincipal? principal,
+        Capability capability)
+    {
+        var authorization = Authorize<T>(principal, capability);
+        return authorization ?? (principal?.Kind == PrincipalKind.UserInteractive
+            ? null
+            : ReconcileResults.Fail<T>(
+                ReconcileError.CapabilityDenied,
+                "WP09 requires USER_INTERACTIVE for destructive or Authority reconcile resolution."));
     }
 
     private static bool PhysicalDigestStillMatches(string fullPath, string expectedDigest)

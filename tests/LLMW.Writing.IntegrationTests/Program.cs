@@ -1,11 +1,15 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using LLMW.Writing.Contracts.Ipc;
+using LLMW.Writing.Application.Security;
 
 namespace LLMW.Writing.IntegrationTests;
 
 internal static partial class Program
 {
+    private static readonly CallerPrincipal Wp09UserPrincipal =
+        new TrustedNativePrincipalSource("integration-tests").ResolveUserInteractive();
+    private static readonly CoreAuthorizationService Wp09Authorization = new(new Wp09TestSecurityPolicySource());
     private static async Task<int> Main()
     {
         try
@@ -14,6 +18,7 @@ internal static partial class Program
             RunWp06Tests();
             RunWp07Tests();
             RunWp08Tests();
+            RunWp09Tests();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;

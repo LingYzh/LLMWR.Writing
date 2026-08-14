@@ -38,9 +38,9 @@ internal static partial class Program
         File.WriteAllBytes(fixture.DraftPath, draftBytes);
 
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "happy-accept")));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "happy-accept", Principal: Wp09UserPrincipal)));
         var reviewed = Success(fixture.Service.ReviewChapterCandidate(
-            new ReviewChapterCandidateCommand(submitted.CandidateId)));
+            new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
         var accepted = Success(fixture.Service.AcceptChapterCandidate(
             AuthorAccept(submitted.CandidateId, "happy-accept")));
 
@@ -72,10 +72,10 @@ internal static partial class Program
         var versionB = Encoding.UTF8.GetBytes("version B");
         File.WriteAllBytes(fixture.DraftPath, versionA);
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "immutable-accept")));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "immutable-accept", Principal: Wp09UserPrincipal)));
         File.WriteAllBytes(fixture.DraftPath, versionB);
 
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
         Success(fixture.Service.AcceptChapterCandidate(AuthorAccept(submitted.CandidateId, "immutable-accept")));
 
         AssertWp05Bytes(versionA, fixture.ReadBlob(submitted.ArtifactDigest), "Candidate blob changed with Draft.");
@@ -89,8 +89,8 @@ internal static partial class Program
         using var fixture = Wp05Fixture.Create(ChapterReviewOutcome.Fail);
         File.WriteAllText(fixture.DraftPath, "first candidate", Encoding.UTF8);
         var first = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "fail-first")));
-        var failed = Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(first.CandidateId)));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "fail-first", Principal: Wp09UserPrincipal)));
+        var failed = Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(first.CandidateId, Wp09UserPrincipal)));
         AssertWp05Equal(ChapterReviewOutcome.Fail, failed.Outcome, "Fake reviewer did not FAIL.");
         fixture.AssertScalar("failed", $"SELECT status FROM candidates WHERE candidate_id='{first.CandidateId}';");
         fixture.AssertScalar(1L, $"SELECT COUNT(*) FROM review_attempts WHERE candidate_id='{first.CandidateId}';");
@@ -101,12 +101,12 @@ internal static partial class Program
         fixture.Reviewer.Outcome = ChapterReviewOutcome.Pass;
         File.WriteAllText(fixture.DraftPath, "second candidate", Encoding.UTF8);
         var second = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "retry-second")));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "retry-second", Principal: Wp09UserPrincipal)));
         AssertWp05False(StringComparer.Ordinal.Equals(first.CandidateId, second.CandidateId), "Retry reused Candidate identity.");
         fixture.AssertScalar(first.CandidateId,
             $"SELECT parent_candidate_id FROM candidates WHERE candidate_id='{second.CandidateId}';");
         fixture.AssertScalar("failed", $"SELECT status FROM candidates WHERE candidate_id='{first.CandidateId}';");
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(second.CandidateId)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(second.CandidateId, Wp09UserPrincipal)));
         Success(fixture.Service.AcceptChapterCandidate(AuthorAccept(second.CandidateId, "retry-second")));
     }
 
@@ -115,20 +115,19 @@ internal static partial class Program
         using var fixture = Wp05Fixture.Create(ChapterReviewOutcome.Pass);
         File.WriteAllText(fixture.DraftPath, "duplicate guard", Encoding.UTF8);
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "guard-accept")));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "guard-accept", Principal: Wp09UserPrincipal)));
         var duplicate = fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "guard-second"));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "guard-second", Principal: Wp09UserPrincipal));
         AssertWp05Failure(ChapterAuthorityError.ActiveSubmissionExists, duplicate.Failure);
 
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
         var unauthorized = fixture.Service.AcceptChapterCandidate(
             new AcceptChapterCandidateCommand(
                 submitted.CandidateId,
                 "guard-accept",
-                AcceptanceAuthorized: false,
-                DecisionAuthorityKind.AuthorConfirmed,
-                "unauthorized"));
-        AssertWp05Failure(ChapterAuthorityError.AcceptanceNotAuthorized, unauthorized.Failure);
+                "unauthorized",
+                Principal: null));
+        AssertWp05Failure(ChapterAuthorityError.InvalidPrincipal, unauthorized.Failure);
         fixture.AssertScalar(0L, "SELECT COUNT(*) FROM acceptance_records;");
         fixture.AssertScalar(0L, "SELECT COUNT(*) FROM manuscript_revisions;");
         AssertWp05False(File.Exists(fixture.CurrentManuscriptPath), "Unauthorized Accept changed materialization.");
@@ -141,8 +140,8 @@ internal static partial class Program
             AuthorityTransactionFaultPoint.BeforeSqliteCommit);
         File.WriteAllText(fixture.DraftPath, "pre-commit retry", Encoding.UTF8);
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "precommit-accept")));
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId)));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "precommit-accept", Principal: Wp09UserPrincipal)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
 
         var interrupted = fixture.Service.AcceptChapterCandidate(AuthorAccept(submitted.CandidateId, "precommit-accept"));
         AssertWp05Failure(ChapterAuthorityError.InfrastructureFailure, interrupted.Failure);
@@ -167,8 +166,8 @@ internal static partial class Program
         var expected = Encoding.UTF8.GetBytes("post-commit recovery");
         File.WriteAllBytes(fixture.DraftPath, expected);
         var submitted = Success(fixture.Service.SubmitChapterDraft(
-            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "postcommit-accept")));
-        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId)));
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "postcommit-accept", Principal: Wp09UserPrincipal)));
+        Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
 
         var interrupted = fixture.Service.AcceptChapterCandidate(AuthorAccept(submitted.CandidateId, "postcommit-accept"));
         AssertWp05Failure(ChapterAuthorityError.AuthorityDirty, interrupted.Failure);
@@ -198,9 +197,8 @@ internal static partial class Program
         new(
             candidateId,
             idempotencyKey,
-            AcceptanceAuthorized: true,
-            DecisionAuthorityKind.AuthorConfirmed,
-            "test/user-interactive");
+            "test/user-interactive",
+            Principal: Wp09UserPrincipal);
 
     private static T Success<T>(ChapterAuthorityResult<T> result)
     {
@@ -337,7 +335,8 @@ internal static partial class Program
                 coordinator,
                 store,
                 reviewer,
-                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+                Wp09Authorization);
             return new Wp05Fixture(root, databasePath, storylineId, chapterId, draftPath, blobStore, reviewer, coordinator, service);
         }
 

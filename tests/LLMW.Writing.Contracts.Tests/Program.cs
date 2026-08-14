@@ -16,6 +16,7 @@ internal static class Program
             ProtocolNegotiationHonorsV1Boundaries();
             PipeNamesAreWorkspaceSpecific();
             MessageIdsUseUuidV7Layout();
+            RunSessionContractCannotSelectTrustedPrincipalOrBinding();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }
@@ -95,6 +96,45 @@ internal static class Program
         var bytes = messageId.ToByteArray(bigEndian: true);
         AssertEqual(7, bytes[6] >> 4, "IPC message IDs must use UUIDv7.");
         AssertEqual(0x80, bytes[8] & 0xc0, "IPC message IDs must use the RFC 4122 variant.");
+    }
+
+    private static void RunSessionContractCannotSelectTrustedPrincipalOrBinding()
+    {
+        var envelope = new IpcEnvelope<CreateRunSessionRequest>(
+            1,
+            IpcMessageType.Request,
+            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"),
+            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ac"),
+            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ad"),
+            "workspace-01",
+            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ae"),
+            1735689600000,
+            new CreateRunSessionRequest("018f3e78-1234-7abc-8def-0123456789ae", 1735693200000));
+        var json = Encoding.UTF8.GetString(IpcJson.Serialize(
+            envelope,
+            IpcJsonContext.Default.CreateRunSessionRequestEnvelope));
+
+        AssertTrue(!json.Contains("principalKind", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC allowed caller-selected principalKind.");
+        AssertTrue(!json.Contains("role", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC allowed caller-selected role.");
+        AssertTrue(!json.Contains("capability", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC allowed caller-selected capability.");
+        AssertTrue(!json.Contains("workerInstanceId", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC accepted trusted worker binding from the ordinary payload.");
+        AssertTrue(!json.Contains("channelInstanceId", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC accepted trusted channel binding from the ordinary payload.");
+        AssertTrue(!json.Contains("projectScope", StringComparison.OrdinalIgnoreCase),
+            "RunSession IPC accepted trusted project scope from the ordinary payload.");
+        var response = new CreateRunSessionResponse("handle", "run", "plaintext-secret", 1735693200000);
+        var proof = new RunSessionProof("run", "plaintext-secret");
+        AssertTrue(!response.ToString().Contains("plaintext-secret", StringComparison.Ordinal),
+            "CreateRunSessionResponse.ToString leaked the opaque secret.");
+        AssertTrue(!proof.ToString().Contains("plaintext-secret", StringComparison.Ordinal),
+            "RunSessionProof.ToString leaked the opaque secret.");
+        var hello = new HelloRequest(1, 1, "bootstrap-secret", IpcClientKind.AgentRuntime, Guid.NewGuid());
+        AssertTrue(!hello.ToString().Contains("bootstrap-secret", StringComparison.Ordinal),
+            "HelloRequest.ToString leaked the bootstrap secret.");
     }
 
     private static void AssertTrue(bool condition, string message)

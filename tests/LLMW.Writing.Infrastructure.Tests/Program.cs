@@ -35,6 +35,7 @@ internal static partial class Program
             RunWp03Tests();
             RunWp07ProjectionInfrastructureTests();
             RunWp08InfrastructureTests();
+            RunWp09InfrastructureTests();
 
             Console.WriteLine($"Infrastructure tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

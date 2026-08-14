@@ -376,8 +376,9 @@ internal static partial class Program
                 store,
                 new SemanticFake(),
                 new ImpactFake(),
-                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
-            var search = new SearchNarrativeService(new SqliteNarrativeSearchStore(databasePath));
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+                Wp09Authorization);
+            var search = new SearchNarrativeService(new SqliteNarrativeSearchStore(databasePath), Wp09Authorization);
             var rebuilder = new ProjectionRebuilder(databasePath, blobs, projectionMaterializer);
             return new Wp07Fixture(directory, databasePath, blobs, coordinator, projectionMaterializer, searchIndex, service, search, rebuilder);
         }
@@ -401,7 +402,7 @@ internal static partial class Program
                 beforeDigest,
                 payload is null ? null : new MemoryStream(Encoding.UTF8.GetBytes(payload)));
             var created = Wp07Success(Service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
-                "storyline", "wp07-storyline", "author", "wp07-author", [input])));
+                "storyline", "wp07-storyline", "author", "wp07-author", [input], Wp09UserPrincipal)));
             return created.ChangeSetId;
         }
 
@@ -410,10 +411,11 @@ internal static partial class Program
                 changeSetId,
                 idempotencyKey,
                 NarrativeDecisionKind.AuthorConfirmed,
-                "wp07-author"));
+                "wp07-author",
+                Principal: Wp09UserPrincipal));
 
         public RegistryQueryResult<IReadOnlyList<NarrativeSearchHit>> Search(string text) =>
-            SearchService.Search(new SearchNarrativeQuery(text));
+            SearchService.Search(new SearchNarrativeQuery(text, Principal: Wp09UserPrincipal));
 
         public string ObjectProjectionPath(string objectType, string objectId) =>
             Path.Combine(Directory, "Narrative", "objects", $"{objectType}-{objectId}.md");

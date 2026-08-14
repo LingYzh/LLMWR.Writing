@@ -97,7 +97,11 @@ public sealed record HelloRequest(
     int ProtocolMax,
     string BootstrapToken,
     IpcClientKind ClientKind,
-    Guid ProcessInstanceId);
+    Guid ProcessInstanceId)
+{
+    public override string ToString() =>
+        $"HelloRequest {{ ProtocolMin = {ProtocolMin}, ProtocolMax = {ProtocolMax}, BootstrapToken = [REDACTED], ClientKind = {ClientKind}, ProcessInstanceId = {ProcessInstanceId} }}";
+}
 
 public sealed record HelloAck(int NegotiatedProtocol, string[] ServerCapabilities);
 
