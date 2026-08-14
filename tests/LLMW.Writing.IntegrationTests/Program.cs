@@ -12,6 +12,7 @@ internal static partial class Program
         {
             RunWp05Tests();
             RunWp06Tests();
+            RunWp07Tests();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;

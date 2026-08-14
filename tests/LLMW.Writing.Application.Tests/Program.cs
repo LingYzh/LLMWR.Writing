@@ -16,7 +16,8 @@ internal static class Program
         {
             NoEvidenceUsesLightweightAssessmentWithoutImpactAnalyzer();
             DuplicateNarrativeObjectIsRejectedBeforeWorkingSetPersistence();
-            Console.WriteLine("Application Narrative Change tests passed (2).");
+            SearchNarrativeRejectsInvalidQueryBeforeStore();
+            Console.WriteLine("Application Narrative Change/Registry tests passed (3).");
             return 0;
         }
         catch (Exception exception)
@@ -59,6 +60,17 @@ internal static class Program
         AssertEqual(0, store.CreateCalls, "Duplicate object mutation reached the persistence port.");
     }
 
+    private static void SearchNarrativeRejectsInvalidQueryBeforeStore()
+    {
+        var store = new SearchStoreFake();
+        var service = new LLMW.Writing.Application.Registry.SearchNarrativeService(store);
+        var result = service.Search(new LLMW.Writing.Application.Registry.SearchNarrativeQuery(" "));
+
+        AssertEqual(LLMW.Writing.Application.Registry.RegistryQueryError.SearchQueryInvalid, result.Failure?.Code,
+            "An empty Normal Retrieval query was not rejected with a typed result.");
+        AssertEqual(0, store.Calls, "An invalid search query reached Infrastructure.");
+    }
+
     private static T Success<T>(NarrativeChangeResult<T> result)
     {
         if (!result.Succeeded || result.Value is null)
@@ -70,6 +82,21 @@ internal static class Program
     }
 
     private static MemoryStream Payload(string content) => new(Encoding.UTF8.GetBytes(content));
+
+    private sealed class SearchStoreFake : LLMW.Writing.Application.Registry.INarrativeSearchStore
+    {
+        public int Calls { get; private set; }
+
+        public LLMW.Writing.Application.Registry.RegistryQueryResult<
+            IReadOnlyList<LLMW.Writing.Application.Registry.NarrativeSearchHit>> Search(
+            LLMW.Writing.Application.Registry.SearchNarrativeQuery query,
+            CancellationToken cancellationToken = default)
+        {
+            Calls++;
+            return LLMW.Writing.Application.Registry.RegistryQueryResults.Success<
+                IReadOnlyList<LLMW.Writing.Application.Registry.NarrativeSearchHit>>([]);
+        }
+    }
 
     private static void AssertEqual<T>(T expected, T? actual, string message)
     {

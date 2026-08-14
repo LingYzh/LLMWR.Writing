@@ -7,6 +7,7 @@ using LLMW.Writing.Infrastructure.Authority;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
+using LLMW.Writing.Infrastructure.Projection;
 
 namespace LLMW.Writing.Infrastructure.NarrativeChange;
 
@@ -16,6 +17,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
     private readonly ImmutableBlobStore blobStore;
     private readonly AuthorityTransactionCoordinator coordinator;
     private readonly SqliteDatabaseConnectionFactory connectionFactory;
+    private readonly NarrativeProjectionPlanner? projectionPlanner;
     private readonly Func<long> clock;
 
     public SqliteNarrativeChangeStore(
@@ -23,13 +25,17 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
         ImmutableBlobStore blobStore,
         AuthorityTransactionCoordinator coordinator,
         SqliteDatabaseConnectionFactory? connectionFactory = null,
-        Func<long>? clock = null)
+        Func<long>? clock = null,
+        bool enableProjection = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         this.databasePath = Path.GetFullPath(databasePath);
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.coordinator = coordinator ?? throw new ArgumentNullException(nameof(coordinator));
         this.connectionFactory = connectionFactory ?? new SqliteDatabaseConnectionFactory();
+        projectionPlanner = enableProjection
+            ? new NarrativeProjectionPlanner(this.databasePath, blobStore, this.connectionFactory)
+            : null;
         this.clock = clock ?? (() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
     }
 
@@ -317,11 +323,51 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
 
         try
         {
+            PreparedNarrativeProjection? prepared = null;
+            IReadOnlyDictionary<string, string> newStateRevisionIds;
+            if (projectionPlanner is not null)
+            {
+                try
+                {
+                    prepared = projectionPlanner.Prepare(changeSet, handle.TransactionId, cancellationToken);
+                }
+                catch (Exception exception)
+                {
+                    TryCleanUncommittedTransaction(handle.TransactionId);
+                    return NarrativeStoreResults.Fail<NarrativeApplyStoreResult>(
+                        NarrativeChangeError.InfrastructureFailure,
+                        $"Projection preparation failed: {exception.Message}");
+                }
+
+                newStateRevisionIds = prepared.NewStateRevisionIds;
+            }
+            else
+            {
+                newStateRevisionIds = changeSet.Changes
+                    .Where(change => change.ChangeKind is
+                        NarrativeChangeKind.Add or NarrativeChangeKind.Modify or NarrativeChangeKind.Reintroduce)
+                    .ToDictionary(
+                        change => change.ObjectId,
+                        _ => DurableUuidV7.Create().ToString(),
+                        StringComparer.Ordinal);
+            }
+
             var events = CreateEvents(changeSet);
+            if (prepared is not null)
+            {
+                events.Add(prepared.RecoveryEvent);
+            }
+
             var committed = coordinator.Commit(
                 handle,
-                new AuthorityCommitRequest(events, [], []),
-                transaction => ApplyMutation(transaction, changeSet, request, handle.TransactionId, cancellationToken),
+                new AuthorityCommitRequest(events, [], prepared?.Plans ?? []),
+                transaction => ApplyMutation(
+                    transaction,
+                    changeSet,
+                    request,
+                    handle.TransactionId,
+                    newStateRevisionIds,
+                    cancellationToken),
                 cancellationToken);
             return NarrativeStoreResults.Success(new NarrativeApplyStoreResult(
                 changeSet.ChangeSetId,
@@ -395,6 +441,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
         NarrativeChangeSetSnapshot changeSet,
         NarrativeApplyStoreRequest request,
         string transactionId,
+        IReadOnlyDictionary<string, string> newStateRevisionIds,
         CancellationToken cancellationToken)
     {
         var validationFailure = ValidateAllChanges(transaction.Connection, transaction.Transaction, changeSet.Changes, cancellationToken);
@@ -421,7 +468,14 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                         WHERE object_id=$object_id AND status='proposed' AND revision_no=0;
                         """,
                         ("$now", now), ("$object_id", change.ObjectId)), change.ObjectId);
-                    InsertStateRevision(transaction, change.ObjectId, transactionId, change.AfterPayloadDigest!, null, now);
+                    InsertStateRevision(
+                        transaction,
+                        newStateRevisionIds[change.ObjectId],
+                        change.ObjectId,
+                        transactionId,
+                        change.AfterPayloadDigest!,
+                        null,
+                        now);
                     break;
 
                 case NarrativeChangeKind.Modify:
@@ -434,7 +488,14 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                         WHERE object_id=$object_id AND status='current' AND deleted_at_ms IS NULL;
                         """,
                         ("$now", now), ("$object_id", change.ObjectId)), change.ObjectId);
-                    InsertStateRevision(transaction, change.ObjectId, transactionId, change.AfterPayloadDigest!, state!.StateRevisionId, now);
+                    InsertStateRevision(
+                        transaction,
+                        newStateRevisionIds[change.ObjectId],
+                        change.ObjectId,
+                        transactionId,
+                        change.AfterPayloadDigest!,
+                        state!.StateRevisionId,
+                        now);
                     break;
 
                 case NarrativeChangeKind.Remove:
@@ -459,7 +520,14 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                         WHERE object_id=$object_id AND status='removed' AND deleted_at_ms IS NOT NULL;
                         """,
                         ("$now", now), ("$object_id", change.ObjectId)), change.ObjectId);
-                    InsertStateRevision(transaction, change.ObjectId, transactionId, change.AfterPayloadDigest!, state!.StateRevisionId, now);
+                    InsertStateRevision(
+                        transaction,
+                        newStateRevisionIds[change.ObjectId],
+                        change.ObjectId,
+                        transactionId,
+                        change.AfterPayloadDigest!,
+                        state!.StateRevisionId,
+                        now);
                     break;
 
                 default:
@@ -752,6 +820,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
 
     private static void InsertStateRevision(
         AuthoritySqliteTransactionContext transaction,
+        string stateRevisionId,
         string objectId,
         string transactionId,
         string snapshotDigest,
@@ -766,7 +835,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                 state_revision_id,scope_object_id,transaction_id,snapshot_digest,supersedes_state_revision_id,created_at_ms)
             VALUES($state_revision_id,$scope_object_id,$transaction_id,$snapshot_digest,$supersedes_state_revision_id,$now);
             """,
-            ("$state_revision_id", DurableUuidV7.Create().ToString()),
+            ("$state_revision_id", stateRevisionId),
             ("$scope_object_id", objectId),
             ("$transaction_id", transactionId),
             ("$snapshot_digest", snapshotDigest),

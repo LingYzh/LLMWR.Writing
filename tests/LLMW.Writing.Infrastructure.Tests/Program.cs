@@ -33,6 +33,7 @@ internal static partial class Program
             Run(nameof(FutureVersionIsRejectedWithoutMutation), FutureVersionIsRejectedWithoutMutation);
             Run(nameof(FtsCanBeDroppedAndRebuiltWithoutAuthorityLoss), FtsCanBeDroppedAndRebuiltWithoutAuthorityLoss);
             RunWp03Tests();
+            RunWp07ProjectionInfrastructureTests();
 
             Console.WriteLine($"Infrastructure tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

@@ -41,6 +41,7 @@ internal static partial class Program
             Run(nameof(BypassAndAutoCannotRewriteAuthorityRules), BypassAndAutoCannotRewriteAuthorityRules);
             Run(nameof(AuthorityScopesUseIndependentTypes), AuthorityScopesUseIndependentTypes);
             RunWp06NarrativeChangeDomainTests();
+            RunWp07RegistryDomainTests();
 
             Console.WriteLine($"Domain Authority FSM tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)
