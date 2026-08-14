@@ -4,12 +4,13 @@ using LLMW.Writing.Contracts.Ipc;
 
 namespace LLMW.Writing.IntegrationTests;
 
-internal static class Program
+internal static partial class Program
 {
     private static async Task<int> Main()
     {
         try
         {
+            RunWp05Tests();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;
