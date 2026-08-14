@@ -34,6 +34,7 @@ internal static partial class Program
             Run(nameof(FtsCanBeDroppedAndRebuiltWithoutAuthorityLoss), FtsCanBeDroppedAndRebuiltWithoutAuthorityLoss);
             RunWp03Tests();
             RunWp07ProjectionInfrastructureTests();
+            RunWp08InfrastructureTests();
 
             Console.WriteLine($"Infrastructure tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

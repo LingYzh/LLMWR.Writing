@@ -281,6 +281,8 @@ internal static partial class Program
         }
 
         public string DatabasePath { get; }
+        public string Root => root;
+        public ImmutableBlobStore BlobStore => blobStore;
         public string StorylineId { get; }
         public string ChapterId { get; }
         public string DraftPath { get; }
@@ -330,7 +332,12 @@ internal static partial class Program
                 faultInjector: faultInjector);
             var store = new SqliteChapterAuthorityStore(databasePath, coordinator);
             var reviewer = new DeterministicReviewer(outcome);
-            var service = new ChapterAuthorityService(blobStore, coordinator, store, reviewer);
+            var service = new ChapterAuthorityService(
+                blobStore,
+                coordinator,
+                store,
+                reviewer,
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
             return new Wp05Fixture(root, databasePath, storylineId, chapterId, draftPath, blobStore, reviewer, coordinator, service);
         }
 

@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using LLMW.Writing.Application.Authority;
+using LLMW.Writing.Application.Reconcile;
 
 namespace LLMW.Writing.Infrastructure.FileSystem;
 
@@ -8,12 +9,17 @@ public sealed class AtomicAuthorityMaterializer : IAuthorityMaterializer
     private const int BufferSize = 128 * 1024;
     private readonly string projectRoot;
     private readonly ImmutableBlobStore blobStore;
+    private readonly ISelfWriteTracker? selfWriteTracker;
 
-    public AtomicAuthorityMaterializer(string projectRoot, ImmutableBlobStore blobStore)
+    public AtomicAuthorityMaterializer(
+        string projectRoot,
+        ImmutableBlobStore blobStore,
+        ISelfWriteTracker? selfWriteTracker = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(projectRoot);
         this.projectRoot = Path.GetFullPath(projectRoot);
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
+        this.selfWriteTracker = selfWriteTracker;
     }
 
     public void Materialize(
@@ -23,6 +29,9 @@ public sealed class AtomicAuthorityMaterializer : IAuthorityMaterializer
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(transactionId);
         ArgumentNullException.ThrowIfNull(plans);
+
+        using var selfWriteOperation = selfWriteTracker?.BeginOperation(
+            plans.Select(plan => new SelfWriteExpectation(plan.TargetRelativePath, plan.BlobDigest)).ToArray());
 
         foreach (var plan in plans)
         {

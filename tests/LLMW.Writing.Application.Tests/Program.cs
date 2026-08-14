@@ -31,7 +31,9 @@ internal static class Program
     {
         var store = new FakeStore();
         var impact = new ImpactFake();
-        var service = new NarrativeChangeService(new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), impact);
+        var service = new NarrativeChangeService(
+            new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), impact,
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
         var created = Success(service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
             [new WorkingNarrativeChangeInput(ObjectId, "character", NarrativeChangeKind.Add, AfterPayload: Payload("A"))])));
@@ -47,7 +49,9 @@ internal static class Program
     private static void DuplicateNarrativeObjectIsRejectedBeforeWorkingSetPersistence()
     {
         var store = new FakeStore();
-        var service = new NarrativeChangeService(new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), new ImpactFake());
+        var service = new NarrativeChangeService(
+            new MemoryBlobStore(), store, new NoEvidenceSemanticFake(), new ImpactFake(),
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
         var result = service.CreateWorkingChangeSet(new CreateWorkingNarrativeChangeSetCommand(
             "storyline", "storyline-1", "author", "author-1",
             [

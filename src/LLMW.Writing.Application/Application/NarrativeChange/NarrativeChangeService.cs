@@ -1,6 +1,7 @@
 using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Domain.Narrative;
+using LLMW.Writing.Application.Reconcile;
 
 namespace LLMW.Writing.Application.NarrativeChange;
 
@@ -10,17 +11,20 @@ public sealed class NarrativeChangeService
     private readonly INarrativeChangeStore store;
     private readonly ISemanticDependencyAssessor semanticDependencyAssessor;
     private readonly INarrativeImpactAnalyzer impactAnalyzer;
+    private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
 
     public NarrativeChangeService(
         IImmutableBlobStore blobStore,
         INarrativeChangeStore store,
         ISemanticDependencyAssessor semanticDependencyAssessor,
-        INarrativeImpactAnalyzer impactAnalyzer)
+        INarrativeImpactAnalyzer impactAnalyzer,
+        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.semanticDependencyAssessor = semanticDependencyAssessor ?? throw new ArgumentNullException(nameof(semanticDependencyAssessor));
         this.impactAnalyzer = impactAnalyzer ?? throw new ArgumentNullException(nameof(impactAnalyzer));
+        this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
     }
 
     public NarrativeChangeResult<CreateWorkingNarrativeChangeSetResult> CreateWorkingChangeSet(
@@ -112,6 +116,20 @@ public sealed class NarrativeChangeService
                 command.DeciderKind.ToString());
         }
 
+        var resolvingIds = new HashSet<string>(
+            command.ResolvingReconcileObjectIds ?? [],
+            StringComparer.Ordinal);
+        var healthRequest = new AuthoritySurfaceHealthRequest(
+            resolvingIds,
+            command.ResolvingReconcilePhysicalDigests);
+        var initialHealth = authoritySurfaceHealthGate.Check(healthRequest, cancellationToken);
+        if (!initialHealth.IsHealthy)
+        {
+            return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                NarrativeChangeError.AuthorityDirty,
+                FormatHealthFailure(initialHealth));
+        }
+
         try
         {
             var changeSet = store.LoadChangeSet(command.ChangeSetId);
@@ -140,6 +158,14 @@ public sealed class NarrativeChangeService
             else if (changeSet.ImpactAnalysisId is null)
             {
                 return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(NarrativeChangeError.ChangeSetNotApplicable);
+            }
+
+            var finalHealth = authoritySurfaceHealthGate.Check(healthRequest, cancellationToken);
+            if (!finalHealth.IsHealthy)
+            {
+                return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                    NarrativeChangeError.AuthorityDirty,
+                    FormatHealthFailure(finalHealth));
             }
 
             var applied = store.Apply(
@@ -370,4 +396,7 @@ public sealed class NarrativeChangeService
     private static string UncertaintyWarning(SemanticDependencyAssessment semantic) =>
         $"Semantic dependency assessment is UNCERTAIN: {semantic.UncertaintyReason ?? "coverage is insufficient"}; " +
         $"coverage={semantic.CoverageMetadata ?? "not supplied"}.";
+
+    private static string FormatHealthFailure(AuthoritySurfaceHealth health) =>
+        string.Join("; ", health.Issues.Select(issue => $"{issue.Kind}:{issue.RelativePath}:{issue.Detail}"));
 }

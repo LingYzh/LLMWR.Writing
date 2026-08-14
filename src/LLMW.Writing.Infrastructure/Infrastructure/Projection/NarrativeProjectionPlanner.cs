@@ -91,7 +91,7 @@ internal sealed class NarrativeProjectionPlanner
 
         List<ProjectionNarrativeObject> narrativeObjects = [];
         foreach (var row in objects.Values
-                     .Where(value => value.Status is "current" or "removed")
+                     .Where(value => (value.Status is "current" or "removed") && value.StateRevisionId is not null)
                      .OrderBy(value => value.ObjectId, StringComparer.Ordinal))
         {
             cancellationToken.ThrowIfCancellationRequested();

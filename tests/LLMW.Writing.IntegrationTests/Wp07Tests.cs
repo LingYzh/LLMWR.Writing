@@ -5,6 +5,7 @@ using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Application.Projection;
 using LLMW.Writing.Application.Registry;
+using LLMW.Writing.Application.Reconcile;
 using LLMW.Writing.Domain.Narrative;
 using LLMW.Writing.Domain.Registry;
 using LLMW.Writing.Infrastructure.Authority;
@@ -348,7 +349,10 @@ internal static partial class Program
         public SearchNarrativeService SearchService { get; }
         public ProjectionRebuilder Rebuilder { get; }
 
-        public static Wp07Fixture Create(Wp07TransactionFault? transactionFault = null, Wp07SearchFault? searchFault = null)
+        public static Wp07Fixture Create(
+            Wp07TransactionFault? transactionFault = null,
+            Wp07SearchFault? searchFault = null,
+            ISelfWriteTracker? selfWriteTracker = null)
         {
             var directory = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP07", Guid.NewGuid().ToString("N"));
             System.IO.Directory.CreateDirectory(directory);
@@ -359,7 +363,7 @@ internal static partial class Program
             var projectionMaterializer = new ProjectionAuthorityMaterializer(
                 databasePath,
                 blobs,
-                new AtomicAuthorityMaterializer(directory, blobs),
+                new AtomicAuthorityMaterializer(directory, blobs, selfWriteTracker),
                 searchIndex);
             var coordinator = new AuthorityTransactionCoordinator(
                 databasePath,
@@ -367,7 +371,12 @@ internal static partial class Program
                 projectionMaterializer,
                 faultInjector: transactionFault);
             var store = new SqliteNarrativeChangeStore(databasePath, blobs, coordinator, enableProjection: true);
-            var service = new NarrativeChangeService(blobs, store, new SemanticFake(), new ImpactFake());
+            var service = new NarrativeChangeService(
+                blobs,
+                store,
+                new SemanticFake(),
+                new ImpactFake(),
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
             var search = new SearchNarrativeService(new SqliteNarrativeSearchStore(databasePath));
             var rebuilder = new ProjectionRebuilder(databasePath, blobs, projectionMaterializer);
             return new Wp07Fixture(directory, databasePath, blobs, coordinator, projectionMaterializer, searchIndex, service, search, rebuilder);

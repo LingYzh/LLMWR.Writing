@@ -70,7 +70,9 @@ public sealed record ApplyNarrativeChangeSetCommand(
     string ChangeSetId,
     string IdempotencyKey,
     NarrativeDecisionKind DeciderKind,
-    string? DeciderId);
+    string? DeciderId,
+    IReadOnlyList<string>? ResolvingReconcileObjectIds = null,
+    IReadOnlyDictionary<string, string>? ResolvingReconcilePhysicalDigests = null);
 
 public sealed record ApplyNarrativeChangeSetResult(
     string ChangeSetId,

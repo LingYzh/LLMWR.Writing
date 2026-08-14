@@ -433,7 +433,12 @@ internal static partial class Program
             var store = new SqliteNarrativeChangeStore(databasePath, blobStore, coordinator);
             var semantic = new SemanticFake();
             var impact = new ImpactFake();
-            var service = new NarrativeChangeService(blobStore, store, semantic, impact);
+            var service = new NarrativeChangeService(
+                blobStore,
+                store,
+                semantic,
+                impact,
+                LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance);
             return new Wp06Fixture(directory, databasePath, blobStore, semantic, impact, service);
         }
 

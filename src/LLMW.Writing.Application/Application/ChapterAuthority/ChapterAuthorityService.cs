@@ -3,6 +3,7 @@ using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
+using LLMW.Writing.Application.Reconcile;
 
 namespace LLMW.Writing.Application.ChapterAuthority;
 
@@ -15,17 +16,20 @@ public sealed class ChapterAuthorityService
     private readonly IAuthorityTransactionCoordinator transactionCoordinator;
     private readonly IChapterAuthorityStore store;
     private readonly IChapterReviewer reviewer;
+    private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
 
     public ChapterAuthorityService(
         IImmutableBlobStore blobStore,
         IAuthorityTransactionCoordinator transactionCoordinator,
         IChapterAuthorityStore store,
-        IChapterReviewer reviewer)
+        IChapterReviewer reviewer,
+        IAuthoritySurfaceHealthGate authoritySurfaceHealthGate)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.transactionCoordinator = transactionCoordinator ?? throw new ArgumentNullException(nameof(transactionCoordinator));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.reviewer = reviewer ?? throw new ArgumentNullException(nameof(reviewer));
+        this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
     }
 
     public ChapterAuthorityResult<SubmitChapterDraftResult> SubmitChapterDraft(
@@ -52,6 +56,14 @@ public sealed class ChapterAuthorityService
         if (context.ActiveSubmissionExists)
         {
             return ChapterAuthorityResults.Fail<SubmitChapterDraftResult>(ChapterAuthorityError.ActiveSubmissionExists);
+        }
+
+        var health = authoritySurfaceHealthGate.Check(AuthoritySurfaceHealthRequest.Standard, cancellationToken);
+        if (!health.IsHealthy)
+        {
+            return ChapterAuthorityResults.Fail<SubmitChapterDraftResult>(
+                ChapterAuthorityError.AuthorityDirty,
+                FormatHealthFailure(health));
         }
 
         var projectTransition = ProjectSubmissionStateMachine.Instance.Transition(
@@ -315,6 +327,14 @@ public sealed class ChapterAuthorityService
                 return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(ChapterAuthorityError.CandidateNotCurrent);
             }
 
+            var health = authoritySurfaceHealthGate.Check(AuthoritySurfaceHealthRequest.Standard, cancellationToken);
+            if (!health.IsHealthy)
+            {
+                return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
+                    ChapterAuthorityError.AuthorityDirty,
+                    FormatHealthFailure(health));
+            }
+
             return ChapterAuthorityResults.Success(
                 store.CommitAcceptance(context, cancellationToken));
         }
@@ -338,6 +358,9 @@ public sealed class ChapterAuthorityService
                 exception.Message);
         }
     }
+
+    private static string FormatHealthFailure(AuthoritySurfaceHealth health) =>
+        string.Join("; ", health.Issues.Select(issue => $"{issue.Kind}:{issue.RelativePath}:{issue.Detail}"));
 
     private static ChapterAuthorityResult<T> TransitionFailure<T>(AuthorityRejection? rejection)
     {
