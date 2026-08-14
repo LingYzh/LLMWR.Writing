@@ -307,6 +307,7 @@ public sealed class ChapterAuthorityService
                 return transitionAuthorization;
             }
 
+            var requiresPreparation = false;
             if (context.ProjectSubmissionState == ProjectSubmissionState.Resolving)
             {
                 var projectAccepting = ProjectSubmissionStateMachine.Instance.Transition(
@@ -354,21 +355,13 @@ public sealed class ChapterAuthorityService
                     return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(ChapterAuthorityError.FsmTransitionRejected);
                 }
 
-                var extension = Path.GetExtension(context.SourceDraftPath).ToLowerInvariant();
-                var relativePath = Path.Combine("Manuscript", "current", context.ChapterId + extension)
-                    .Replace(Path.DirectorySeparatorChar, '/');
-                context = store.PrepareAcceptance(
-                    new PrepareAcceptanceRequest(context, decision, command.AcceptedById, relativePath));
+                requiresPreparation = true;
             }
             else if (context.ProjectSubmissionState == ProjectSubmissionState.Committing &&
-                     (context.AcceptanceId is null || context.ManuscriptRevisionId is null ||
-                      context.MaterializedRelativePath is null))
+                      (context.AcceptanceId is null || context.ManuscriptRevisionId is null ||
+                       context.MaterializedRelativePath is null))
             {
-                var extension = Path.GetExtension(context.SourceDraftPath).ToLowerInvariant();
-                var relativePath = Path.Combine("Manuscript", "current", context.ChapterId + extension)
-                    .Replace(Path.DirectorySeparatorChar, '/');
-                context = store.PrepareAcceptance(
-                    new PrepareAcceptanceRequest(context, decision, command.AcceptedById, relativePath));
+                requiresPreparation = true;
             }
             else if (context.ProjectSubmissionState != ProjectSubmissionState.Committing)
             {
@@ -390,6 +383,15 @@ public sealed class ChapterAuthorityService
             {
                 return commitAuthorization ?? ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
                     ChapterAuthorityError.AcceptanceNotAuthorized);
+            }
+
+            if (requiresPreparation)
+            {
+                var extension = Path.GetExtension(context.SourceDraftPath).ToLowerInvariant();
+                var relativePath = Path.Combine("Manuscript", "current", context.ChapterId + extension)
+                    .Replace(Path.DirectorySeparatorChar, '/');
+                context = store.PrepareAcceptance(
+                    new PrepareAcceptanceRequest(context, decision, command.AcceptedById, relativePath));
             }
 
             return ChapterAuthorityResults.Success(

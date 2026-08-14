@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.ChapterAuthority;
+using LLMW.Writing.Application.Security;
 using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Infrastructure.Authority;
 using LLMW.Writing.Infrastructure.ChapterAuthority;
@@ -291,7 +292,8 @@ internal static partial class Program
 
         public static Wp05Fixture Create(
             ChapterReviewOutcome outcome,
-            AuthorityTransactionFaultPoint? faultPoint = null)
+            AuthorityTransactionFaultPoint? faultPoint = null,
+            IAuthorizationService? authorizationService = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP05", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -336,7 +338,7 @@ internal static partial class Program
                 store,
                 reviewer,
                 LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
-                Wp09Authorization);
+                authorizationService ?? Wp09Authorization);
             return new Wp05Fixture(root, databasePath, storylineId, chapterId, draftPath, blobStore, reviewer, coordinator, service);
         }
 

@@ -13,9 +13,11 @@ internal static partial class Program
     {
         AgentRunAuthorizationPrecedesWp05SideEffects();
         AgentRoleMaximumsRemainEffectiveAcrossPermissionModes();
-        Console.WriteLine("WP09 security integration tests passed (2).");
+        FinalAcceptanceAuthorizationDenialLeavesWorkflowUnchanged();
+        Console.WriteLine("WP09 security integration tests passed (3).");
         Console.WriteLine("PASS AgentRunAuthorizationPrecedesWp05SideEffects");
         Console.WriteLine("PASS AgentRoleMaximumsRemainEffectiveAcrossPermissionModes");
+        Console.WriteLine("PASS FinalAcceptanceAuthorizationDenialLeavesWorkflowUnchanged");
     }
 
     private static void AgentRunAuthorizationPrecedesWp05SideEffects()
@@ -108,6 +110,70 @@ internal static partial class Program
             "Explicit-user-task PM Git remained incorrectly denied.");
     }
 
+    private static void FinalAcceptanceAuthorizationDenialLeavesWorkflowUnchanged()
+    {
+        var policy = new CountingAcceptanceSecurityPolicySource(denyOnAcceptCall: 3);
+        var authorization = new CoreAuthorizationService(policy);
+        using var fixture = Wp05Fixture.Create(
+            ChapterReviewOutcome.Pass,
+            authorizationService: authorization);
+        var draftBytes = System.Text.Encoding.UTF8.GetBytes("wp09 final authorization TOCTOU");
+        File.WriteAllBytes(fixture.DraftPath, draftBytes);
+        const string idempotencyKey = "wp09-final-recheck";
+
+        var submitted = Wp09Success(fixture.Service.SubmitChapterDraft(new SubmitChapterDraftCommand(
+            fixture.ChapterId,
+            fixture.DraftPath,
+            idempotencyKey,
+            Principal: Wp09UserPrincipal)));
+        Wp09Success(fixture.Service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(
+            submitted.CandidateId,
+            Wp09UserPrincipal)));
+        var baseline = CaptureAcceptanceBaseline(fixture, submitted.CandidateId, idempotencyKey);
+        Wp09Equal("under_review", baseline.CandidateState, "TOCTOU baseline Candidate is not acceptance-eligible.");
+        Wp09Equal("under_review", baseline.ChapterState, "TOCTOU baseline Chapter state drifted.");
+        Wp09Equal("resolving", baseline.TransactionStatus, "TOCTOU baseline transaction is not resolving.");
+        Wp09Equal("resolving", baseline.ProjectSubmissionState, "TOCTOU baseline project submission is not resolving.");
+        Wp09Equal("pending", baseline.RecoveryState, "TOCTOU baseline recovery state drifted.");
+        Wp09Equal(0L, baseline.AcceptanceCount, "TOCTOU baseline already contains Acceptance.");
+        Wp09Equal(0L, baseline.RevisionCount, "TOCTOU baseline already contains a Manuscript revision.");
+        Wp09Equal(0L, baseline.AuthorityEventCount, "TOCTOU baseline already contains Authority events.");
+        Wp09Equal<string?>(null, baseline.CurrentPointer, "TOCTOU baseline already has a current pointer.");
+        Wp09Equal<string?>(null, baseline.MaterializedDigest, "TOCTOU baseline already has materialized bytes.");
+
+        var denied = fixture.Service.AcceptChapterCandidate(new AcceptChapterCandidateCommand(
+            submitted.CandidateId,
+            idempotencyKey,
+            "test/user-interactive",
+            Principal: Wp09UserPrincipal));
+
+        Wp09Equal(ChapterAuthorityError.CapabilityDenied, denied.Failure?.Code,
+            "Final pre-side-effect authorization denial did not stop Acceptance.");
+        Wp09Equal(3, policy.AcceptAuthorizationCalls,
+            "The mutable policy did not deny the final Accept recheck.");
+        AssertAcceptanceBaselineUnchanged(
+            baseline,
+            CaptureAcceptanceBaseline(fixture, submitted.CandidateId, idempotencyKey));
+
+        policy.AllowFutureAccept();
+        var accepted = Wp09Success(fixture.Service.AcceptChapterCandidate(new AcceptChapterCandidateCommand(
+            submitted.CandidateId,
+            idempotencyKey,
+            "test/user-interactive",
+            Principal: Wp09UserPrincipal)));
+        Wp09Equal(AuthorityTransactionState.Complete, accepted.TransactionState,
+            "The denied Candidate could not be accepted after authorization was restored.");
+        fixture.AssertScalar(1L, "SELECT COUNT(*) FROM acceptance_records;");
+        fixture.AssertScalar(1L, "SELECT COUNT(*) FROM manuscript_revisions;");
+        fixture.AssertScalar("accepted", $"SELECT status FROM candidates WHERE candidate_id='{submitted.CandidateId}';");
+        fixture.AssertScalar("materialized", $"SELECT workflow_state FROM chapters WHERE chapter_id='{fixture.ChapterId}';");
+        Wp09Equal(true, File.Exists(fixture.CurrentManuscriptPath),
+            "Successful retry did not materialize Current Manuscript.");
+        Wp09Equal(Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(draftBytes)).ToLowerInvariant(),
+            FileDigest(fixture.CurrentManuscriptPath),
+            "Successful retry materialized unexpected bytes.");
+    }
+
     private static CallerPrincipal CreateAgentPrincipal(
         string databasePath,
         string runId,
@@ -162,19 +228,101 @@ internal static partial class Program
         public RuntimePermissionMode GetRuntimePermissionMode(string runId) => permissionMode;
     }
 
+    private sealed class CountingAcceptanceSecurityPolicySource(int denyOnAcceptCall) : ISecurityPolicySource
+    {
+        private int? denyOnCall = denyOnAcceptCall;
+
+        public int AcceptAuthorizationCalls { get; private set; }
+
+        public SecurityPolicySnapshot Resolve(CallerPrincipal principal, Capability capability)
+        {
+            if (capability == Capability.AuthorityAccept)
+            {
+                AcceptAuthorizationCalls++;
+            }
+
+            return TrustedPolicySnapshot(
+                productAllowed: capability != Capability.AuthorityAccept ||
+                                denyOnCall is null ||
+                                AcceptAuthorizationCalls != denyOnCall.Value);
+        }
+
+        public void AllowFutureAccept() => denyOnCall = null;
+    }
+
     private sealed class Wp09TestSecurityPolicySource(bool explicitUserTask = false) : ISecurityPolicySource
     {
         public SecurityPolicySnapshot Resolve(CallerPrincipal principal, Capability capability) =>
-            new(
-                ProductAllowed: true,
-                ToolGranted: true,
-                ExtensionGranted: true,
-                ProjectTrusted: true,
-                SecurityScopeClassification.InScope,
-                HardDeny.None,
-                NarrativeAuthorityAvailable: false,
-                ExplicitUserTask: explicitUserTask);
+            TrustedPolicySnapshot(explicitUserTask: explicitUserTask);
     }
+
+    private static SecurityPolicySnapshot TrustedPolicySnapshot(
+        bool productAllowed = true,
+        bool explicitUserTask = false) =>
+        new(
+            ProductAllowed: productAllowed,
+            ToolGranted: true,
+            ExtensionGranted: true,
+            ProjectTrusted: true,
+            SecurityScopeClassification.InScope,
+            HardDeny.None,
+            NarrativeAuthorityAvailable: false,
+            ExplicitUserTask: explicitUserTask);
+
+    private sealed record AcceptanceBaseline(
+        string CandidateState,
+        string ChapterState,
+        long AcceptanceCount,
+        long RevisionCount,
+        long AuthorityEventCount,
+        string? CurrentPointer,
+        string TransactionStatus,
+        string ProjectSubmissionState,
+        string RecoveryState,
+        string? MaterializedDigest);
+
+    private static AcceptanceBaseline CaptureAcceptanceBaseline(
+        Wp05Fixture fixture,
+        string candidateId,
+        string idempotencyKey) =>
+        new(
+            fixture.ScalarForWp09<string>($"SELECT status FROM candidates WHERE candidate_id='{candidateId}';"),
+            fixture.ScalarForWp09<string>($"SELECT workflow_state FROM chapters WHERE chapter_id='{fixture.ChapterId}';"),
+            fixture.ScalarForWp09<long>("SELECT COUNT(*) FROM acceptance_records;"),
+            fixture.ScalarForWp09<long>("SELECT COUNT(*) FROM manuscript_revisions;"),
+            fixture.ScalarForWp09<long>("SELECT COUNT(*) FROM authority_events;"),
+            NullableScalarForWp09(fixture, $"SELECT current_manuscript_revision_id FROM chapters WHERE chapter_id='{fixture.ChapterId}';"),
+            fixture.ScalarForWp09<string>($"SELECT status FROM authority_transactions WHERE idempotency_key='{idempotencyKey}';"),
+            fixture.ScalarForWp09<string>($"SELECT project_submission_state FROM authority_transactions WHERE idempotency_key='{idempotencyKey}';"),
+            fixture.ScalarForWp09<string>($"SELECT recovery_state FROM authority_transactions WHERE idempotency_key='{idempotencyKey}';"),
+            FileDigest(fixture.CurrentManuscriptPath));
+
+    private static void AssertAcceptanceBaselineUnchanged(AcceptanceBaseline expected, AcceptanceBaseline actual)
+    {
+        Wp09Equal(expected.CandidateState, actual.CandidateState, "Denied Accept changed Candidate state.");
+        Wp09Equal(expected.ChapterState, actual.ChapterState, "Denied Accept changed Chapter Authority state.");
+        Wp09Equal(expected.AcceptanceCount, actual.AcceptanceCount, "Denied Accept created an acceptance record.");
+        Wp09Equal(expected.RevisionCount, actual.RevisionCount, "Denied Accept created a manuscript revision.");
+        Wp09Equal(expected.AuthorityEventCount, actual.AuthorityEventCount, "Denied Accept appended an Authority event.");
+        Wp09Equal(expected.CurrentPointer, actual.CurrentPointer, "Denied Accept changed the current manuscript pointer.");
+        Wp09Equal(expected.TransactionStatus, actual.TransactionStatus, "Denied Accept advanced the Authority transaction state.");
+        Wp09Equal(expected.ProjectSubmissionState, actual.ProjectSubmissionState, "Denied Accept changed project_submission_state.");
+        Wp09Equal(expected.RecoveryState, actual.RecoveryState, "Denied Accept created dirty/recovery state.");
+        Wp09Equal(expected.MaterializedDigest, actual.MaterializedDigest, "Denied Accept changed filesystem materialization.");
+    }
+
+    private static string? NullableScalarForWp09(Wp05Fixture fixture, string sql)
+    {
+        using var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(fixture.DatabasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        var value = command.ExecuteScalar();
+        return value is null or DBNull ? null : Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static string? FileDigest(string path) => File.Exists(path)
+        ? Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant()
+        : null;
 
     private static void AddWp09(System.Data.Common.DbCommand command, string name, object value)
     {
