@@ -150,38 +150,14 @@ public sealed class IpcClientSession : IAsyncDisposable
         var envelope = IpcJson.DeserializeWire(utf8);
         _ = messageType;
         _ = semanticType;
-        var tcs = new TaskCompletionSource<IpcWireEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (gate)
-        {
-            if (pending.Count >= IpcProtocol.MaximumInFlightRequests)
-            {
-                throw new IpcProtocolException(IpcErrorCodes.QueueOverload, "Too many in-flight IPC requests.");
-            }
-
-            if (!pending.TryAdd(envelope.RequestId, tcs))
-            {
-                throw new IpcProtocolException(IpcErrorCodes.DuplicateRequest, "Duplicate IPC request id.");
-            }
-        }
-
+        var tcs = RegisterPending(envelope.RequestId);
         if (!writes.Writer.TryWrite(utf8))
         {
             CompletePending(envelope.RequestId);
             throw new IpcProtocolException(IpcErrorCodes.QueueOverload, "The IPC write queue is saturated.");
         }
 
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
-        using var timeout = new CancellationTokenSource(IpcProtocol.DefaultRequestTimeoutMs);
-        using var combined = CancellationTokenSource.CreateLinkedTokenSource(linked.Token, timeout.Token);
-        using var registration = combined.Token.Register(() => tcs.TrySetCanceled(combined.Token));
-        try
-        {
-            return await tcs.Task.ConfigureAwait(false);
-        }
-        finally
-        {
-            CompletePending(envelope.RequestId);
-        }
+        return await AwaitPendingAsync(envelope.RequestId, tcs, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<CancelResponse> CancelAsync(Guid correlationId, CancellationToken cancellationToken)
@@ -191,20 +167,14 @@ public sealed class IpcClientSession : IAsyncDisposable
             IpcSemanticTypes.Cancel,
             workspaceInstanceId,
             new CancelRequest(correlationId));
-        var tcs = new TaskCompletionSource<IpcWireEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
-        lock (gate)
-        {
-            pending[envelope.RequestId] = tcs;
-        }
-
+        var tcs = RegisterPending(envelope.RequestId);
         if (!writes.Writer.TryWrite(IpcJson.Serialize(envelope, IpcJsonContext.Default.CancelRequestEnvelope)))
         {
             CompletePending(envelope.RequestId);
             throw new IpcProtocolException(IpcErrorCodes.QueueOverload, "The IPC write queue is saturated.");
         }
 
-        var wire = await tcs.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-        CompletePending(envelope.RequestId);
+        var wire = await AwaitPendingAsync(envelope.RequestId, tcs, cancellationToken).ConfigureAwait(false);
         return IpcJson.DeserializePayload(wire.Payload, IpcJsonContext.Default.CancelResponse);
     }
 
@@ -423,6 +393,44 @@ public sealed class IpcClientSession : IAsyncDisposable
         }
 
         LocalEventOverflow?.Invoke();
+    }
+
+    private TaskCompletionSource<IpcWireEnvelope> RegisterPending(Guid requestId)
+    {
+        var tcs = new TaskCompletionSource<IpcWireEnvelope>(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (gate)
+        {
+            if (pending.Count >= IpcProtocol.MaximumInFlightRequests)
+            {
+                throw new IpcProtocolException(IpcErrorCodes.QueueOverload, "Too many in-flight IPC requests.");
+            }
+
+            if (!pending.TryAdd(requestId, tcs))
+            {
+                throw new IpcProtocolException(IpcErrorCodes.DuplicateRequest, "Duplicate IPC request id.");
+            }
+        }
+
+        return tcs;
+    }
+
+    private async Task<IpcWireEnvelope> AwaitPendingAsync(
+        Guid requestId,
+        TaskCompletionSource<IpcWireEnvelope> waiter,
+        CancellationToken cancellationToken)
+    {
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, lifetime.Token);
+        using var timeout = new CancellationTokenSource(IpcProtocol.DefaultRequestTimeoutMs);
+        using var combined = CancellationTokenSource.CreateLinkedTokenSource(linked.Token, timeout.Token);
+        using var registration = combined.Token.Register(() => waiter.TrySetCanceled(combined.Token));
+        try
+        {
+            return await waiter.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            CompletePending(requestId);
+        }
     }
 
     private void CompletePending(Guid requestId)

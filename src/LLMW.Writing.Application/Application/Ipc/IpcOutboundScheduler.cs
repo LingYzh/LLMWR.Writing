@@ -15,6 +15,7 @@ public sealed record IpcOutboundFrame(IpcOutboundClass Class, byte[] Utf8Json, s
 /// Bounded traffic-class queues feeding a single serialized writer.
 /// Critical/snapshot saturation fails closed rather than silently dropping.
 /// Pipe writes are cancellable and time-bounded so a stalled peer cannot hang Core.
+/// One coalescing wake signal is the only idle wait; enqueue/publish cannot accumulate abandoned waiters.
 /// </summary>
 public sealed class IpcOutboundScheduler : IAsyncDisposable
 {
@@ -34,7 +35,7 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
             FullMode = BoundedChannelFullMode.Wait
         });
 
-    private readonly SemaphoreSlim eventPulse = new(0, 1);
+    private readonly SemaphoreSlim wake = new(0, 1);
     private readonly CancellationTokenSource writerLifetime = new();
     private readonly TimeSpan writeTimeout;
     private readonly TimeSpan drainTimeout;
@@ -49,25 +50,29 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
 
     public event Action? Failed;
 
-    public bool TryEnqueueCritical(byte[] utf8Json, string semanticType) =>
-        critical.Writer.TryWrite(new IpcOutboundFrame(IpcOutboundClass.Critical, utf8Json, semanticType));
-
-    public bool TryEnqueueSnapshot(byte[] utf8Json, string semanticType) =>
-        snapshot.Writer.TryWrite(new IpcOutboundFrame(IpcOutboundClass.Snapshot, utf8Json, semanticType));
-
-    public void PulseEvents()
+    public bool TryEnqueueCritical(byte[] utf8Json, string semanticType)
     {
-        if (eventPulse.CurrentCount == 0)
+        if (!critical.Writer.TryWrite(new IpcOutboundFrame(IpcOutboundClass.Critical, utf8Json, semanticType)))
         {
-            try
-            {
-                eventPulse.Release();
-            }
-            catch (SemaphoreFullException)
-            {
-            }
+            return false;
         }
+
+        Signal();
+        return true;
     }
+
+    public bool TryEnqueueSnapshot(byte[] utf8Json, string semanticType)
+    {
+        if (!snapshot.Writer.TryWrite(new IpcOutboundFrame(IpcOutboundClass.Snapshot, utf8Json, semanticType)))
+        {
+            return false;
+        }
+
+        Signal();
+        return true;
+    }
+
+    public void PulseEvents() => Signal();
 
     public void Start(Stream stream, Func<byte[]?> tryPullEvent, CancellationToken cancellationToken)
     {
@@ -86,7 +91,7 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
         writerLifetime.Cancel();
         critical.Writer.TryComplete();
         snapshot.Writer.TryComplete();
-        PulseEvents();
+        Signal();
         if (writer is not null)
         {
             try
@@ -110,7 +115,7 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
         if (writer is null || writer.IsCompleted)
         {
             writerLifetime.Dispose();
-            eventPulse.Dispose();
+            wake.Dispose();
         }
     }
 
@@ -155,10 +160,7 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
                     break;
                 }
 
-                var waitCritical = critical.Reader.WaitToReadAsync(token).AsTask();
-                var waitSnapshot = snapshot.Reader.WaitToReadAsync(token).AsTask();
-                var waitEvent = eventPulse.WaitAsync(token);
-                await Task.WhenAny(waitCritical, waitSnapshot, waitEvent).ConfigureAwait(false);
+                await wake.WaitAsync(token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -179,6 +181,23 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
         finally
         {
             await DrainCriticalAsync(stream).ConfigureAwait(false);
+        }
+    }
+
+    private void Signal()
+    {
+        if (wake.CurrentCount == 0)
+        {
+            try
+            {
+                wake.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
         }
     }
 

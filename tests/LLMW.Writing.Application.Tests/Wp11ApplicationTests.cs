@@ -40,8 +40,10 @@ internal static class Wp11ApplicationTests
         ClientEventBufferOverflowIsExplicitAndRecoverable();
         StalledNonReadingPeerUnblocksEndpoint();
         ProductionReconnectSnapshotSubscribeGapAndEpoch();
-        Console.WriteLine("Application WP11 IPC tests passed (22).");
-        return 22;
+        WriterWakeDeliversEventAfterRepeatedCriticalIdle();
+        CancelAsyncHonorsInFlightBoundAndDoesNotLeak();
+        Console.WriteLine("Application WP11 IPC tests passed (24).");
+        return 24;
     }
 
     private static void TtlPolicyClampsHugeExpiryAndHonorsShorterRequest()
@@ -311,6 +313,99 @@ internal static class Wp11ApplicationTests
         });
     }
 
+    private static void CancelAsyncHonorsInFlightBoundAndDoesNotLeak()
+    {
+        var hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holdSnapshots = false;
+        var entered = 0;
+        var token = IpcBootstrapToken.Create();
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            DelayAsync = async (semantic, _, cancellationToken) =>
+            {
+                if (!holdSnapshots || semantic != IpcSemanticTypes.GetStateSnapshot)
+                {
+                    return;
+                }
+
+                Interlocked.Increment(ref entered);
+                await hold.Task.WaitAsync(cancellationToken);
+            }
+        };
+
+        RunHosted(token, options, async client =>
+        {
+            using var alreadyCancelled = new CancellationTokenSource();
+            alreadyCancelled.Cancel();
+            try
+            {
+                await client.CancelAsync(Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"), alreadyCancelled.Token);
+                throw new InvalidOperationException("Caller cancellation of CancelAsync must be observed.");
+            }
+            catch (OperationCanceledException)
+            {
+            }
+
+            for (var i = 0; i < 40; i++)
+            {
+                using var cancelled = new CancellationTokenSource();
+                cancelled.Cancel();
+                try
+                {
+                    await client.CancelAsync(Guid.NewGuid(), cancelled.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
+            var snapshot = await client.RequestAsync(
+                IpcSemanticTypes.GetStateSnapshot,
+                new GetStateSnapshotRequest(0, null),
+                IpcJsonContext.Default.GetStateSnapshotRequestEnvelope,
+                IpcJsonContext.Default.GetStateSnapshotResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(false, snapshot.Payload.ResyncRequired, "Repeated cancelled CancelAsync calls must not poison later requests.");
+
+            holdSnapshots = true;
+            var inflight = new List<Task<IpcWireEnvelope>>();
+            for (var i = 0; i < IpcProtocol.MaximumInFlightRequests; i++)
+            {
+                var envelope = IpcEnvelopeFactory.Create(
+                    IpcMessageType.Request,
+                    IpcSemanticTypes.GetStateSnapshot,
+                    Workspace,
+                    new GetStateSnapshotRequest(0, null));
+                inflight.Add(client.RequestWireAsync(
+                    IpcMessageType.Request,
+                    IpcSemanticTypes.GetStateSnapshot,
+                    IpcJson.Serialize(envelope, IpcJsonContext.Default.GetStateSnapshotRequestEnvelope),
+                    CancellationToken.None));
+            }
+
+            WaitUntil(
+                () => Volatile.Read(ref entered) >= IpcProtocol.MaximumInFlightRequests,
+                "Client pending slots must fill to MaximumInFlightRequests.");
+
+            try
+            {
+                await client.CancelAsync(Guid.NewGuid(), CancellationToken.None);
+                throw new InvalidOperationException("CancelAsync must honor MaximumInFlightRequests.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.QueueOverload, exception.ErrorCode, "CancelAsync must not bypass the in-flight bound.");
+            }
+
+            hold.TrySetResult();
+            await Task.WhenAll(inflight);
+        });
+    }
+
     private static void SlowSubscriberDoesNotBlockPublishAndSnapshotStillProgresses()
     {
         var ring = new IpcEventRing("stream-slow");
@@ -478,6 +573,63 @@ internal static class Wp11ApplicationTests
         finally
         {
             scheduler.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    private static void WriterWakeDeliversEventAfterRepeatedCriticalIdle()
+    {
+        var (left, right) = IpcConnectedStreamPair.Create();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var scheduler = new IpcOutboundScheduler();
+        byte[]? pendingEvent = null;
+        var eventPayload = """{"kind":"event"}"""u8.ToArray();
+        var criticalPayload = """{"kind":"critical"}"""u8.ToArray();
+        try
+        {
+            scheduler.Start(
+                left,
+                () =>
+                {
+                    var payload = pendingEvent;
+                    pendingEvent = null;
+                    return payload;
+                },
+                timeout.Token);
+
+            for (var i = 0; i < 32; i++)
+            {
+                AssertEqual(
+                    true,
+                    scheduler.TryEnqueueCritical(criticalPayload, IpcSemanticTypes.HeartbeatAck),
+                    "Repeated critical wakes must enqueue.");
+                var frame = IpcFrameIO.ReadAsync(right, timeout.Token).GetAwaiter().GetResult();
+                AssertTrue(
+                    frame.AsSpan().SequenceEqual(criticalPayload),
+                    "Idle writer must drain each critical/heartbeat frame before the next wait.");
+            }
+
+            pendingEvent = eventPayload;
+            scheduler.PulseEvents();
+            using var eventWait = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            byte[] delivered;
+            try
+            {
+                delivered = IpcFrameIO.ReadAsync(right, eventWait.Token).GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+                throw new InvalidOperationException(
+                    "A single event pulse must wake the current writer and deliver the event without another critical/heartbeat enqueue.");
+            }
+
+            AssertTrue(delivered.AsSpan().SequenceEqual(eventPayload), "The coalesced wake must deliver the event promptly.");
+        }
+        finally
+        {
+            timeout.Cancel();
+            scheduler.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            left.Dispose();
+            right.Dispose();
         }
     }
 
