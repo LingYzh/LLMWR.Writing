@@ -8,5 +8,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.SandboxProbe\LLMW.Writing.SandboxProbe.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
   </ItemGroup>
 </Project>

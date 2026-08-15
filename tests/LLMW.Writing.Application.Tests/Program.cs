@@ -24,7 +24,8 @@ internal static class Program
             TrustedPrincipalConstructionBoundariesAreExplicit();
             AuthorizationDenialPrecedesSearchSideEffects();
             MissingSecurityPolicyFailsClosed();
-            Console.WriteLine("Application Narrative Change/Registry/Security tests passed (6).");
+            var wp10 = Wp10SandboxApplicationTests.Run();
+            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10}).");
             return 0;
         }
         catch (Exception exception)

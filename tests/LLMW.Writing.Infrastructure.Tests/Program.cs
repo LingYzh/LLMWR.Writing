@@ -36,6 +36,12 @@ internal static partial class Program
             RunWp07ProjectionInfrastructureTests();
             RunWp08InfrastructureTests();
             RunWp09InfrastructureTests();
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new InvalidOperationException("WP10 Windows sandbox tests cannot be skipped on a non-Windows runner.");
+            }
+
+            RunWp10InfrastructureTests();
 
             Console.WriteLine($"Infrastructure tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

@@ -19,6 +19,12 @@ internal static partial class Program
             RunWp07Tests();
             RunWp08Tests();
             RunWp09Tests();
+            if (!OperatingSystem.IsWindows())
+            {
+                throw new InvalidOperationException("WP10 Windows sandbox tests cannot be skipped on a non-Windows runner.");
+            }
+
+            RunWp10Tests();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;

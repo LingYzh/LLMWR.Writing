@@ -4,11 +4,23 @@
     <AssemblyName>LLMW.Writing.IntegrationTests</AssemblyName>
     <RootNamespace>LLMW.Writing.IntegrationTests</RootNamespace>
     <IsPackable>false</IsPackable>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
     <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
     <ProjectReference Include="..\..\src\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.SandboxProbe\LLMW.Writing.SandboxProbe.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
   </ItemGroup>
+
+  <Target Name="PublishSandboxProbeSelfContained" AfterTargets="Build" Condition="'$(OS)' == 'Windows_NT'">
+    <PropertyGroup>
+      <_ProbeProject>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\LLMW.Writing.SandboxProbe\LLMW.Writing.SandboxProbe.csproj'))</_ProbeProject>
+      <_ProbeDest>$([System.IO.Path]::GetFullPath('$(OutputPath)sandbox-probe'))</_ProbeDest>
+    </PropertyGroup>
+    <Exec Command="dotnet publish &quot;$(_ProbeProject)&quot; --configuration $(Configuration) --runtime win-x64 --self-contained true --output &quot;$(_ProbeDest)&quot; --nologo -p:PublishSingleFile=false" />
+  </Target>
 </Project>
