@@ -18,8 +18,14 @@ public static class IpcBootstrapToken
         ArgumentNullException.ThrowIfNull(expected);
         ArgumentNullException.ThrowIfNull(supplied);
 
-        return CryptographicOperations.FixedTimeEquals(
-            System.Text.Encoding.UTF8.GetBytes(expected),
-            System.Text.Encoding.UTF8.GetBytes(supplied));
+        var left = System.Text.Encoding.UTF8.GetBytes(expected);
+        var right = System.Text.Encoding.UTF8.GetBytes(supplied);
+        var lengthMismatch = left.Length != right.Length;
+        if (lengthMismatch)
+        {
+            right = left;
+        }
+
+        return CryptographicOperations.FixedTimeEquals(left, right) && !lengthMismatch;
     }
 }

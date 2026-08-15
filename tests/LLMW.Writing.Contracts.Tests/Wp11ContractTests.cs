@@ -17,6 +17,7 @@ internal static class Wp11ContractTests
         GapSnapshotAndCancelGoldens();
         RunSessionProofWireShapeDoesNotCarryRoleOrCapability();
         SafeReplayCatalogExcludesMutations();
+        LengthMismatchedBootstrapCompareFailsClosed();
         Console.WriteLine("WP11 contract tests passed.");
     }
 
@@ -359,6 +360,18 @@ internal static class Wp11ContractTests
         Program.AssertTrue(!IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.CreateRunSession), "CreateRunSession must not auto-replay.");
         Program.AssertTrue(!IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.SubmitCandidate), "SubmitCandidate must not auto-replay.");
         Program.AssertTrue(!IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.AcceptAuthority), "AcceptAuthority must not auto-replay.");
+    }
+
+    private static void LengthMismatchedBootstrapCompareFailsClosed()
+    {
+        var token = IpcBootstrapToken.Create();
+        Program.AssertTrue(IpcBootstrapToken.FixedTimeEquals(token, token), "Equal bootstrap tokens must compare equal.");
+        Program.AssertTrue(
+            !IpcBootstrapToken.FixedTimeEquals(token, token[..^1]),
+            "A truncated bootstrap token must be rejected without throwing.");
+        Program.AssertTrue(
+            !IpcBootstrapToken.FixedTimeEquals(token, token + "x"),
+            "A lengthened bootstrap token must be rejected without throwing.");
     }
 
     private static void AssertGolden<T>(
