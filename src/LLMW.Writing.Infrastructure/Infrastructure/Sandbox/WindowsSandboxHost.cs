@@ -2,6 +2,7 @@ using System.Runtime.Versioning;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Domain.Security;
+using LLMW.Writing.Infrastructure.Sandbox.Native;
 
 namespace LLMW.Writing.Infrastructure.Sandbox;
 
@@ -148,6 +149,39 @@ public sealed class WindowsSandboxHost : ISandboxHost
         return WindowsSandboxProcessLauncher.LaunchLive(request, identity, work, projectRoot, faultInjector, grantInternetClient: false);
     }
 
+    public SandboxedWorkerStartResult StartWorker(SandboxExecutionRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        EnsureInitialized();
+        if (availability is not SandboxAvailability.Available || identity is null)
+        {
+            return SandboxedWorkerStartResult.Fail(initError ?? SandboxError.SandboxUnavailable, initializationDetail);
+        }
+
+        if (!SandboxPathPolicy.PathsEqual(request.ProjectRoot, projectRoot) ||
+            !string.Equals(
+                request.Binding.ProjectScope.ToCanonicalValue(),
+                projectScope.ToCanonicalValue(),
+                StringComparison.Ordinal))
+        {
+            return SandboxedWorkerStartResult.Fail(SandboxError.PathOutOfScope, "Caller project claims do not match Core sandbox context.");
+        }
+
+        try
+        {
+            var live = StartLive(request);
+            return new SandboxedWorkerStartResult(
+                true,
+                null,
+                new WindowsSandboxedWorkerProcess(request.Binding.WorkerInstanceId, live),
+                null);
+        }
+        catch (SandboxLayerException exception)
+        {
+            return SandboxedWorkerStartResult.Fail(exception.Error, exception.Message);
+        }
+    }
+
     private void EnsureInitialized()
     {
         lock (gate)
@@ -224,5 +258,58 @@ public sealed class WindowsSandboxHost : ISandboxHost
         var hasFalse = json.Contains(needleFalse, StringComparison.OrdinalIgnoreCase) ||
                        json.Contains(needleFalseSpaced, StringComparison.OrdinalIgnoreCase);
         return expected ? hasTrue && !hasFalse : hasFalse;
+    }
+}
+
+[SupportedOSPlatform("windows")]
+internal sealed class WindowsSandboxedWorkerProcess : ISandboxedWorkerProcess
+{
+    private const uint StillActive = 259;
+    private readonly LiveSandboxLaunch live;
+    private int disposed;
+
+    public WindowsSandboxedWorkerProcess(string workerInstanceId, LiveSandboxLaunch live)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(workerInstanceId);
+        this.live = live ?? throw new ArgumentNullException(nameof(live));
+        WorkerInstanceId = workerInstanceId;
+        ProcessId = live.ProcessId;
+    }
+
+    public string WorkerInstanceId { get; }
+
+    public int ProcessId { get; }
+
+    public bool IsAlive
+    {
+        get
+        {
+            if (disposed != 0)
+            {
+                return false;
+            }
+
+            return NativeMethods.GetExitCodeProcess(live.Process, out var exit) && exit == StillActive;
+        }
+    }
+
+    public void Terminate()
+    {
+        if (disposed != 0)
+        {
+            return;
+        }
+
+        NativeMethods.TerminateJobObject(live.Job, 1);
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0)
+        {
+            return;
+        }
+
+        live.Dispose();
     }
 }

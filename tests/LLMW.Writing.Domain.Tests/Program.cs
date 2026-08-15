@@ -43,6 +43,7 @@ internal static partial class Program
             RunWp06NarrativeChangeDomainTests();
             RunWp07RegistryDomainTests();
             RunWp09SecurityDomainTests();
+            RunWp12SchedulerDomainTests();
 
             Console.WriteLine($"Domain Authority FSM tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)
@@ -548,6 +549,21 @@ internal static partial class Program
         {
             throw new InvalidOperationException($"{message} Expected: {expected}; actual: {actual}.");
         }
+    }
+
+    private static void AssertThrows<TException>(Action action, string message)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private sealed record MatrixMetric(

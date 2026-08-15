@@ -27,6 +27,19 @@ public static class IpcSemanticTypes
     public const string SearchNarrative = "searchNarrative";
     public const string RestoreHistoryEntry = "restoreHistoryEntry";
     public const string ActivateExtension = "activateExtension";
+    public const string LoadSchedulerSnapshot = "loadSchedulerSnapshot";
+    public const string CreateWorkflowRun = "createWorkflowRun";
+    public const string CreateRun = "createRun";
+    public const string CreateTask = "createTask";
+    public const string DispatchReadyTask = "dispatchReadyTask";
+    public const string CancelRuntimeScope = "cancelRuntimeScope";
+    public const string RetryTask = "retryTask";
+    public const string PersistCheckpoint = "persistCheckpoint";
+    public const string ClassifyResume = "classifyResume";
+    public const string LaunchRunWorker = "launchRunWorker";
+    public const string ReleaseRunWorker = "releaseRunWorker";
+    public const string ReconcileRunWorkers = "reconcileRunWorkers";
+    public const string SpawnChildRun = "spawnChildRun";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -51,7 +64,20 @@ public static class IpcSemanticTypes
         ReconcileRegistryEntry,
         SearchNarrative,
         RestoreHistoryEntry,
-        ActivateExtension
+        ActivateExtension,
+        LoadSchedulerSnapshot,
+        CreateWorkflowRun,
+        CreateRun,
+        CreateTask,
+        DispatchReadyTask,
+        CancelRuntimeScope,
+        RetryTask,
+        PersistCheckpoint,
+        ClassifyResume,
+        LaunchRunWorker,
+        ReleaseRunWorker,
+        ReconcileRunWorkers,
+        SpawnChildRun
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();

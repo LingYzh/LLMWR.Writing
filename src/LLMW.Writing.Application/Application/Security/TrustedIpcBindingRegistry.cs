@@ -1,13 +1,17 @@
+using LLMW.Writing.Application.Security;
+
 namespace LLMW.Writing.Application.Security;
 
-/// <summary>
-/// Core-owned launch/composition record. This is not an IPC payload and is not caller-writable.
-/// </summary>
 public sealed record TrustedIpcLaunchRecord(
     AuthenticatedClientKind ClientKind,
     string WorkerInstanceId,
     string ChannelInstanceId,
-    ProjectScope ProjectScope);
+    ProjectScope ProjectScope,
+    string? LaunchBindingId = null,
+    string? BoundRunId = null)
+{
+    public string BindingId => string.IsNullOrWhiteSpace(LaunchBindingId) ? ChannelInstanceId : LaunchBindingId;
+}
 
 public interface ITrustedIpcBindingRegistry
 {
@@ -15,13 +19,18 @@ public interface ITrustedIpcBindingRegistry
 
     bool TryBind(AuthenticatedClientKind clientKind, out AuthenticatedChannelContext context);
 
+    bool TryBind(string launchBindingId, AuthenticatedClientKind expectedKind, out AuthenticatedChannelContext context);
+
     void Unregister(AuthenticatedClientKind clientKind);
+
+    void Unregister(string launchBindingId);
 }
 
 public sealed class TrustedIpcBindingRegistry : ITrustedIpcBindingRegistry
 {
     private readonly object gate = new();
-    private readonly Dictionary<AuthenticatedClientKind, TrustedIpcLaunchRecord> records = [];
+    private readonly Dictionary<string, TrustedIpcLaunchRecord> records = new(StringComparer.Ordinal);
+    private string? runtimeBindingId;
 
     public void Register(TrustedIpcLaunchRecord record)
     {
@@ -36,7 +45,11 @@ public sealed class TrustedIpcBindingRegistry : ITrustedIpcBindingRegistry
 
         lock (gate)
         {
-            records[record.ClientKind] = record;
+            records[record.BindingId] = record;
+            if (record.ClientKind == AuthenticatedClientKind.AgentRuntime)
+            {
+                runtimeBindingId = record.BindingId;
+            }
         }
     }
 
@@ -44,17 +57,31 @@ public sealed class TrustedIpcBindingRegistry : ITrustedIpcBindingRegistry
     {
         lock (gate)
         {
-            if (!records.TryGetValue(clientKind, out var record))
+            if (clientKind == AuthenticatedClientKind.AgentRuntime &&
+                runtimeBindingId is not null &&
+                records.TryGetValue(runtimeBindingId, out var runtime))
+            {
+                context = ToContext(runtime);
+                return true;
+            }
+
+            context = null!;
+            return false;
+        }
+    }
+
+    public bool TryBind(string launchBindingId, AuthenticatedClientKind expectedKind, out AuthenticatedChannelContext context)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(launchBindingId);
+        lock (gate)
+        {
+            if (!records.TryGetValue(launchBindingId, out var record) || record.ClientKind != expectedKind)
             {
                 context = null!;
                 return false;
             }
 
-            context = new AuthenticatedChannelContext(
-                record.ChannelInstanceId,
-                record.ClientKind,
-                record.WorkerInstanceId,
-                record.ProjectScope);
+            context = ToContext(record);
             return true;
         }
     }
@@ -63,7 +90,28 @@ public sealed class TrustedIpcBindingRegistry : ITrustedIpcBindingRegistry
     {
         lock (gate)
         {
-            records.Remove(clientKind);
+            if (clientKind != AuthenticatedClientKind.AgentRuntime || runtimeBindingId is null)
+            {
+                return;
+            }
+
+            records.Remove(runtimeBindingId);
+            runtimeBindingId = null;
         }
     }
+
+    public void Unregister(string launchBindingId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(launchBindingId);
+        lock (gate)
+        {
+            if (records.Remove(launchBindingId) && StringComparer.Ordinal.Equals(runtimeBindingId, launchBindingId))
+            {
+                runtimeBindingId = null;
+            }
+        }
+    }
+
+    private static AuthenticatedChannelContext ToContext(TrustedIpcLaunchRecord record) =>
+        new(record.ChannelInstanceId, record.ClientKind, record.WorkerInstanceId, record.ProjectScope, record.BoundRunId);
 }

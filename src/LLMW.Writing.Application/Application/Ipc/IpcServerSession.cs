@@ -18,6 +18,8 @@ public sealed class IpcServerOptions
 
     public ITrustedIpcBindingRegistry? Bindings { get; init; }
 
+    public string? LaunchBindingId { get; init; }
+
     public RunSessionService? RunSessions { get; init; }
 
     public IIpcStateSnapshotProvider Snapshots { get; init; } = TransportOnlySnapshotProvider.Instance;
@@ -232,7 +234,14 @@ public static class IpcServerSession
                 var kind = options.ExpectedClientKind == IpcClientKind.Worker
                     ? AuthenticatedClientKind.Worker
                     : AuthenticatedClientKind.AgentRuntime;
-                options.Bindings?.TryBind(kind, out channel);
+                if (!string.IsNullOrWhiteSpace(options.LaunchBindingId))
+                {
+                    options.Bindings?.TryBind(options.LaunchBindingId, kind, out channel);
+                }
+                else
+                {
+                    options.Bindings?.TryBind(kind, out channel);
+                }
             }
 
             var ack = new HelloAck(
@@ -622,7 +631,26 @@ public static class IpcServerSession
         private async Task HandleApplicationCommandAsync(IpcWireEnvelope wire, CancellationToken cancellationToken)
         {
             CallerPrincipal? principal = null;
-            if (options.ExpectedClientKind == IpcClientKind.Ui)
+            if (RuntimeManagementCatalog.IsChannelScoped(wire.SemanticType))
+            {
+                if (options.ExpectedClientKind != IpcClientKind.AgentRuntime)
+                {
+                    TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.RuntimeManagementDenied, "Runtime management commands require an authenticated Agent Runtime channel.", wire.SemanticType);
+                    return;
+                }
+
+                if (channel is null)
+                {
+                    options.Bindings?.TryBind(AuthenticatedClientKind.AgentRuntime, out channel);
+                }
+
+                if (channel is null)
+                {
+                    TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.TrustedBindingUnavailable, "Trusted Runtime launch binding is unavailable.", wire.SemanticType);
+                    return;
+                }
+            }
+            else if (options.ExpectedClientKind == IpcClientKind.Ui)
             {
                 principal = options.NativeUi?.ResolveUserInteractive();
                 if (principal is null)
@@ -801,6 +829,12 @@ public static class IpcServerSession
             {
                 options.RunSessions.RevokeByChannelWorker(channel);
             }
+
+            if (options.ExpectedClientKind == IpcClientKind.Worker &&
+                !string.IsNullOrWhiteSpace(options.LaunchBindingId))
+            {
+                options.Bindings?.Unregister(options.LaunchBindingId);
+            }
         }
 
         private bool TryCrossCheckEnvelope(IpcWireEnvelope wire, string runId, out string? errorCode)
@@ -809,6 +843,13 @@ public static class IpcServerSession
             if (channel is null)
             {
                 errorCode = IpcErrorCodes.TrustedBindingUnavailable;
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(channel.BoundRunId) &&
+                !StringComparer.Ordinal.Equals(channel.BoundRunId, runId))
+            {
+                errorCode = IpcErrorCodes.BindingMismatch;
                 return false;
             }
 

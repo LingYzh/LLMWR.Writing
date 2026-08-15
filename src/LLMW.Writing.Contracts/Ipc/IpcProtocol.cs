@@ -52,7 +52,8 @@ public static class IpcProtocol
 }
 
 /// <summary>
-/// Names for the two Core-owned named-pipe endpoints in a workspace instance.
+/// Names for Core-owned named-pipe endpoints in a workspace instance.
+/// Worker endpoints are per Core-owned launch binding and admit one connection each.
 /// </summary>
 public static class IpcPipeNames
 {
@@ -61,6 +62,20 @@ public static class IpcPipeNames
     public static string Core(string workspaceInstanceId) => Create(workspaceInstanceId, "core");
 
     public static string Runtime(string workspaceInstanceId) => Create(workspaceInstanceId, "runtime");
+
+    public static string Worker(string workspaceInstanceId, string launchBindingId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(launchBindingId);
+        if (launchBindingId.Length != 16 ||
+            launchBindingId.Any(character => !char.IsAsciiHexDigit(character)))
+        {
+            throw new ArgumentException(
+                "Worker launch binding IDs used in pipe names must be 16 ASCII hex characters.",
+                nameof(launchBindingId));
+        }
+
+        return Create(workspaceInstanceId, "w-" + launchBindingId.ToLowerInvariant());
+    }
 
     private static string Create(string workspaceInstanceId, string endpoint)
     {
@@ -177,6 +192,13 @@ public static class IpcErrorCodes
     public const string SessionRevoked = "SECURITY_SESSION_REVOKED";
     public const string BindingMismatch = "SECURITY_BINDING_MISMATCH";
     public const string TrustedBindingUnavailable = "SECURITY_TRUSTED_BINDING_UNAVAILABLE";
+    public const string RuntimeManagementDenied = "SECURITY_RUNTIME_MANAGEMENT_DENIED";
+    public const string AgentSpawnDenied = "AGENT_SPAWN_DENIED";
+    public const string AgentDepthLimit = "AGENT_DEPTH_LIMIT";
+    public const string AgentDepthSpoof = "AGENT_DEPTH_SPOOF";
+    public const string AgentUnknownSideEffect = "AGENT_UNKNOWN_SIDE_EFFECT";
+    public const string AgentCheckpointUnsupported = "AGENT_CHECKPOINT_UNSUPPORTED";
+    public const string AgentIllegalTransition = "AGENT_ILLEGAL_TRANSITION";
 }
 
 public static class IpcServerCapabilities

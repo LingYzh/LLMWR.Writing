@@ -809,6 +809,20 @@ internal static class WindowsSandboxProcessLauncher
             throw new SandboxLayerException(extraError.Value, "ExtraEnvironment is not on the independent allowlist.");
         }
 
+        if (request.TrustedLaunchEnvironment is { Count: > 0 })
+        {
+            var overlayError = SandboxEnvironmentPolicy.ValidateTrustedLaunchEnvironment(request.TrustedLaunchEnvironment);
+            if (overlayError is not null)
+            {
+                throw new SandboxLayerException(overlayError.Value, "Trusted Worker launch environment was rejected.");
+            }
+
+            foreach (var pair in request.TrustedLaunchEnvironment)
+            {
+                sanitized[pair.Key] = pair.Value;
+            }
+        }
+
         var block = string.Join("\0", sanitized.Select(pair => pair.Key + "=" + pair.Value)) + "\0\0";
         var bytes = System.Text.Encoding.Unicode.GetBytes(block);
         var buffer = Marshal.AllocHGlobal(bytes.Length);

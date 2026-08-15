@@ -10,12 +10,33 @@ internal sealed class RuntimePipeClient
 
     public RuntimePipeClient(string workspaceInstanceId, string bootstrapToken, TimeSpan heartbeatInterval)
     {
+        var recovery = new IpcTransportRecovery
+        {
+            AfterRestoreAsync = async (session, cancellationToken) =>
+            {
+                try
+                {
+                    await session.RequestAsync(
+                            IpcSemanticTypes.LoadSchedulerSnapshot,
+                            new LoadSchedulerSnapshotRequest(null),
+                            IpcJsonContext.Default.LoadSchedulerSnapshotRequestEnvelope,
+                            IpcJsonContext.Default.LoadSchedulerSnapshotResponseEnvelope,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (IpcProtocolException exception) when (
+                    exception.ErrorCode is IpcErrorCodes.CommandUnavailable or IpcErrorCodes.TrustedBindingUnavailable)
+                {
+                }
+            }
+        };
         _reconnect = new IpcReconnectClient(
             token => ConnectAsync(workspaceInstanceId, token),
             workspaceInstanceId,
             bootstrapToken,
             IpcClientKind.AgentRuntime,
-            heartbeatInterval);
+            heartbeatInterval,
+            recovery);
     }
 
     public Task RunWithReconnectAsync(CancellationToken cancellationToken) =>

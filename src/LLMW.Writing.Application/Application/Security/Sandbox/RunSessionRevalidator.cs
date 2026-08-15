@@ -134,7 +134,8 @@ public sealed class RunSessionRevalidator : IRunSessionRevalidator
                 session.ChannelInstanceId,
                 AuthenticatedClientKind.AgentRuntime,
                 session.WorkerInstanceId,
-                sessionScope);
+                sessionScope,
+                session.RunId);
             var fresh = CallerPrincipal.CreateAgentRun(
                 run.RunId,
                 role,

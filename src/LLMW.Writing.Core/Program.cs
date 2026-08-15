@@ -27,6 +27,19 @@ internal static class Program
 
         var eventRing = new IpcEventRing(Guid.NewGuid().ToString("D"));
         var bindings = new TrustedIpcBindingRegistry();
+        var commands = new MutableIpcCommandHandler();
+        var nativeUi = new TrustedNativePrincipalSource("core-native-ui");
+        var runtimeWorkerInstanceId = "runtime-" + Guid.NewGuid().ToString("N");
+        var runtimeChannelInstanceId = "runtime-channel-" + Guid.NewGuid().ToString("N");
+        commands.Inner = new CoreOpenProjectHandler(
+            commands,
+            bindings,
+            eventRing,
+            workspaceInstanceId,
+            runtimeWorkerInstanceId,
+            runtimeChannelInstanceId,
+            nativeUi);
+
         var uiOptions = new IpcServerOptions
         {
             WorkspaceInstanceId = workspaceInstanceId,
@@ -34,7 +47,8 @@ internal static class Program
             Bootstrap = new IpcBootstrapAuthenticator(uiBootstrapToken),
             EventRing = eventRing,
             Bindings = bindings,
-            NativeUi = new TrustedNativePrincipalSource("core-native-ui")
+            NativeUi = nativeUi,
+            Commands = commands
         };
         var runtimeOptions = new IpcServerOptions
         {
@@ -42,7 +56,8 @@ internal static class Program
             ExpectedClientKind = IpcClientKind.AgentRuntime,
             Bootstrap = new IpcBootstrapAuthenticator(runtimeBootstrapToken),
             EventRing = eventRing,
-            Bindings = bindings
+            Bindings = bindings,
+            Commands = commands
         };
 
         var uiServer = new Ipc.CorePipeServer(

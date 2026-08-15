@@ -109,6 +109,12 @@ internal static class NativeConstants
     public const uint ACCESS_ALLOWED_ACE_TYPE = 0;
     public const uint GENERIC_ALL = 0x10000000;
     public const uint SECURITY_DESCRIPTOR_REVISION = 1;
+    public const uint PIPE_ACCESS_DUPLEX = 0x00000003;
+    public const uint FILE_FLAG_OVERLAPPED = 0x40000000;
+    public const uint PIPE_TYPE_BYTE = 0;
+    public const uint PIPE_WAIT = 0;
+    public const uint PIPE_REJECT_REMOTE_CLIENTS = 0x00000008;
+    public const uint SDDL_REVISION_1 = 1;
 
     public const uint WINSTA_ENUMDESKTOPS = 0x0001;
     public const uint WINSTA_READATTRIBUTES = 0x0002;

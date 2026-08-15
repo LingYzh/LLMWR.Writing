@@ -26,6 +26,7 @@ internal static partial class Program
 
             RunWp10Tests();
             await RunWp11TestsAsync();
+            await RunWp12TestsAsync();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;

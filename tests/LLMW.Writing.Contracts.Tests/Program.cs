@@ -26,6 +26,7 @@ internal static class Program
             MessageIdsUseUuidV7Layout();
             RunSessionContractCannotSelectTrustedPrincipalOrBinding();
             Wp11ContractTests.Run();
+            Wp12ContractTests.Run();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }
@@ -97,6 +98,7 @@ internal static class Program
     private static void PipeNamesAreWorkspaceSpecific()
     {
         AssertEqual("llmw-writing-workspace-01-runtime", IpcPipeNames.Runtime("workspace-01"), "Runtime pipe name changed.");
+        AssertEqual("llmw-writing-workspace-01-w-0123456789abcdef", IpcPipeNames.Worker("workspace-01", "0123456789abcdef"), "Worker pipe name changed.");
         AssertTrue(
             !StringComparer.Ordinal.Equals(IpcPipeNames.Runtime("workspace-01"), IpcPipeNames.Runtime("workspace-02")),
             "Distinct workspace instances must not collide on a pipe name.");

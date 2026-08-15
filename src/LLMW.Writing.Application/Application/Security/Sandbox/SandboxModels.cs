@@ -68,7 +68,8 @@ public sealed record SandboxExecutionRequest(
     TimeSpan Timeout,
     bool NetworkRequired = false,
     SandboxResourceLimits? Limits = null,
-    IReadOnlyDictionary<string, string>? ExtraEnvironment = null)
+    IReadOnlyDictionary<string, string>? ExtraEnvironment = null,
+    IReadOnlyDictionary<string, string>? TrustedLaunchEnvironment = null)
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(60);
 
@@ -146,6 +147,15 @@ public sealed record SandboxFileWriteResult(bool Succeeded, SandboxError? Error,
 
     public static SandboxFileWriteResult Ok() => new(true, null, null);
 }
+
+public sealed record SandboxWorkerLaunchRequest(
+    CallerPrincipal Principal,
+    string RunId,
+    string WorkerInstanceId,
+    string ExecutablePath,
+    IReadOnlyList<string> Arguments,
+    IReadOnlyDictionary<string, string> TrustedLaunchEnvironment,
+    TimeSpan Timeout);
 
 public sealed record CommandFingerprint(string CanonicalExecutable, IReadOnlyList<string> Arguments, string Digest)
 {

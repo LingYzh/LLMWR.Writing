@@ -12,9 +12,10 @@
 ```text
 llmw-<app-id>-<workspace-instance-id>-core
 llmw-<app-id>-<workspace-instance-id>-runtime
+llmw-<app-id>-<workspace-instance-id>-w-<launch-binding-id>
 ```
 
-Use current-user-only restriction and non-inheritable handles. One duplex connection per client. Each endpoint admits at most one authenticated connection at a time.
+Use current-user-only restriction and non-inheritable handles on UI and Runtime endpoints. Worker endpoints are Core-owned per launch binding: one duplex connection per Worker, ACL'd to the current user plus the sandbox AppContainer SID of that Worker. Each endpoint admits at most one authenticated connection at a time.
 
 ## Bootstrap auth
 
@@ -77,6 +78,8 @@ v1 `serverCapabilities`: `heartbeat`, `multiplex`, `snapshot`, `cancel`, `events
 
 WP11 transport additions: GetStateSnapshot, SubscribeEvents, Cancel, GapEvent, CoreNoticeEvent.
 
+WP12 Runtime scheduler additions: LoadSchedulerSnapshot, CreateWorkflowRun, CreateRun, CreateTask, DispatchReadyTask, CancelRuntimeScope, RetryTask, PersistCheckpoint, ClassifyResume, LaunchRunWorker, ReleaseRunWorker, ReconcileRunWorkers, SpawnChildRun.
+
 Known but not-yet-implemented business commands return structured `IPC_COMMAND_UNAVAILABLE` without executing. Unknown `semanticType` returns `IPC_UNSUPPORTED_SEMANTIC_TYPE` and disconnects.
 
 IPC DTOs never serialize Domain entities directly.
@@ -90,6 +93,8 @@ IPC DTOs never serialize Domain entities directly.
 Families: IPC, AUTH, REGISTRY, SECURITY, PROJECT, AGENT, PROVIDER, EDITOR, STORAGE.
 
 WP11 codes include: `IPC_UNSUPPORTED_SEMANTIC_TYPE`, `IPC_DUPLICATE_REQUEST`, `IPC_UNKNOWN_CORRELATION`, `IPC_QUEUE_OVERLOAD`, `IPC_RESYNC_REQUIRED`, `IPC_COMMAND_UNAVAILABLE`, `IPC_PROTOCOL_VIOLATION`, `IPC_CANCELLED`, `AUTH_BOOTSTRAP_REPLAY`, `SECURITY_INVALID_SESSION`, `SECURITY_SESSION_EXPIRED`, `SECURITY_SESSION_REVOKED`, `SECURITY_BINDING_MISMATCH`, `SECURITY_TRUSTED_BINDING_UNAVAILABLE`.
+
+WP12 codes include: `SECURITY_RUNTIME_MANAGEMENT_DENIED`, `AGENT_SPAWN_DENIED`, `AGENT_DEPTH_LIMIT`, `AGENT_DEPTH_SPOOF`, `AGENT_UNKNOWN_SIDE_EFFECT`, `AGENT_CHECKPOINT_UNSUPPORTED`, `AGENT_ILLEGAL_TRANSITION`.
 
 Do not include bootstrap tokens, RunSession tokens, secrets, full stack traces, or filesystem security paths in error messages.
 
@@ -174,6 +179,34 @@ actualExpiresAt = min(requested, now + MaximumTtl)
 ```
 
 Persisted and returned expiry is `actualExpiresAt`. A huge caller timestamp cannot exceed `MaximumTtl`. Session issuance without a Core-owned trusted launch record / channel binding fails closed (`SECURITY_TRUSTED_BINDING_UNAVAILABLE`). Principal kind is Core-owned: Runtime cannot become `USER_INTERACTIVE`; IPC cannot select `CORE_INTERNAL`.
+
+## WP12 Runtime scheduler commands
+
+These are coarse Runtime-orchestration operations. They are not generic SQL/CRUD, do not serialize Domain entities, and do not expose `ISandboxHost`, raw SQLite, trusted-binding mutation, or caller-selected principals.
+
+Authenticated Agent Runtime channel + Core-owned Runtime launch binding is required. They do **not** mint `CORE_INTERNAL`. `spawnChildRun` additionally requires a Core-issued parent `RunSessionProof` and `Agent.Spawn`. Child `createRun` depth is derived from the durable parent; callers cannot choose `depth`. Live subagent creation uses `spawnChildRun`, not a lower-level Worker launch API.
+
+Worker trusted launch records are keyed by a Core-owned `launchBindingId` (16 hex), not by `AuthenticatedClientKind` alone. Each record may carry a composition-owned `BoundRunId`. A Worker cannot bind by kind, cannot select another Worker's record via payload `runId`/`workerInstanceId`/`channelId`, and cannot issue a `RunSession` for a different Run than `BoundRunId`.
+
+| semanticType | Request | Response |
+|---|---|---|
+| `loadSchedulerSnapshot` | optional `workflowRunId` | rebuildable snapshot + READY/blocked projection |
+| `createWorkflowRun` | optional `storylineId` | durable workflow identity |
+| `createRun` | `workflowRunId`, `role`, optional parent | durable run + derived depth |
+| `createTask` | `runId`, `taskKind`, `priority` | durable task |
+| `dispatchReadyTask` | `taskId` | atomic READY→RUNNING + Attempt, or `queued` |
+| `cancelRuntimeScope` | `scopeKind`=`workflowRun`\|`run`\|`task`, `scopeId` | cascade cancel |
+| `retryTask` | `taskId` | same Task, new Attempt; `blockedUnknown` if UNKNOWN |
+| `persistCheckpoint` | run/task + v1 payload | checkpoint id |
+| `classifyResume` | run + freshness flags | `CONTINUE`/`REPLAN`/`RESTART_TASK`/`RESTART_RUN`/`BLOCK_UNKNOWN` |
+| `launchRunWorker` | durable `runId`/`taskId`/`attemptId` | Core-owned `workerInstanceId`/`launchBindingId` |
+| `releaseRunWorker` | Core-owned `workerInstanceId` | released |
+| `reconcileRunWorkers` | empty | orphan/liveness classifications |
+| `spawnChildRun` | parent run/task + optional requested depth + session | `spawned`/`queued`/`denied` |
+
+Envelope `runId` / `workerInstanceId` / `channelId` claims never select the trusted launch record. Worker pipes are `llmw-writing-<workspace>-w-<16-hex-launchBindingId>` and admit one connection. Bootstrap for a Worker is a Core-issued one-shot secret distinct from UI/Runtime/Core bootstrap tokens.
+
+Queue saturation returns `outcome=queued`. Missing `Agent.Spawn` returns `AGENT_SPAWN_DENIED`. Illegal depth 5 returns `AGENT_DEPTH_LIMIT`. Depth spoof returns `AGENT_DEPTH_SPOOF`. UNKNOWN side effect returns `AGENT_UNKNOWN_SIDE_EFFECT` and does not create an automatic Attempt.
 
 ## BlobRef
 

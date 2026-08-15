@@ -72,6 +72,8 @@ public sealed class IpcTransportRecovery
         }
     }
 
+    public Func<IpcClientSession, CancellationToken, Task>? AfterRestoreAsync { get; init; }
+
     public async Task RestoreAsync(IpcClientSession session, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(session);
@@ -128,6 +130,10 @@ public sealed class IpcTransportRecovery
                 {
                     overflowSignal = NewSignal();
                     await RestoreAsync(session, cancellationToken).ConfigureAwait(false);
+                    if (AfterRestoreAsync is not null)
+                    {
+                        await AfterRestoreAsync(session, cancellationToken).ConfigureAwait(false);
+                    }
                     var disconnected = await PumpAsync(session, cancellationToken).ConfigureAwait(false);
                     if (disconnected)
                     {

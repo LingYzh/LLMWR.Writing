@@ -20,6 +20,23 @@ public static class SandboxEnvironmentPolicy
 
     private static readonly HashSet<string> ExtraAllowedNames = new(StringComparer.OrdinalIgnoreCase);
 
+    private static readonly HashSet<string> TrustedLaunchOverlayNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "LLMW_WORKER_BOOTSTRAP_TOKEN",
+        "LLMW_WORKSPACE_INSTANCE_ID",
+        "LLMW_WORKER_INSTANCE_ID",
+        "LLMW_RUN_ID",
+        "LLMW_LAUNCH_BINDING_ID",
+        "LLMW_WORKER_PIPE_NAME"
+    };
+
+    private static readonly HashSet<string> ForbiddenWorkerInheritedNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "LLMW_UI_BOOTSTRAP_TOKEN",
+        "LLMW_RUNTIME_BOOTSTRAP_TOKEN",
+        "LLMW_CORE_BOOTSTRAP_TOKEN"
+    };
+
     private static readonly HashSet<string> ForbiddenOverrideNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "SystemRoot",
@@ -134,6 +151,32 @@ public static class SandboxEnvironmentPolicy
         }
 
         return null;
+    }
+
+    public static SandboxError? ValidateTrustedLaunchEnvironment(IReadOnlyDictionary<string, string>? overlay)
+    {
+        if (overlay is null || overlay.Count == 0)
+        {
+            return SandboxError.EnvironmentRejected;
+        }
+
+        foreach (var pair in overlay)
+        {
+            if (ForbiddenWorkerInheritedNames.Contains(pair.Key) ||
+                pair.Key.Equals("LLMW_UI_BOOTSTRAP_TOKEN", StringComparison.OrdinalIgnoreCase) ||
+                pair.Key.Equals("LLMW_RUNTIME_BOOTSTRAP_TOKEN", StringComparison.OrdinalIgnoreCase) ||
+                pair.Key.Equals("LLMW_CORE_BOOTSTRAP_TOKEN", StringComparison.OrdinalIgnoreCase))
+            {
+                return SandboxError.EnvironmentRejected;
+            }
+
+            if (!TrustedLaunchOverlayNames.Contains(pair.Key) || string.IsNullOrWhiteSpace(pair.Value))
+            {
+                return SandboxError.EnvironmentRejected;
+            }
+        }
+
+        return overlay.ContainsKey("LLMW_WORKER_BOOTSTRAP_TOKEN") ? null : SandboxError.EnvironmentRejected;
     }
 
     public static IReadOnlyDictionary<string, string> Sanitize(

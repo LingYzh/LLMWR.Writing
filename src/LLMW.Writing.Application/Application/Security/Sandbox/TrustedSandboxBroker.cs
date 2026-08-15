@@ -13,6 +13,8 @@ public interface ITrustedSandboxBroker
     SandboxFileReadResult ReadFile(SandboxFileReadRequest request);
 
     SandboxFileWriteResult WriteSandboxWorkFile(SandboxFileWriteRequest request);
+
+    SandboxedWorkerStartResult LaunchRunWorker(SandboxWorkerLaunchRequest request);
 }
 
 public sealed class TrustedSandboxBroker : ITrustedSandboxBroker
@@ -152,6 +154,55 @@ public sealed class TrustedSandboxBroker : ITrustedSandboxBroker
             request.LogicalRelativePath,
             request.Contents.Span);
         return error is null ? SandboxFileWriteResult.Ok() : SandboxFileWriteResult.Fail(error.Value);
+    }
+
+    public SandboxedWorkerStartResult LaunchRunWorker(SandboxWorkerLaunchRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (faultInjector.Fault == SandboxFaultPoint.BrokerUnavailable)
+        {
+            return SandboxedWorkerStartResult.Fail(SandboxError.BrokerUnavailable);
+        }
+
+        if (sandboxHost.Availability is not SandboxAvailability.Available)
+        {
+            return SandboxedWorkerStartResult.Fail(
+                sandboxHost.Availability == SandboxAvailability.UnsupportedPlatform
+                    ? SandboxError.PlatformUnsupported
+                    : SandboxError.SandboxUnavailable,
+                "Run Workers launch only through an available OS-enforced sandbox host.");
+        }
+
+        var overlayError = SandboxEnvironmentPolicy.ValidateTrustedLaunchEnvironment(request.TrustedLaunchEnvironment);
+        if (overlayError is not null)
+        {
+            return SandboxedWorkerStartResult.Fail(overlayError.Value, "Trusted Worker launch environment was rejected.");
+        }
+
+        if (IsProjectExecutable(projectContext.TrustedProjectRoot, request.ExecutablePath))
+        {
+            return SandboxedWorkerStartResult.Fail(
+                SandboxError.CapabilityDenied,
+                "Untrusted project executables cannot be launched as Run Workers.");
+        }
+
+        var binding = SandboxLaunchBinding.Create(
+            request.RunId,
+            request.WorkerInstanceId,
+            projectContext.TrustedProjectScope,
+            "wp12-worker");
+        var execution = new SandboxExecutionRequest(
+            binding,
+            request.Principal,
+            Capability.ShellExecute,
+            request.ExecutablePath,
+            request.Arguments,
+            projectContext.TrustedProjectRoot,
+            request.Timeout,
+            NetworkRequired: false,
+            ExtraEnvironment: null,
+            TrustedLaunchEnvironment: request.TrustedLaunchEnvironment);
+        return sandboxHost.StartWorker(execution);
     }
 
     private SandboxExecutionResult ExecuteProcess(SandboxExecutionRequest request, Capability required)

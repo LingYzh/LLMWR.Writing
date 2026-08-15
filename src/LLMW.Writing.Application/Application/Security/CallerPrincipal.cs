@@ -156,7 +156,8 @@ public sealed record AuthenticatedChannelContext(
     string ChannelInstanceId,
     AuthenticatedClientKind ClientKind,
     string WorkerInstanceId,
-    ProjectScope ProjectScope)
+    ProjectScope ProjectScope,
+    string? BoundRunId = null)
 {
     public void ValidateForAgentRun()
     {

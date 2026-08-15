@@ -48,6 +48,27 @@ public interface ISandboxPathGuard
     SandboxError? TryOpenWrite(string projectRoot, string runId, string logicalRelativePath, ReadOnlySpan<byte> contents);
 }
 
+public interface ISandboxedWorkerProcess : IDisposable
+{
+    string WorkerInstanceId { get; }
+
+    int ProcessId { get; }
+
+    bool IsAlive { get; }
+
+    void Terminate();
+}
+
+public sealed record SandboxedWorkerStartResult(
+    bool Succeeded,
+    SandboxError? Error,
+    ISandboxedWorkerProcess? Process,
+    string? DenyReason)
+{
+    public static SandboxedWorkerStartResult Fail(SandboxError error, string? denyReason = null) =>
+        new(false, error, null, denyReason ?? error.ToString());
+}
+
 public interface ISandboxHost
 {
     SandboxAvailability Availability { get; }
@@ -55,6 +76,8 @@ public interface ISandboxHost
     SandboxIdentity? Identity { get; }
 
     SandboxExecutionResult Execute(SandboxExecutionRequest request);
+
+    SandboxedWorkerStartResult StartWorker(SandboxExecutionRequest request);
 }
 
 public sealed class UnsupportedSandboxHost : ISandboxHost
@@ -71,6 +94,9 @@ public sealed class UnsupportedSandboxHost : ISandboxHost
 
     public SandboxExecutionResult Execute(SandboxExecutionRequest request) =>
         SandboxExecutionResult.Fail(request, SandboxError.PlatformUnsupported);
+
+    public SandboxedWorkerStartResult StartWorker(SandboxExecutionRequest request) =>
+        SandboxedWorkerStartResult.Fail(SandboxError.PlatformUnsupported, "Worker launch requires an OS-enforced sandbox host.");
 }
 
 public sealed class UnavailableSandboxHost : ISandboxHost
@@ -88,4 +114,25 @@ public sealed class UnavailableSandboxHost : ISandboxHost
 
     public SandboxExecutionResult Execute(SandboxExecutionRequest request) =>
         SandboxExecutionResult.Fail(request, error);
+
+    public SandboxedWorkerStartResult StartWorker(SandboxExecutionRequest request) =>
+        SandboxedWorkerStartResult.Fail(error, "Worker launch is fail-closed because the sandbox host is unavailable.");
+}
+
+public sealed class UnavailableSandboxPathGuard : ISandboxPathGuard
+{
+    public static UnavailableSandboxPathGuard Instance { get; } = new();
+
+    private UnavailableSandboxPathGuard()
+    {
+    }
+
+    public SandboxError? TryOpenRead(string projectRoot, string runId, string logicalRelativePath, out byte[] bytes)
+    {
+        bytes = [];
+        return SandboxError.SandboxUnavailable;
+    }
+
+    public SandboxError? TryOpenWrite(string projectRoot, string runId, string logicalRelativePath, ReadOnlySpan<byte> contents) =>
+        SandboxError.SandboxUnavailable;
 }

@@ -340,6 +340,9 @@ internal static class Wp10SandboxApplicationTests
                 request.Binding.RunId, request.Binding.WorkerInstanceId, Identity?.AppContainerSid,
                 request.ExecutablePath, request.Capability, null, 1);
         }
+
+        public SandboxedWorkerStartResult StartWorker(SandboxExecutionRequest request) =>
+            SandboxedWorkerStartResult.Fail(SandboxError.SandboxUnavailable, "WP10 counting host does not launch Run Workers.");
     }
 
     private sealed class CountingPathGuard : ISandboxPathGuard
