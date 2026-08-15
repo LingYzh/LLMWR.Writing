@@ -358,28 +358,31 @@ internal static partial class Program
             AssertEqual(parent.Payload.RunId, session.Payload.RunId, "CreateRunSession must return the parent RunId.");
             AssertTrue(!string.IsNullOrWhiteSpace(session.Payload.OpaqueToken), "CreateRunSession must return a non-empty opaque token.");
 
-            var spawned = await runtime.RequestAsync(
-                IpcSemanticTypes.SpawnChildRun,
-                new SpawnChildRunRequest(
-                    parent.Payload.RunId,
-                    parentTask.Payload.TaskId,
-                    "writer",
-                    null,
-                    new RunSessionProof(session.Payload.RunId, session.Payload.OpaqueToken)),
-                IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
-                IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
-                timeout.Token);
-            AssertTrue(spawned.Payload.ChildRunId is not null, "Authorized spawnChildRun must return a durable child RunId.");
-            AssertTrue(
-                spawned.Payload.Outcome is "spawned" or "queued",
-                "spawnChildRun must use the normal secure path, not InvalidSession.");
+            try
+            {
+                await runtime.RequestAsync(
+                    IpcSemanticTypes.SpawnChildRun,
+                    new SpawnChildRunRequest(
+                        parent.Payload.RunId,
+                        parentTask.Payload.TaskId,
+                        "writer",
+                        null,
+                        new RunSessionProof(session.Payload.RunId, session.Payload.OpaqueToken)),
+                    IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                    IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("Production spawnChildRun must fail closed without Project Trust.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.AgentSpawnDenied, exception.ErrorCode,
+                    "Valid RunSession proof must reach Agent.Spawn and fail closed without manufactured trust.");
+            }
 
             var sqlite = new SqliteRuntimeStore(Path.Combine(root, ".llmw", "project.db"));
-            var child = sqlite.GetRun(spawned.Payload.ChildRunId!);
-            AssertTrue(child is not null, "Child Run must be durable.");
-            AssertEqual(workflow.Payload.WorkflowRunId, child!.WorkflowRunId, "Child must share the parent workflow.");
-            AssertTrue(StringComparer.Ordinal.Equals(parent.Payload.RunId, child.ParentRunId), "Child ParentRunId must be the parent Run.");
-            AssertEqual(parent.Payload.Depth + 1, child.Depth, "Child depth must be parent + 1.");
+            AssertTrue(sqlite.GetRun(parent.Payload.RunId) is not null, "Parent Run must remain durable after denied spawn.");
+            AssertTrue(sqlite.LoadSnapshot().Runs.All(item => item.ParentRunId is null),
+                "OpenProject must not persist a child Run when Agent.Spawn is fail-closed.");
 
             try
             {
@@ -510,18 +513,26 @@ internal static partial class Program
                     "Old disconnected-channel session must not authorize spawnChildRun. Actual: " + exception.ErrorCode);
             }
 
-            var spawned = await reconnected.RequestAsync(
-                IpcSemanticTypes.SpawnChildRun,
-                new SpawnChildRunRequest(
-                    parentRunId,
-                    parentTaskId,
-                    "writer",
-                    null,
-                    new RunSessionProof(secondSession.Payload.RunId, secondSession.Payload.OpaqueToken)),
-                IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
-                IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
-                timeout.Token);
-            AssertTrue(spawned.Payload.ChildRunId is not null, "New reconnect RunSession must authorize spawnChildRun.");
+            try
+            {
+                await reconnected.RequestAsync(
+                    IpcSemanticTypes.SpawnChildRun,
+                    new SpawnChildRunRequest(
+                        parentRunId,
+                        parentTaskId,
+                        "writer",
+                        null,
+                        new RunSessionProof(secondSession.Payload.RunId, secondSession.Payload.OpaqueToken)),
+                    IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                    IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("Reconnect spawnChildRun must fail closed without Project Trust.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.AgentSpawnDenied, exception.ErrorCode,
+                    "New reconnect RunSession must reach Agent.Spawn and fail closed without manufactured trust.");
+            }
         }
         finally
         {

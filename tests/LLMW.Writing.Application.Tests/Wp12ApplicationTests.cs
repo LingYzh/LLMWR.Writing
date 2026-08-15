@@ -41,8 +41,10 @@ internal static class Wp12ApplicationTests
         TaskCancelDoesNotCancelSiblingOrContainingRun();
         WorkerRunSessionCompositionFailsClosedAndRevokesOwnSession();
         RuntimeRunSessionAccessorIsResolvedLiveNotCopiedAtConstruction();
-        Console.WriteLine("Application WP12 scheduler tests passed (24).");
-        return 24;
+        UnauthenticatedWorkerCleanupMustNotMutateTrustedState();
+        MissingProjectTrustFailsClosedDespitePmAgentSpawnRole();
+        Console.WriteLine("Application WP12 scheduler tests passed (26).");
+        return 26;
     }
 
     private static void ConcurrentWorkerBindingsRemainDistinctAndForgedIdsAreDenied()
@@ -758,6 +760,8 @@ internal static class Wp12ApplicationTests
 
         AssertTrue(sessionStore.All().All(item => item.RevokedAtMs is not null),
             "Worker disconnect must revoke its own session.");
+        AssertTrue(!registry.TryBind("aaaaaaaaaaaaaaaa", AuthenticatedClientKind.Worker, out _),
+            "Authenticated Worker disconnect must unregister its LaunchBindingId.");
 
         var other = sessions.Create(new LLMW.Writing.Application.Security.CreateRunSessionRequest(
             "run-b",
@@ -865,6 +869,107 @@ internal static class Wp12ApplicationTests
         }, IpcClientKind.AgentRuntime);
     }
 
+    private static void UnauthenticatedWorkerCleanupMustNotMutateTrustedState()
+    {
+        var sessionStore = new MemoryRunSessionStore();
+        sessionStore.Runs["run-a"] = new DurableRunIdentity("run-a", "writer");
+        var sessions = new RunSessionService(sessionStore);
+        var preexisting = sessions.Create(new LLMW.Writing.Application.Security.CreateRunSessionRequest(
+            "run-a",
+            new AuthenticatedChannelContext("channel-a", AuthenticatedClientKind.Worker, "worker-a", Scope, "run-a"),
+            null));
+        AssertTrue(preexisting.Succeeded, "Pre-existing authenticated session must be issuable.");
+        var handleId = preexisting.Value!.HandleId;
+        var registry = new TrustedIpcBindingRegistry();
+        registry.Register(new TrustedIpcLaunchRecord(
+            AuthenticatedClientKind.Worker, "worker-a", "channel-a", Scope, "aaaaaaaaaaaaaaaa", "run-a"));
+        var correctToken = IpcBootstrapToken.Create();
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.Worker,
+            Bootstrap = new IpcBootstrapAuthenticator(correctToken),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            Bindings = registry,
+            LaunchBindingId = "aaaaaaaaaaaaaaaa",
+            RunSessions = sessions
+        };
+
+        RunRaw(options, stream =>
+        {
+            WriteHello(stream, IpcBootstrapToken.Create(), 1, 1, IpcClientKind.Worker, CancellationToken.None);
+            var error = ReadError(stream, CancellationToken.None);
+            AssertEqual(IpcErrorCodes.AuthBootstrapRejected, error.Code, "Wrong Worker bootstrap must be rejected.");
+        });
+        AssertTrue(registry.TryBind("aaaaaaaaaaaaaaaa", AuthenticatedClientKind.Worker, out _),
+            "Wrong-bootstrap Worker cleanup must not unregister the trusted LaunchBindingId.");
+        AssertEqual(0, sessionStore.RevokeByChannelWorkerCalls,
+            "Wrong-bootstrap Worker cleanup must not call RevokeByChannelWorker.");
+        AssertTrue(sessionStore.FindByHandleId(handleId)?.RevokedAtMs is null,
+            "Wrong-bootstrap Worker cleanup must not revoke a pre-existing session.");
+
+        RunRaw(options, stream =>
+        {
+            var unexpected = IpcEnvelopeFactory.Create(
+                IpcMessageType.Request,
+                IpcSemanticTypes.GetStateSnapshot,
+                Workspace,
+                new GetStateSnapshotRequest(0, null));
+            IpcFrameIO.WriteAsync(
+                    stream,
+                    IpcJson.Serialize(unexpected, IpcJsonContext.Default.GetStateSnapshotRequestEnvelope),
+                    CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+            var error = ReadError(stream, CancellationToken.None);
+            AssertEqual(IpcErrorCodes.UnexpectedMessage, error.Code, "Pre-auth Worker traffic must not authenticate.");
+        });
+        AssertTrue(registry.TryBind("aaaaaaaaaaaaaaaa", AuthenticatedClientKind.Worker, out _),
+            "Malformed/pre-auth Worker cleanup must not unregister the trusted LaunchBindingId.");
+        AssertEqual(0, sessionStore.RevokeByChannelWorkerCalls,
+            "Malformed/pre-auth Worker cleanup must not call RevokeByChannelWorker.");
+        AssertTrue(sessionStore.FindByHandleId(handleId)?.RevokedAtMs is null,
+            "Malformed/pre-auth Worker cleanup must not revoke a pre-existing session.");
+    }
+
+    private static void MissingProjectTrustFailsClosedDespitePmAgentSpawnRole()
+    {
+        AssertEqual(RoleCapabilityLevel.Allowed, RoleCapabilityMatrix.Get(AgentRole.PmMainOrchestrator, Capability.AgentSpawn),
+            "PM role maximum must remain Agent.Spawn=Allowed.");
+        var sessionStore = new MemoryRunSessionStore();
+        sessionStore.Runs["pm-run"] = new DurableRunIdentity("pm-run", "pm");
+        var sessions = new RunSessionService(sessionStore);
+        var channel = new AuthenticatedChannelContext("runtime-ch", AuthenticatedClientKind.AgentRuntime, "runtime-1", Scope);
+        var issued = sessions.Create(new LLMW.Writing.Application.Security.CreateRunSessionRequest("pm-run", channel, null));
+        AssertTrue(issued.Succeeded, "PM RunSession must issue without Project Trust.");
+        var token = issued.Value!.Token.ExportOnceForAuthenticatedTransport();
+        var principal = sessions.Resolve(new ResolveRunSessionRequest("pm-run", token, channel));
+        AssertTrue(principal.Succeeded && principal.Value is not null, "PM RunSession must resolve.");
+        AssertEqual(AgentRole.PmMainOrchestrator, principal.Value!.Role, "Resolved principal must keep the PM role.");
+
+        var decision = new CoreAuthorizationService().Authorize(
+            principal.Value,
+            new AuthorizationRequest(Capability.AgentSpawn));
+        AssertEqual(CapabilityDecisionKind.Denied, decision.Decision,
+            "OpenProject-equivalent fail-closed authorization must not treat a bound project as trusted.");
+        AssertEqual(CapabilityDecisionReason.ProductDenied, decision.Reasons.Single(),
+            "Missing production trust/grant layers must fail closed before role allow.");
+
+        var service = new RuntimeSchedulerService(
+            new MemoryRuntimeStore(),
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            new FixedClock(1_000),
+            new FakeRunWorkerSupervisor(),
+            new CoreAuthorizationService());
+        var workflow = Success(service.CreateWorkflowRun("wf-trust"));
+        var parent = Success(service.CreateRun(workflow.WorkflowRunId, "pm", null, "pm-run"));
+        Success(service.CreateTask(parent.RunId, "write", 1, null, "pm-task"));
+        AssertEqual(RuntimeError.SpawnDenied, service.SpawnChildRun(parent.RunId, "pm-task", "writer", null, principal.Value).Failure?.Code,
+            "Valid proof plus PM role must still fail closed without authoritative Project Trust.");
+        AssertTrue(service.LoadSnapshot().Runs.All(item => item.ParentRunId is null),
+            "Fail-closed Agent.Spawn must not persist a child Run.");
+    }
+
     private static void DispatchAndLaunch(RuntimeSchedulerService service, string runId, string taskId)
     {
         Success(service.CreateTask(runId, "write", 1, null, taskId));
@@ -968,9 +1073,63 @@ internal static class Wp12ApplicationTests
         }
     }
 
+    private static void RunRaw(IpcServerOptions options, Action<Stream> test)
+    {
+        var (left, right) = IpcConnectedStreamPair.Create();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var server = Task.Run(() => IpcServerSession.ServeAsync(left, options, timeout.Token), timeout.Token);
+        try
+        {
+            test(right);
+        }
+        finally
+        {
+            timeout.Cancel();
+            try
+            {
+                server.GetAwaiter().GetResult();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (AggregateException)
+            {
+            }
+
+            left.Dispose();
+            right.Dispose();
+        }
+    }
+
+    private static void WriteHello(
+        Stream stream,
+        string token,
+        int protocolMin,
+        int protocolMax,
+        IpcClientKind clientKind,
+        CancellationToken cancellationToken)
+    {
+        var hello = new HelloRequest(protocolMin, protocolMax, token, clientKind, Guid.NewGuid());
+        IpcFrameIO.WriteAsync(
+                stream,
+                IpcJson.Serialize(
+                    IpcEnvelopeFactory.Create(IpcMessageType.Control, IpcSemanticTypes.Hello, Workspace, hello),
+                    IpcJsonContext.Default.HelloRequestEnvelope),
+                cancellationToken)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    private static IpcError ReadError(Stream stream, CancellationToken cancellationToken)
+    {
+        var frame = IpcFrameIO.ReadAsync(stream, cancellationToken).GetAwaiter().GetResult();
+        return IpcJson.Deserialize(frame, IpcJsonContext.Default.ErrorEnvelope).Payload;
+    }
+
     private sealed class MemoryRunSessionStore : IRunSessionStore
     {
         public Dictionary<string, DurableRunIdentity> Runs { get; } = new(StringComparer.Ordinal);
+        public int RevokeByChannelWorkerCalls { get; private set; }
         private readonly Dictionary<string, StoredRunSession> byHandle = new(StringComparer.Ordinal);
 
         public DurableRunIdentity? LoadRun(string runId) =>
@@ -1028,6 +1187,7 @@ internal static class Wp12ApplicationTests
 
         public int RevokeByChannelWorker(string channelInstanceId, string workerInstanceId, long revokedAtMs)
         {
+            RevokeByChannelWorkerCalls++;
             var count = 0;
             foreach (var pair in byHandle.ToArray())
             {

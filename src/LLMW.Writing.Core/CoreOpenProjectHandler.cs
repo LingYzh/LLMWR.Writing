@@ -4,7 +4,6 @@ using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
-using LLMW.Writing.Domain.Security;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
@@ -103,7 +102,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
                     SystemSecurityClock.Instance,
                     supervisor,
-                    new CoreAuthorizationService(new OpenedProjectAgentSpawnPolicySource()),
+                    new CoreAuthorizationService(),
                     bindings: bindings,
                     sessions: sessions);
 
@@ -180,30 +179,4 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 context.CorrelationId,
                 context.RequestId),
             IpcJsonContext.Default.ErrorEnvelope));
-}
-
-/// <summary>
-/// After a successful existing-project bind, Agent.Spawn is evaluated against the role matrix
-/// with project-trusted product flags. Sandbox authorization remains FailClosed.
-/// Writer + Ask still requires approval; PM Agent.Spawn is Allowed.
-/// </summary>
-file sealed class OpenedProjectAgentSpawnPolicySource : ISecurityPolicySource
-{
-    public SecurityPolicySnapshot? Resolve(CallerPrincipal principal, Capability capability)
-    {
-        if (capability != Capability.AgentSpawn || principal.Kind != PrincipalKind.AgentRun)
-        {
-            return null;
-        }
-
-        return new SecurityPolicySnapshot(
-            ProductAllowed: true,
-            ToolGranted: true,
-            ExtensionGranted: true,
-            ProjectTrusted: true,
-            Scope: SecurityScopeClassification.InScope,
-            HardDeny: HardDeny.None,
-            NarrativeAuthorityAvailable: false,
-            ExplicitUserTask: false);
-    }
 }

@@ -82,6 +82,7 @@ public static class IpcServerSession
         private long lastDeliveredSeq;
         private GapEvent? outstandingGap;
         private int releasedSessions;
+        private bool authenticated;
 
         public Connection(Stream stream, IpcServerOptions options)
         {
@@ -266,6 +267,7 @@ public static class IpcServerSession
                     IpcJson.Serialize(envelope, IpcJsonContext.Default.HelloAckEnvelope),
                     cancellationToken)
                 .ConfigureAwait(false);
+            authenticated = true;
             return true;
         }
 
@@ -846,14 +848,15 @@ public static class IpcServerSession
 
         private void RevokeBoundSessions()
         {
-            TryBindTrustedChannel();
-            var sessions = options.ResolveRunSessions();
-            if (Interlocked.Exchange(ref releasedSessions, 1) != 0 || channel is null || sessions is null)
+            if (!authenticated || Interlocked.Exchange(ref releasedSessions, 1) != 0)
             {
                 return;
             }
 
-            if (options.ExpectedClientKind is IpcClientKind.AgentRuntime or IpcClientKind.Worker)
+            var sessions = options.ResolveRunSessions();
+            if (channel is not null &&
+                sessions is not null &&
+                options.ExpectedClientKind is IpcClientKind.AgentRuntime or IpcClientKind.Worker)
             {
                 sessions.RevokeByChannelWorker(channel);
             }
