@@ -106,7 +106,13 @@ internal static class WindowsSandboxProcessLauncher
     {
         ArgumentNullException.ThrowIfNull(request);
         _ = grantInternetClient;
-        Directory.CreateDirectory(workDirectory);
+        workDirectory = SafeSandboxHierarchy.EnsureRunWorkDirectory(trustedProjectRoot, request.Binding.RunId);
+        SafeSandboxHierarchy.VerifyExistingChain(
+            trustedProjectRoot,
+            SandboxPathPolicy.SandboxRootDirectoryName,
+            "runs",
+            request.Binding.RunId,
+            "work");
 
         if (faultInjector.Fault == SandboxFaultPoint.CreateProcess)
         {
@@ -157,7 +163,7 @@ internal static class WindowsSandboxProcessLauncher
                 workDirectory,
                 identity.AppContainerSid,
                 faultInjector);
-            GrantWorkSurface(workDirectory, trustedProjectRoot, identity.AppContainerSid, request.Binding, faultInjector);
+            GrantWorkSurface(trustedProjectRoot, identity.AppContainerSid, request.Binding, faultInjector);
             var windowStation = SandboxWindowStation.Ensure();
             windowStation.GrantSandboxIdentity(identity.AppContainerSid, faultInjector);
             AppContainerNetworkIsolation.EnsureLoopbackNotExempt(identity.AppContainerSid, faultInjector);
@@ -660,19 +666,21 @@ internal static class WindowsSandboxProcessLauncher
         };
 
     private static void GrantWorkSurface(
-        string workDirectory,
         string trustedProjectRoot,
         string appContainerSid,
         SandboxLaunchBinding binding,
         ISandboxFaultInjector faultInjector)
     {
-        var sandboxRoot = SandboxPathPolicy.SandboxRoot(trustedProjectRoot);
-        Directory.CreateDirectory(sandboxRoot);
-        var runs = Path.Combine(sandboxRoot, "runs");
-        Directory.CreateDirectory(runs);
-        var runDir = Path.Combine(runs, binding.RunId);
-        Directory.CreateDirectory(runDir);
-        Directory.CreateDirectory(workDirectory);
+        var sandboxRoot = SafeSandboxHierarchy.EnsureSandboxRoot(trustedProjectRoot);
+        var runs = SafeSandboxHierarchy.EnsureDirectory(trustedProjectRoot, SandboxPathPolicy.SandboxRootDirectoryName, "runs");
+        var runDir = SafeSandboxHierarchy.EnsureDirectory(trustedProjectRoot, SandboxPathPolicy.SandboxRootDirectoryName, "runs", binding.RunId);
+        SafeSandboxHierarchy.EnsureRunWorkDirectory(trustedProjectRoot, binding.RunId);
+        SafeSandboxHierarchy.VerifyExistingChain(
+            trustedProjectRoot,
+            SandboxPathPolicy.SandboxRootDirectoryName,
+            "runs",
+            binding.RunId,
+            "work");
         AppContainerAclManager.GrantMinimum(sandboxRoot, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);
         AppContainerAclManager.GrantMinimum(runs, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);
         AppContainerAclManager.GrantMinimum(runDir, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);

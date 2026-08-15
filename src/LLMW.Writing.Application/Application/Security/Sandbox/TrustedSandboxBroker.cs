@@ -366,6 +366,13 @@ public sealed class TrustedSandboxBroker : ITrustedSandboxBroker
                 return true;
             }
 
+            if (SandboxPathPolicy.IsInternalSandboxTree(relative) &&
+                !(forWrite && SandboxPathPolicy.IsDesignatedWorkRelative(relative, runId)))
+            {
+                error = SandboxError.PathOutOfScope;
+                return true;
+            }
+
             if (forWrite && !SandboxPathPolicy.IsDesignatedWorkRelative(relative, runId))
             {
                 error = SandboxError.PathOutOfScope;

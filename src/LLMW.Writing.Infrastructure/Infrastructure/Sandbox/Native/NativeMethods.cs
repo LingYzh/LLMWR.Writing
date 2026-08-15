@@ -448,6 +448,27 @@ internal static class NativeMethods
         IntPtr sacl);
 
     [DllImport("advapi32.dll", SetLastError = true)]
+    internal static extern uint GetSecurityInfo(
+        IntPtr handle,
+        uint objectType,
+        uint securityInfo,
+        out IntPtr owner,
+        out IntPtr group,
+        out IntPtr dacl,
+        out IntPtr sacl,
+        out IntPtr securityDescriptor);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    internal static extern uint SetSecurityInfo(
+        IntPtr handle,
+        uint objectType,
+        uint securityInfo,
+        IntPtr owner,
+        IntPtr group,
+        IntPtr dacl,
+        IntPtr sacl);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
     internal static extern uint SetEntriesInAclW(
         uint count,
         [In] EXPLICIT_ACCESS[] entries,

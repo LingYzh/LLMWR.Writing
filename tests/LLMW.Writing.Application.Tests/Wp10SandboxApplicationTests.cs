@@ -25,8 +25,10 @@ internal static class Wp10SandboxApplicationTests
         BrokerRejectsForgedProjectRootWithoutReading();
         BrokerRejectsForgedProjectScope();
         BrokerRequiresSessionRevalidationForAgentRun();
-        Console.WriteLine("Application WP10 sandbox tests passed (12).");
-        return 12;
+        BrokerDeniesGenericReadOfInternalSandboxTreeWithoutOpening();
+        BrokerAllowsOrdinaryProjectRead();
+        Console.WriteLine("Application WP10 sandbox tests passed (14).");
+        return 14;
     }
 
     private static void WindowsCommandLineQuotesSpacesQuotesBackslashEmptyAndUnicode()
@@ -101,6 +103,14 @@ internal static class Wp10SandboxApplicationTests
         AssertTrue(SandboxPathPolicy.IsDesignatedWorkRelative(".llmw.sandbox/runs/run-1/work/out.txt", "run-1"),
             "Designated work relative path was rejected.");
         AssertTrue(SandboxPathPolicy.IsAuthorityTree(".llmw/project.db"), ".llmw internals were not classified as authority.");
+        AssertTrue(SandboxPathPolicy.IsInternalSandboxTree(".llmw.sandbox/runs/run-B/work/secret-B.txt"),
+            "Sibling-run sandbox work was not classified as Core-internal.");
+        AssertTrue(SandboxPathPolicy.IsInternalSandboxTree(".LLMW.SANDBOX/tools/abc/file"),
+            "Case-varied sandbox tools path was not classified as Core-internal.");
+        AssertTrue(SandboxPathPolicy.IsInternalSandboxTree(@".llmw.sandbox\runs\run-B\work\secret-B.txt"),
+            "Backslash sandbox path was not classified as Core-internal.");
+        AssertFalse(SandboxPathPolicy.IsInternalSandboxTree("notes.txt"), "A normal project file was classified as sandbox-internal.");
+        AssertFalse(SandboxPathPolicy.IsInternalSandboxTree("Draft/chapter.md"), "A Draft path was classified as sandbox-internal.");
     }
 
     private static void BrokerDeniesWhenTrustMissingAndDoesNotLaunch()
@@ -192,6 +202,55 @@ internal static class Wp10SandboxApplicationTests
             "run-wp10"));
         AssertEqual(SandboxError.SessionBindingMismatch, result.Error, "Forged ProjectScope was not denied.");
         AssertEqual(0, host.Launches, "Forged ProjectScope launched a child.");
+    }
+
+    private static void BrokerDeniesGenericReadOfInternalSandboxTreeWithoutOpening()
+    {
+        var host = new CountingHost();
+        var guard = new CountingPathGuard();
+        var broker = new TrustedSandboxBroker(
+            new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
+            host,
+            guard,
+            Context);
+        foreach (var logical in new[]
+                 {
+                     ".llmw.sandbox/runs/run-B/work/secret-B.txt",
+                     ".LLMW.SANDBOX/runs/run-B/work/secret-B.txt",
+                     @".llmw.sandbox\runs\run-B\work\secret-B.txt",
+                     ".llmw.sandbox/tools/known/file"
+                 })
+        {
+            var result = broker.ReadFile(new SandboxFileReadRequest(
+                UserPrincipal,
+                Scope,
+                Context.TrustedProjectRoot,
+                logical,
+                "run-wp10"));
+            AssertEqual(SandboxError.PathOutOfScope, result.Error, "Generic ProjectFile.Read of " + logical + " was not denied.");
+            AssertTrue(result.Bytes is null || result.Bytes.Length == 0, "Generic sandbox-internal read returned bytes for " + logical + ".");
+        }
+
+        AssertEqual(0, guard.Reads, "Generic ProjectFile.Read opened a Core-internal sandbox path.");
+    }
+
+    private static void BrokerAllowsOrdinaryProjectRead()
+    {
+        var guard = new CountingPathGuard();
+        var broker = new TrustedSandboxBroker(
+            new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
+            new CountingHost(),
+            guard,
+            Context);
+        var result = broker.ReadFile(new SandboxFileReadRequest(
+            UserPrincipal,
+            Scope,
+            Context.TrustedProjectRoot,
+            "notes.txt",
+            "run-wp10"));
+        AssertTrue(result.Succeeded, "A legitimate project file read was denied.");
+        AssertEqual(1, guard.Reads, "A legitimate project file read did not reach the path guard.");
+        AssertEqual("ok", System.Text.Encoding.UTF8.GetString(result.Bytes ?? []), "Legitimate project read did not return file bytes.");
     }
 
     private static void BrokerRequiresSessionRevalidationForAgentRun()

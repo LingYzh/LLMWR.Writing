@@ -50,7 +50,14 @@ internal sealed class WindowsSandboxPathGuard : ISandboxPathGuard
             return error;
         }
 
-        if (SandboxPathPolicy.IsAuthorityTree(relative) || SandboxPathPolicy.IsWindowsSystemLocation(projectRoot))
+        if (SandboxPathPolicy.IsAuthorityTree(relative) ||
+            SandboxPathPolicy.IsWindowsSystemLocation(projectRoot))
+        {
+            error = SandboxError.PathOutOfScope;
+            return error;
+        }
+
+        if (!write && SandboxPathPolicy.IsInternalSandboxTree(relative))
         {
             error = SandboxError.PathOutOfScope;
             return error;

@@ -105,12 +105,18 @@ public sealed class WindowsSandboxHost : ISandboxHost
             return SandboxExecutionResult.Fail(request, SandboxError.PathOutOfScope, "Caller project claims do not match Core sandbox context.");
         }
 
-        var work = SandboxPathPolicy.RunWorkDirectory(projectRoot, request.Binding.RunId);
-        Directory.CreateDirectory(work);
-        return WindowsSandboxProcessLauncher.Launch(request, identity, work, projectRoot, faultInjector, grantInternetClient: false);
+        try
+        {
+            var work = SafeSandboxHierarchy.EnsureRunWorkDirectory(projectRoot, request.Binding.RunId);
+            return WindowsSandboxProcessLauncher.Launch(request, identity, work, projectRoot, faultInjector, grantInternetClient: false);
+        }
+        catch (SandboxLayerException exception)
+        {
+            return SandboxExecutionResult.Fail(request, exception.Error, exception.Message, identity.AppContainerSid);
+        }
     }
 
-    public SandboxExecutionResult ExecuteWithOptionalNetworkCapability(SandboxExecutionRequest request, bool grantInternetClient)
+    internal SandboxExecutionResult ExecuteWithOptionalNetworkCapability(SandboxExecutionRequest request, bool grantInternetClient)
     {
         ArgumentNullException.ThrowIfNull(request);
         EnsureInitialized();
@@ -119,9 +125,15 @@ public sealed class WindowsSandboxHost : ISandboxHost
             return SandboxExecutionResult.Fail(request, initError ?? SandboxError.SandboxUnavailable, initializationDetail);
         }
 
-        var work = SandboxPathPolicy.RunWorkDirectory(projectRoot, request.Binding.RunId);
-        Directory.CreateDirectory(work);
-        return WindowsSandboxProcessLauncher.Launch(request, identity, work, projectRoot, faultInjector, grantInternetClient);
+        try
+        {
+            var work = SafeSandboxHierarchy.EnsureRunWorkDirectory(projectRoot, request.Binding.RunId);
+            return WindowsSandboxProcessLauncher.Launch(request, identity, work, projectRoot, faultInjector, grantInternetClient);
+        }
+        catch (SandboxLayerException exception)
+        {
+            return SandboxExecutionResult.Fail(request, exception.Error, exception.Message, identity.AppContainerSid);
+        }
     }
 
     internal LiveSandboxLaunch StartLive(SandboxExecutionRequest request)
@@ -132,8 +144,7 @@ public sealed class WindowsSandboxHost : ISandboxHost
             throw new SandboxLayerException(initError ?? SandboxError.SandboxUnavailable, initializationDetail ?? "Sandbox is not available.");
         }
 
-        var work = SandboxPathPolicy.RunWorkDirectory(projectRoot, request.Binding.RunId);
-        Directory.CreateDirectory(work);
+        var work = SafeSandboxHierarchy.EnsureRunWorkDirectory(projectRoot, request.Binding.RunId);
         return WindowsSandboxProcessLauncher.LaunchLive(request, identity, work, projectRoot, faultInjector, grantInternetClient: false);
     }
 
@@ -159,9 +170,8 @@ public sealed class WindowsSandboxHost : ISandboxHost
 
                 identity = AppContainerProfileManager.CreateOrDerive(projectScope.ProjectId, faultInjector);
                 AppContainerNetworkIsolation.EnsureLoopbackNotExempt(identity.AppContainerSid, faultInjector);
-                Directory.CreateDirectory(SandboxPathPolicy.SandboxRoot(projectRoot));
-                var selfTestWork = SandboxPathPolicy.RunWorkDirectory(projectRoot, "self-test");
-                Directory.CreateDirectory(selfTestWork);
+                SafeSandboxHierarchy.EnsureSandboxRoot(projectRoot);
+                var selfTestWork = SafeSandboxHierarchy.EnsureRunWorkDirectory(projectRoot, "self-test");
                 var selfTest = WindowsSandboxProcessLauncher.Launch(
                     new SandboxExecutionRequest(
                         SandboxLaunchBinding.Create("self-test", "self-test-worker", projectScope, "self-test"),

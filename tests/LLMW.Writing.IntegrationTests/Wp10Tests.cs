@@ -50,7 +50,9 @@ internal static partial class Program
         CorePrivilegesUnchangedAfterSuccessfulAndFaultedLaunch();
         ExtraEnvironmentOverridesAreDenied();
         RequestedCpuPolicyFailureFailsClosed();
-        Console.WriteLine("WP10 sandbox integration tests passed (34).");
+        AgentRunGenericProjectFileReadDeniesInternalSandbox();
+        StagedToolOmitsUnrelatedSourceFilesFromChild();
+        Console.WriteLine("WP10 sandbox integration tests passed (36).");
     }
 
     private static void SandboxChildHasRestrictedAppContainerToken()
@@ -594,6 +596,99 @@ internal static partial class Program
         Wp10True(result.Error is SandboxError.JobConfigurationFailed or SandboxError.SandboxUnavailable or SandboxError.SandboxSelfTestFailed,
             $"CPU failure returned {result.Error}.");
         Wp10True(result.ProcessId is null, "CPU failure produced a process id.");
+    }
+
+    private static void AgentRunGenericProjectFileReadDeniesInternalSandbox()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        File.WriteAllText(Path.Combine(agent.ProjectRoot, "notes.txt"), "project-ok");
+        var runB = SandboxPathPolicy.RunWorkDirectory(agent.ProjectRoot, "run-B");
+        Directory.CreateDirectory(runB);
+        var secretB = Path.Combine(runB, "secret-B.txt");
+        File.WriteAllText(secretB, "SECRET-B");
+        var tools = Path.Combine(agent.ProjectRoot, ".llmw.sandbox", "tools", "known-path");
+        Directory.CreateDirectory(tools);
+        File.WriteAllText(Path.Combine(tools, "file"), "TOOL-SECRET");
+
+        foreach (var logical in new[]
+                 {
+                     ".llmw.sandbox/runs/run-B/work/secret-B.txt",
+                     ".LLMW.SANDBOX/runs/run-B/work/secret-B.txt",
+                     @".llmw.sandbox\runs\run-B\work\secret-B.txt",
+                     ".llmw.sandbox/tools/known-path/file"
+                 })
+        {
+            var denied = agent.Broker.ReadFile(new SandboxFileReadRequest(
+                agent.Principal,
+                agent.Scope,
+                agent.ProjectRoot,
+                logical,
+                agent.RunId));
+            Wp10True(!denied.Succeeded, "AgentRun generic read of " + logical + " succeeded.");
+            Wp10Equal(SandboxError.PathOutOfScope, denied.Error, "AgentRun generic read of " + logical + " returned " + denied.Error + ".");
+            Wp10True(denied.Bytes is null || denied.Bytes.Length == 0, "AgentRun generic read of " + logical + " returned bytes.");
+        }
+
+        Wp10Equal("SECRET-B", File.ReadAllText(secretB), "Denied sandbox read mutated Run B bytes.");
+        Wp10Equal("TOOL-SECRET", File.ReadAllText(Path.Combine(tools, "file")), "Denied sandbox read mutated tools bytes.");
+
+        var allowed = agent.Broker.ReadFile(new SandboxFileReadRequest(
+            agent.Principal,
+            agent.Scope,
+            agent.ProjectRoot,
+            "notes.txt",
+            agent.RunId));
+        Wp10True(allowed.Succeeded, "Legitimate project file read was denied. error=" + allowed.Error);
+        Wp10Equal("project-ok", System.Text.Encoding.UTF8.GetString(allowed.Bytes ?? []), "Legitimate project file bytes did not round-trip.");
+    }
+
+    private static void StagedToolOmitsUnrelatedSourceFilesFromChild()
+    {
+        using var fixture = Wp10Fixture.Create();
+        var toolDir = Path.Combine(fixture.Directory, "tool-dir");
+        Directory.CreateDirectory(toolDir);
+        var probeDir = Path.GetDirectoryName(fixture.Probe)!;
+        foreach (var file in Directory.EnumerateFiles(probeDir))
+        {
+            File.Copy(file, Path.Combine(toolDir, Path.GetFileName(file)), overwrite: true);
+        }
+
+        File.WriteAllText(Path.Combine(toolDir, "credentials.json"), "CREDENTIALS");
+        File.WriteAllText(Path.Combine(toolDir, "secret.config"), "SECRET-CONFIG");
+        File.WriteAllBytes(Path.Combine(toolDir, "unrelated.dll"), [1, 2, 3]);
+        File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), Path.Combine(toolDir, "other.exe"), overwrite: true);
+        var toolProbe = Path.Combine(toolDir, Path.GetFileName(fixture.Probe));
+        var result = fixture.Broker.ExecuteShell(fixture.Request(["whoami-token"], TimeSpan.FromSeconds(15)) with
+        {
+            ExecutablePath = toolProbe
+        });
+        Wp10True(result.Succeeded, "Staged probe failed: " + result.Error + " " + result.DenyReason + " " + result.Stderr);
+        var toolsRoot = Path.Combine(fixture.ProjectRoot, ".llmw.sandbox", "tools");
+        Wp10True(Directory.Exists(toolsRoot), "Tool staging directory was not created.");
+        foreach (var staged in Directory.GetDirectories(toolsRoot))
+        {
+            Wp10True(!File.Exists(Path.Combine(staged, "credentials.json")), "credentials.json was staged into " + staged);
+            Wp10True(!File.Exists(Path.Combine(staged, "secret.config")), "secret.config was staged into " + staged);
+            Wp10True(!File.Exists(Path.Combine(staged, "unrelated.dll")), "unrelated.dll was staged into " + staged);
+            Wp10True(!File.Exists(Path.Combine(staged, "other.exe")), "other.exe was staged into " + staged);
+        }
+
+        var credentials = fixture.Broker.ExecuteShell(fixture.Request(["read-file", Path.Combine(toolDir, "credentials.json")], TimeSpan.FromSeconds(15)) with
+        {
+            ExecutablePath = toolProbe
+        });
+        Wp10True(credentials.Stdout.Contains("READ_DENIED", StringComparison.Ordinal),
+            "Sandbox child read undeclared credentials.json. stdout=" + credentials.Stdout);
+        foreach (var staged in Directory.GetDirectories(toolsRoot))
+        {
+            var planted = Path.Combine(staged, "credentials.json");
+            var fromStaging = fixture.Broker.ExecuteShell(fixture.Request(["read-file", planted], TimeSpan.FromSeconds(15)) with
+            {
+                ExecutablePath = toolProbe
+            });
+            Wp10True(fromStaging.Stdout.Contains("READ_DENIED", StringComparison.Ordinal) || !File.Exists(planted),
+                "Sandbox child read credentials.json from staging. stdout=" + fromStaging.Stdout);
+        }
     }
 
     private static bool ProcessHasExited(int pid)

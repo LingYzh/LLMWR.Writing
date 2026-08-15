@@ -71,6 +71,8 @@ internal static class NativeConstants
     public const uint FILE_READ_ATTRIBUTES = 0x0080;
     public const uint FILE_WRITE_ATTRIBUTES = 0x0100;
     public const uint FILE_LIST_DIRECTORY = 0x0001;
+    public const uint READ_CONTROL = 0x00020000;
+    public const uint WRITE_DAC = 0x00040000;
     public const uint STANDARD_RIGHTS_READ = 0x00020000;
     public const uint STANDARD_RIGHTS_WRITE = 0x00020000;
     public const uint STANDARD_RIGHTS_EXECUTE = 0x00020000;
@@ -127,8 +129,6 @@ internal static class NativeConstants
     public const uint DESKTOP_WRITEOBJECTS = 0x0080;
     public const uint DESKTOP_SWITCHDESKTOP = 0x0100;
 
-    public const uint READ_CONTROL = 0x00020000;
-    public const uint WRITE_DAC = 0x00040000;
     public const uint STANDARD_RIGHTS_REQUIRED = 0x000F0000;
     public const uint WINSTA_ALL_ACCESS = STANDARD_RIGHTS_REQUIRED | 0x037F;
     public const uint DESKTOP_ALL_ACCESS = STANDARD_RIGHTS_REQUIRED | 0x01FF;
@@ -167,6 +167,8 @@ internal static class NativeConstants
     public const uint FILE_OPEN_IF = 3;
     public const uint FILE_OVERWRITE_IF = 5;
 
+    public const int STATUS_OBJECT_NAME_NOT_FOUND = unchecked((int)0xC0000034);
+    public const int STATUS_OBJECT_PATH_NOT_FOUND = unchecked((int)0xC000003A);
     public const int FileBasicInformation = 4;
     public const int FileAttributeTagInformation = 35;
 

@@ -24,12 +24,19 @@ public static class SandboxPathPolicy
     public static string RunWorkDirectory(string projectRoot, string runId) =>
         Path.GetFullPath(Path.Combine(SandboxRoot(projectRoot), "runs", RequireRunId(runId), "work"));
 
-    public static string ToolStagingDirectory(string projectRoot, string executableIdentity) =>
-        Path.GetFullPath(Path.Combine(
-            SandboxRoot(projectRoot),
-            "tools",
-            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
-                System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(executableIdentity)))).ToLowerInvariant()[..16]));
+    public static string ToolStagingDirectory(string projectRoot, string stagingIdentity)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(stagingIdentity);
+        if (stagingIdentity.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
+            stagingIdentity.Contains("..", StringComparison.Ordinal) ||
+            stagingIdentity.Contains('/', StringComparison.Ordinal) ||
+            stagingIdentity.Contains('\\', StringComparison.Ordinal))
+        {
+            throw new ArgumentException("Staging identity is not a safe directory name.", nameof(stagingIdentity));
+        }
+
+        return Path.GetFullPath(Path.Combine(SandboxRoot(projectRoot), "tools", stagingIdentity));
+    }
 
     public static string RunCapabilityName(Guid projectId, string runId)
     {
@@ -62,6 +69,9 @@ public static class SandboxPathPolicy
 
     public static bool IsAuthorityTree(string relativePath) =>
         StartsWithSegment(relativePath, AuthorityDirectoryName);
+
+    public static bool IsInternalSandboxTree(string relativePath) =>
+        StartsWithSegment(relativePath, SandboxRootDirectoryName);
 
     public static bool IsDesignatedWorkRelative(string relativePath, string runId)
     {

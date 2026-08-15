@@ -198,19 +198,26 @@ internal sealed class AppContainerAclManager
             full,
             accessMask.ToString(System.Globalization.CultureInfo.InvariantCulture),
             inherit ? "1" : "0");
-        if (Granted.ContainsKey(cacheKey))
-        {
-            return;
-        }
-
         if (!NativeMethods.ConvertStringSidToSidW(appContainerSid, out var sid) || sid == IntPtr.Zero)
         {
             throw new SandboxLayerException(SandboxError.AppContainerAclFailed, "AppContainer SID is not convertible.");
         }
 
         using var sidHandle = new SafeSidHandle(sid, ownsHandle: true, SidReleaseKind.LocalFree);
-        var status = NativeMethods.GetNamedSecurityInfoW(
+        using var pathHandle = NtObjectPath.OpenExisting(
             full,
+            NativeConstants.READ_CONTROL |
+            NativeConstants.WRITE_DAC |
+            NativeConstants.FILE_READ_ATTRIBUTES |
+            NativeConstants.FILE_READ_DATA |
+            NativeConstants.SYNCHRONIZE);
+        if (Granted.ContainsKey(cacheKey))
+        {
+            return;
+        }
+
+        var status = NativeMethods.GetSecurityInfo(
+            pathHandle.DangerousGetHandle(),
             NativeConstants.SE_FILE_OBJECT,
             NativeConstants.DACL_SECURITY_INFORMATION,
             out _,
@@ -220,7 +227,7 @@ internal sealed class AppContainerAclManager
             out var descriptor);
         if (status != 0)
         {
-            throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"GetNamedSecurityInfoW failed: {status}.");
+            throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"GetSecurityInfo failed: {status}.");
         }
 
         try
@@ -253,8 +260,8 @@ internal sealed class AppContainerAclManager
 
             try
             {
-                var writeStatus = NativeMethods.SetNamedSecurityInfoW(
-                    full,
+                var writeStatus = NativeMethods.SetSecurityInfo(
+                    pathHandle.DangerousGetHandle(),
                     NativeConstants.SE_FILE_OBJECT,
                     NativeConstants.DACL_SECURITY_INFORMATION,
                     IntPtr.Zero,
@@ -263,7 +270,7 @@ internal sealed class AppContainerAclManager
                     IntPtr.Zero);
                 if (writeStatus != 0)
                 {
-                    throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"SetNamedSecurityInfoW failed: {writeStatus}.");
+                    throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"SetSecurityInfo failed: {writeStatus}.");
                 }
 
                 Granted.TryAdd(cacheKey, 0);
