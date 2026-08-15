@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -14,6 +15,17 @@ public static class IpcProtocol
     public const int MaximumSupportedVersion = Version1;
     public const int MaximumFrameBytes = 1024 * 1024;
     public const int BootstrapTokenMinimumBits = 256;
+    public const int SubscriberRingCapacity = 256;
+    public const int CriticalOutboundCapacity = 64;
+    public const int SnapshotOutboundCapacity = 8;
+    public const int MaximumInFlightRequests = 32;
+    public const int DefaultHeartbeatIntervalMs = 5000;
+    public const int MissedHeartbeatsBeforeEvict = 3;
+    public const int DefaultRequestTimeoutMs = 30_000;
+    public const int ReconnectInitialBackoffMs = 100;
+    public const int ReconnectMaximumBackoffMs = 5000;
+    public const int FirstEventSequence = 1;
+    public const long EmptySnapshotSequence = 0;
 
     public static bool TryNegotiate(int clientMinimum, int clientMaximum, out int negotiatedVersion)
     {
@@ -65,10 +77,12 @@ public static class IpcPipeNames
 
 /// <summary>
 /// A v1 message envelope. Payloads are transport contracts, never Domain entities.
+/// <paramref name="SemanticType"/> is the stable operation/event discriminator.
 /// </summary>
 public sealed record IpcEnvelope<TPayload>(
     int ProtocolVersion,
     IpcMessageType MessageType,
+    string SemanticType,
     Guid RequestId,
     Guid CorrelationId,
     Guid? ProjectId,
@@ -76,6 +90,21 @@ public sealed record IpcEnvelope<TPayload>(
     Guid? RunId,
     long TimestampMs,
     TPayload Payload);
+
+/// <summary>
+/// Wire envelope used to read the discriminator before selecting a typed payload.
+/// </summary>
+public sealed record IpcWireEnvelope(
+    int ProtocolVersion,
+    IpcMessageType MessageType,
+    string SemanticType,
+    Guid RequestId,
+    Guid CorrelationId,
+    Guid? ProjectId,
+    string WorkspaceInstanceId,
+    Guid? RunId,
+    long TimestampMs,
+    JsonElement Payload);
 
 public enum IpcMessageType
 {
@@ -103,7 +132,16 @@ public sealed record HelloRequest(
         $"HelloRequest {{ ProtocolMin = {ProtocolMin}, ProtocolMax = {ProtocolMax}, BootstrapToken = [REDACTED], ClientKind = {ClientKind}, ProcessInstanceId = {ProcessInstanceId} }}";
 }
 
-public sealed record HelloAck(int NegotiatedProtocol, string[] ServerCapabilities);
+public sealed record HelloAck(
+    int NegotiatedProtocol,
+    string[] ServerCapabilities,
+    string EventStreamId,
+    string ConnectionId,
+    string? RotatedBootstrapToken)
+{
+    public override string ToString() =>
+        $"HelloAck {{ NegotiatedProtocol = {NegotiatedProtocol}, ServerCapabilities = {ServerCapabilities.Length}, EventStreamId = {EventStreamId}, ConnectionId = {ConnectionId}, RotatedBootstrapToken = [REDACTED] }}";
+}
 
 public sealed record Heartbeat(long Sequence);
 
@@ -118,34 +156,58 @@ public sealed record IpcError(
 public static class IpcErrorCodes
 {
     public const string AuthBootstrapRejected = "AUTH_BOOTSTRAP_REJECTED";
+    public const string AuthBootstrapReplay = "AUTH_BOOTSTRAP_REPLAY";
     public const string InvalidFrame = "IPC_INVALID_FRAME";
     public const string MalformedFrame = "IPC_MALFORMED_FRAME";
     public const string ProtocolNoCommonVersion = "IPC_PROTOCOL_NO_COMMON_VERSION";
     public const string UnexpectedMessage = "IPC_UNEXPECTED_MESSAGE";
+    public const string UnsupportedSemanticType = "IPC_UNSUPPORTED_SEMANTIC_TYPE";
+    public const string DuplicateRequest = "IPC_DUPLICATE_REQUEST";
+    public const string UnknownCorrelation = "IPC_UNKNOWN_CORRELATION";
+    public const string QueueOverload = "IPC_QUEUE_OVERLOAD";
+    public const string ResyncRequired = "IPC_RESYNC_REQUIRED";
+    public const string CommandUnavailable = "IPC_COMMAND_UNAVAILABLE";
+    public const string ProtocolViolation = "IPC_PROTOCOL_VIOLATION";
+    public const string Cancelled = "IPC_CANCELLED";
+    public const string InvalidSession = "SECURITY_INVALID_SESSION";
+    public const string SessionExpired = "SECURITY_SESSION_EXPIRED";
+    public const string SessionRevoked = "SECURITY_SESSION_REVOKED";
+    public const string BindingMismatch = "SECURITY_BINDING_MISMATCH";
+    public const string TrustedBindingUnavailable = "SECURITY_TRUSTED_BINDING_UNAVAILABLE";
+}
+
+public static class IpcServerCapabilities
+{
+    public static readonly string[] V1 = ["heartbeat", "multiplex", "snapshot", "cancel", "events"];
 }
 
 public static class IpcEnvelopeFactory
 {
     public static IpcEnvelope<TPayload> Create<TPayload>(
         IpcMessageType messageType,
+        string semanticType,
         string workspaceInstanceId,
         TPayload payload,
         Guid? projectId = null,
         Guid? runId = null,
-        Guid? correlationId = null)
+        Guid? correlationId = null,
+        Guid? requestId = null,
+        long? timestampMs = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workspaceInstanceId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(semanticType);
 
-        var requestId = IpcMessageIds.Create();
+        var id = requestId ?? IpcMessageIds.Create();
         return new IpcEnvelope<TPayload>(
             IpcProtocol.Version1,
             messageType,
-            requestId,
-            correlationId ?? requestId,
+            semanticType,
+            id,
+            correlationId ?? id,
             projectId,
             workspaceInstanceId,
             runId,
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            timestampMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             payload);
     }
 }
@@ -175,25 +237,58 @@ public static class IpcMessageIds
 
 /// <summary>
 /// Prefix encoding is a pure contract helper; stream transport stays outside Contracts.
+/// Length is an unsigned 32-bit little-endian integer and is rejected before a body is allocated.
 /// </summary>
 public static class IpcFrameHeader
 {
+    public const int Size = sizeof(uint);
+
     public static byte[] Create(int payloadLength)
     {
         ValidateLength(payloadLength);
-        return BitConverter.GetBytes(payloadLength);
+        var header = new byte[Size];
+        BinaryPrimitives.WriteUInt32LittleEndian(header, (uint)payloadLength);
+        return header;
     }
 
     public static int Parse(ReadOnlySpan<byte> header)
     {
-        if (header.Length != sizeof(int))
+        if (header.Length != Size)
         {
             throw new ArgumentException("An IPC frame header must contain exactly four bytes.", nameof(header));
         }
 
-        var payloadLength = BitConverter.ToInt32(header);
-        ValidateLength(payloadLength);
-        return payloadLength;
+        var payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(header);
+        if (payloadLength == 0 || payloadLength > IpcProtocol.MaximumFrameBytes)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(header),
+                payloadLength,
+                $"IPC frames must be between 1 and {IpcProtocol.MaximumFrameBytes} bytes.");
+        }
+
+        return (int)payloadLength;
+    }
+
+    public static bool TryParse(ReadOnlySpan<byte> header, out int payloadLength, out string? errorCode)
+    {
+        payloadLength = 0;
+        errorCode = null;
+        if (header.Length != Size)
+        {
+            errorCode = IpcErrorCodes.MalformedFrame;
+            return false;
+        }
+
+        var length = BinaryPrimitives.ReadUInt32LittleEndian(header);
+        if (length == 0 || length > IpcProtocol.MaximumFrameBytes)
+        {
+            errorCode = IpcErrorCodes.InvalidFrame;
+            return false;
+        }
+
+        payloadLength = (int)length;
+        return true;
     }
 
     public static void ValidateLength(int payloadLength)

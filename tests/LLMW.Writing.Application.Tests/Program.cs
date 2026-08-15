@@ -25,7 +25,8 @@ internal static class Program
             AuthorizationDenialPrecedesSearchSideEffects();
             MissingSecurityPolicyFailsClosed();
             var wp10 = Wp10SandboxApplicationTests.Run();
-            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10}).");
+            var wp11 = Wp11ApplicationTests.Run();
+            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10 + wp11}).");
             return 0;
         }
         catch (Exception exception)

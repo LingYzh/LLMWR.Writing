@@ -2,8 +2,9 @@ namespace LLMW.Writing.Contracts.Ipc;
 
 /// <summary>
 /// Routing data only. Authenticated channel, worker and project bindings come from Core transport state.
+/// <see cref="ExpiresAtMs"/> is a caller-requested upper bound, never Core authorization truth.
 /// </summary>
-public sealed record CreateRunSessionRequest(string RunId, long ExpiresAtMs);
+public sealed record CreateRunSessionRequest(string RunId, long? ExpiresAtMs);
 
 public sealed record CreateRunSessionResponse(
     string HandleId,
@@ -24,6 +25,6 @@ public sealed record RunSessionProof(string RunId, string OpaqueToken)
         $"RunSessionProof {{ RunId = {RunId}, OpaqueToken = [REDACTED] }}";
 }
 
-public sealed record RevokeRunSessionRequest(string HandleId);
+public sealed record RevokeRunSessionRequest(string HandleId, RunSessionProof? Session);
 
 public sealed record RevokeRunSessionResponse(bool Revoked);

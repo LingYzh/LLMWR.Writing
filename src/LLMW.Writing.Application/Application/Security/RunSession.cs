@@ -12,6 +12,7 @@ public enum RunSessionError
     SessionBindingMismatch,
     RunNotFound,
     UnknownAgentRole,
+    InvalidTtlPolicy,
     InfrastructureFailure
 }
 
@@ -46,10 +47,13 @@ public sealed class OpaqueRunSessionToken
     public override string ToString() => "[REDACTED RUN SESSION TOKEN]";
 }
 
+/// <summary>
+/// <see cref="ExpiresAt"/> is a caller-requested upper bound. Core clamps it with <see cref="RunSessionTtlPolicy"/>.
+/// </summary>
 public sealed record CreateRunSessionRequest(
     string RunId,
     AuthenticatedChannelContext Channel,
-    DateTimeOffset ExpiresAt);
+    DateTimeOffset? ExpiresAt);
 
 public sealed record CreateRunSessionResult(
     string HandleId,
@@ -144,15 +148,18 @@ public sealed class RunSessionService
     private readonly IRunSessionStore store;
     private readonly ISecurityClock clock;
     private readonly IRunSecurityPolicySource policySource;
+    private readonly RunSessionTtlPolicy ttlPolicy;
 
     public RunSessionService(
         IRunSessionStore store,
         ISecurityClock? clock = null,
-        IRunSecurityPolicySource? policySource = null)
+        IRunSecurityPolicySource? policySource = null,
+        RunSessionTtlPolicy? ttlPolicy = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.clock = clock ?? SystemSecurityClock.Instance;
         this.policySource = policySource ?? FailClosedRunSecurityPolicySource.Instance;
+        this.ttlPolicy = ttlPolicy ?? RunSessionTtlPolicy.Production;
     }
 
     public RunSessionResult<CreateRunSessionResult> Create(CreateRunSessionRequest request)
@@ -161,10 +168,19 @@ public sealed class RunSessionService
         try
         {
             request.Channel.ValidateForAgentRun();
-            if (request.ExpiresAt <= clock.UtcNow)
+            if (!ttlPolicy.IsValid)
+            {
+                return RunSessionResults.Fail<CreateRunSessionResult>(RunSessionError.InvalidTtlPolicy);
+            }
+
+            var now = clock.UtcNow;
+            var requested = request.ExpiresAt ?? now + ttlPolicy.DefaultTtl;
+            if (requested <= now)
             {
                 return RunSessionResults.Fail<CreateRunSessionResult>(RunSessionError.SessionExpired);
             }
+
+            var actualExpiry = ttlPolicy.Clamp(now, requested);
 
             var run = store.LoadRun(request.RunId);
             if (run is null)
@@ -187,7 +203,7 @@ public sealed class RunSessionService
                 request.Channel.ChannelInstanceId,
                 request.Channel.ProjectScope.ToCanonicalValue(),
                 tokenHash,
-                request.ExpiresAt.ToUnixTimeMilliseconds(),
+                actualExpiry.ToUnixTimeMilliseconds(),
                 createdAtMs));
 
             return RunSessionResults.Success(new CreateRunSessionResult(

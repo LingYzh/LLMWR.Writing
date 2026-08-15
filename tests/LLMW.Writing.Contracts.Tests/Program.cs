@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Text;
 using System.Text.Json;
 using LLMW.Writing.Contracts.Ipc;
@@ -6,6 +7,13 @@ namespace LLMW.Writing.Contracts.Tests;
 
 internal static class Program
 {
+    private static readonly Guid RequestId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab");
+    private static readonly Guid CorrelationId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ac");
+    private static readonly Guid ProjectId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ad");
+    private static readonly Guid RunId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ae");
+    private const long Timestamp = 1735689600000;
+    private const string Workspace = "workspace-01";
+
     private static int Main()
     {
         try
@@ -17,6 +25,7 @@ internal static class Program
             PipeNamesAreWorkspaceSpecific();
             MessageIdsUseUuidV7Layout();
             RunSessionContractCannotSelectTrustedPrincipalOrBinding();
+            Wp11ContractTests.Run();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }
@@ -32,16 +41,17 @@ internal static class Program
         var envelope = new IpcEnvelope<HelloRequest>(
             1,
             IpcMessageType.Control,
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"),
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ac"),
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ad"),
-            "workspace-01",
+            IpcSemanticTypes.Hello,
+            RequestId,
+            CorrelationId,
+            ProjectId,
+            Workspace,
             null,
-            1735689600000,
-            new HelloRequest(1, 1, "bootstrap-token", IpcClientKind.AgentRuntime, Guid.Parse("018f3e78-1234-7abc-8def-0123456789ae")));
+            Timestamp,
+            new HelloRequest(1, 1, "bootstrap-token", IpcClientKind.AgentRuntime, RunId));
 
         var actual = Encoding.UTF8.GetString(IpcJson.Serialize(envelope, IpcJsonContext.Default.HelloRequestEnvelope));
-        const string expected = "{\"protocolVersion\":1,\"messageType\":\"control\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"protocolMin\":1,\"protocolMax\":1,\"bootstrapToken\":\"bootstrap-token\",\"clientKind\":\"agentRuntime\",\"processInstanceId\":\"018f3e78-1234-7abc-8def-0123456789ae\"}}";
+        const string expected = "{\"protocolVersion\":1,\"messageType\":\"control\",\"semanticType\":\"hello\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"protocolMin\":1,\"protocolMax\":1,\"bootstrapToken\":\"bootstrap-token\",\"clientKind\":\"agentRuntime\",\"processInstanceId\":\"018f3e78-1234-7abc-8def-0123456789ae\"}}";
         AssertEqual(expected, actual, "Hello envelope golden JSON changed.");
     }
 
@@ -50,18 +60,20 @@ internal static class Program
         var envelope = new IpcEnvelope<Heartbeat>(
             1,
             IpcMessageType.Control,
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"),
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"),
+            IpcSemanticTypes.Heartbeat,
+            RequestId,
+            RequestId,
             null,
-            "workspace-01",
+            Workspace,
             null,
-            1735689600000,
+            Timestamp,
             new Heartbeat(7));
 
         var serialized = IpcJson.Serialize(envelope, IpcJsonContext.Default.HeartbeatEnvelope);
         var roundTripped = IpcJson.Deserialize(serialized, IpcJsonContext.Default.HeartbeatEnvelope);
         AssertEqual(7L, roundTripped.Payload.Sequence, "Heartbeat sequence did not round-trip.");
         AssertEqual("workspace-01", roundTripped.WorkspaceInstanceId, "Workspace did not round-trip.");
+        AssertEqual(IpcSemanticTypes.Heartbeat, roundTripped.SemanticType, "Heartbeat lost semanticType.");
     }
 
     private static void FrameHeaderUsesLittleEndianAndRejectsInvalidLengths()
@@ -103,12 +115,13 @@ internal static class Program
         var envelope = new IpcEnvelope<CreateRunSessionRequest>(
             1,
             IpcMessageType.Request,
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"),
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ac"),
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ad"),
-            "workspace-01",
-            Guid.Parse("018f3e78-1234-7abc-8def-0123456789ae"),
-            1735689600000,
+            IpcSemanticTypes.CreateRunSession,
+            RequestId,
+            CorrelationId,
+            ProjectId,
+            Workspace,
+            RunId,
+            Timestamp,
             new CreateRunSessionRequest("018f3e78-1234-7abc-8def-0123456789ae", 1735693200000));
         var json = Encoding.UTF8.GetString(IpcJson.Serialize(
             envelope,
@@ -135,9 +148,30 @@ internal static class Program
         var hello = new HelloRequest(1, 1, "bootstrap-secret", IpcClientKind.AgentRuntime, Guid.NewGuid());
         AssertTrue(!hello.ToString().Contains("bootstrap-secret", StringComparison.Ordinal),
             "HelloRequest.ToString leaked the bootstrap secret.");
+        var ack = new HelloAck(1, IpcServerCapabilities.V1, "stream", "conn", "rotated-secret");
+        AssertTrue(!ack.ToString().Contains("rotated-secret", StringComparison.Ordinal),
+            "HelloAck.ToString leaked the rotated bootstrap secret.");
     }
 
-    private static void AssertTrue(bool condition, string message)
+    internal static IpcEnvelope<T> Envelope<T>(
+        IpcMessageType messageType,
+        string semanticType,
+        T payload,
+        Guid? runId = null,
+        Guid? projectId = null) =>
+        new(
+            1,
+            messageType,
+            semanticType,
+            RequestId,
+            CorrelationId,
+            projectId ?? ProjectId,
+            Workspace,
+            runId,
+            Timestamp,
+            payload);
+
+    internal static void AssertTrue(bool condition, string message)
     {
         if (!condition)
         {
@@ -145,7 +179,7 @@ internal static class Program
         }
     }
 
-    private static void AssertEqual<T>(T expected, T actual, string message)
+    internal static void AssertEqual<T>(T expected, T actual, string message)
         where T : IEquatable<T>
     {
         if (!expected.Equals(actual))
@@ -154,7 +188,7 @@ internal static class Program
         }
     }
 
-    private static void AssertThrows<TException>(Action action, string message)
+    internal static void AssertThrows<TException>(Action action, string message)
         where TException : Exception
     {
         try

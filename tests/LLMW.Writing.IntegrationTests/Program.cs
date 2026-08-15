@@ -25,6 +25,7 @@ internal static partial class Program
             }
 
             RunWp10Tests();
+            await RunWp11TestsAsync();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;
@@ -46,8 +47,8 @@ internal static partial class Program
 
         try
         {
-            await AssertHandshakeAndHeartbeatAsync(workspaceInstanceId, bootstrapToken, 1, testTimeout.Token);
-            await AssertClientKindIsRejectedAsync(workspaceInstanceId, bootstrapToken, testTimeout.Token);
+            var ack = await AssertHandshakeAndHeartbeatAsync(workspaceInstanceId, bootstrapToken, 1, testTimeout.Token);
+            await AssertClientKindIsRejectedAsync(workspaceInstanceId, ack.RotatedBootstrapToken ?? bootstrapToken, testTimeout.Token);
             StopCore(firstCore);
 
             restartedCore = StartCore(workspaceInstanceId, IpcBootstrapToken.Create(), bootstrapToken);
@@ -101,7 +102,7 @@ internal static partial class Program
         }
     }
 
-    private static async Task AssertHandshakeAndHeartbeatAsync(
+    private static async Task<HelloAck> AssertHandshakeAndHeartbeatAsync(
         string workspaceInstanceId,
         string bootstrapToken,
         long sequence,
@@ -117,7 +118,7 @@ internal static partial class Program
         var hello = new HelloRequest(1, 1, bootstrapToken, IpcClientKind.AgentRuntime, Guid.NewGuid());
         await WriteAsync(
             client,
-            IpcEnvelopeFactory.Create(IpcMessageType.Control, workspaceInstanceId, hello),
+            IpcEnvelopeFactory.Create(IpcMessageType.Control, IpcSemanticTypes.Hello, workspaceInstanceId, hello),
             IpcJsonContext.Default.HelloRequestEnvelope,
             cancellationToken);
         var helloAck = await ReadAsync(client, IpcJsonContext.Default.HelloAckEnvelope, cancellationToken);
@@ -125,11 +126,12 @@ internal static partial class Program
 
         await WriteAsync(
             client,
-            IpcEnvelopeFactory.Create(IpcMessageType.Control, workspaceInstanceId, new Heartbeat(sequence)),
+            IpcEnvelopeFactory.Create(IpcMessageType.Control, IpcSemanticTypes.Heartbeat, workspaceInstanceId, new Heartbeat(sequence)),
             IpcJsonContext.Default.HeartbeatEnvelope,
             cancellationToken);
         var heartbeatAck = await ReadAsync(client, IpcJsonContext.Default.HeartbeatAckEnvelope, cancellationToken);
         AssertEqual(sequence, heartbeatAck.Payload.Sequence, "Core did not acknowledge the heartbeat.");
+        return helloAck.Payload;
     }
 
     private static async Task AssertClientKindIsRejectedAsync(
@@ -147,7 +149,7 @@ internal static partial class Program
         var hello = new HelloRequest(1, 1, runtimeBootstrapToken, IpcClientKind.Ui, Guid.NewGuid());
         await WriteAsync(
             client,
-            IpcEnvelopeFactory.Create(IpcMessageType.Control, workspaceInstanceId, hello),
+            IpcEnvelopeFactory.Create(IpcMessageType.Control, IpcSemanticTypes.Hello, workspaceInstanceId, hello),
             IpcJsonContext.Default.HelloRequestEnvelope,
             cancellationToken);
         var error = await ReadAsync(client, IpcJsonContext.Default.ErrorEnvelope, cancellationToken);
@@ -190,6 +192,14 @@ internal static partial class Program
             }
 
             totalRead += read;
+        }
+    }
+
+    private static void AssertTrue(bool condition, string message)
+    {
+        if (!condition)
+        {
+            throw new InvalidOperationException(message);
         }
     }
 

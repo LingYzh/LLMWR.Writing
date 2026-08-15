@@ -14,7 +14,7 @@ llmw-<app-id>-<workspace-instance-id>-core
 llmw-<app-id>-<workspace-instance-id>-runtime
 ```
 
-Use current-user-only restriction and non-inheritable handles. One duplex connection per client.
+Use current-user-only restriction and non-inheritable handles. One duplex connection per client. Each endpoint admits at most one authenticated connection at a time.
 
 ## Bootstrap auth
 
@@ -23,11 +23,18 @@ Use current-user-only restriction and non-inheritable handles. One duplex connec
 - preferred: inherited anonymous bootstrap pipe/handle from launcher.
 - fallback: directly spawned child-only environment value, cleared immediately.
 - separate UI/Core and Runtime/Core secret.
-- rotate on reconnect/restart.
+- rotate on reconnect/restart:
+  - Core loads the launcher-provided secret at process start and clears the child environment.
+  - After a successful Hello, Core replaces the in-memory authenticator with a new CSPRNG secret and returns it as `HelloAck.rotatedBootstrapToken`.
+  - The previous in-memory secret is no longer accepted for that Core process.
+  - Rotation happens only after protocol negotiation, bootstrap token comparison, and `clientKind` binding all succeed. A rejected Hello (wrong token, wrong `clientKind`, or no common protocol) must not consume or rotate the current secret.
+  - A second concurrent Hello on the same endpoint is `AUTH_BOOTSTRAP_REPLAY` and disconnects.
+  - After Core process restart the launcher-provided environment secret is loaded again. A client that still holds only a previous rotated token may retry **once** with the original launcher secret after `AUTH_BOOTSTRAP_REJECTED`; it must not treat that retry as a business-mutation replay.
+- `Hello.processInstanceId` is routing/provenance only and is never authentication truth.
 
 ## Framing
 
-`uint32 little-endian length` + exact UTF-8 JSON bytes. Max 1 MiB. Invalid/oversize length or malformed UTF-8/JSON => structured protocol error then disconnect. Large content is referenced by BlobRef.
+`uint32 little-endian length` + exact UTF-8 JSON bytes. Max 1 MiB. Zero-length, oversize (rejected before body allocation), truncated header/body, malformed UTF-8/JSON, unsupported protocol, or unknown `semanticType` => structured protocol error then disconnect. After an oversize/malformed frame the connection is not treated as still synchronized. Large content is referenced by BlobRef.
 
 ## Envelope
 
@@ -35,6 +42,7 @@ Use current-user-only restriction and non-inheritable handles. One duplex connec
 {
   "protocolVersion":1,
   "messageType":"request|response|event|control",
+  "semanticType":"hello",
   "requestId":"uuidv7",
   "correlationId":"uuidv7",
   "projectId":"uuidv7",
@@ -45,13 +53,29 @@ Use current-user-only restriction and non-inheritable handles. One duplex connec
 }
 ```
 
+`messageType` is only the generic envelope class. `semanticType` is the required stable semantic discriminator. Payloads are selected from `semanticType`; implementations must not guess DTO type from JSON shape, must not use reflection over Domain types, and must not trust CLR type names from the peer.
+
+Envelope `projectId` / `runId` / Hello `processInstanceId` are routing claims until Core cross-checks them against trusted connection/session state. They never replace `AuthenticatedChannelContext` or `CallerPrincipal`.
+
 ## Handshake
 
-Client `Hello{protocolMin,protocolMax,bootstrapToken,clientKind,processInstanceId}`. Server `HelloAck{negotiatedProtocol,serverCapabilities}`. No version overlap => `IPC_PROTOCOL_NO_COMMON_VERSION`.
+Client control `semanticType=hello` payload `Hello{protocolMin,protocolMax,bootstrapToken,clientKind,processInstanceId}`.
+
+Server control `semanticType=helloAck` payload `HelloAck{negotiatedProtocol,serverCapabilities,eventStreamId,connectionId,rotatedBootstrapToken}`.
+
+No version overlap => `IPC_PROTOCOL_NO_COMMON_VERSION` and does not rotate the bootstrap secret. Wrong `clientKind` or bootstrap => `AUTH_BOOTSTRAP_REJECTED` without rotation. Handshake completes before ordinary commands are accepted.
+
+v1 `serverCapabilities`: `heartbeat`, `multiplex`, `snapshot`, `cancel`, `events`.
+
+`eventStreamId` identifies the Core process in-memory event stream epoch. Sequence numbers from a different `eventStreamId` must not be compared.
 
 ## Public DTO naming
 
 `XxxRequest/XxxResponse/XxxEvent`; one-to-one with public Core command/query. Initial set includes OpenProject, GetProjectState, SubmitCandidate, CancelSubmission, AcceptAuthority, ApplyNarrativeChangeSet, RegisterProjectFile, ReconcileRegistryEntry, SearchNarrative, RestoreHistoryEntry, ActivateExtension, CreateRunSession, RevokeRunSession.
+
+WP11 transport additions: GetStateSnapshot, SubscribeEvents, Cancel, GapEvent, CoreNoticeEvent.
+
+Known but not-yet-implemented business commands return structured `IPC_COMMAND_UNAVAILABLE` without executing. Unknown `semanticType` returns `IPC_UNSUPPORTED_SEMANTIC_TYPE` and disconnects.
 
 IPC DTOs never serialize Domain entities directly.
 
@@ -63,29 +87,85 @@ IPC DTOs never serialize Domain entities directly.
 
 Families: IPC, AUTH, REGISTRY, SECURITY, PROJECT, AGENT, PROVIDER, EDITOR, STORAGE.
 
+WP11 codes include: `IPC_UNSUPPORTED_SEMANTIC_TYPE`, `IPC_DUPLICATE_REQUEST`, `IPC_UNKNOWN_CORRELATION`, `IPC_QUEUE_OVERLOAD`, `IPC_RESYNC_REQUIRED`, `IPC_COMMAND_UNAVAILABLE`, `IPC_PROTOCOL_VIOLATION`, `IPC_CANCELLED`, `AUTH_BOOTSTRAP_REPLAY`, `SECURITY_INVALID_SESSION`, `SECURITY_SESSION_EXPIRED`, `SECURITY_SESSION_REVOKED`, `SECURITY_BINDING_MISMATCH`, `SECURITY_TRUSTED_BINDING_UNAVAILABLE`.
+
+Do not include bootstrap tokens, RunSession tokens, secrets, full stack traces, or filesystem security paths in error messages.
+
 ## JSON
 
-System.Text.Json source-generated metadata; camelCase properties; string/camelCase enums. Unknown optional fields ignored. Unknown semantic message type => protocol error.
+System.Text.Json source-generated metadata; camelCase properties; string/camelCase enums. Unknown optional fields ignored. Unknown semantic message type => protocol error then disconnect.
+
+## Multiplexing and backpressure
+
+One reader owns frame parsing per connection. One serialized write pump emits frames; callers must not write header/body pairs concurrently.
+
+Multiple in-flight requests are allowed (max 32). Responses may arrive out of request order and are correlated by `requestId` / `correlationId`. Duplicate active request IDs => `IPC_DUPLICATE_REQUEST`. Unknown response correlation is ignored for trust purposes and surfaced as `IPC_UNKNOWN_CORRELATION` on the control path where a caller is waiting.
+
+Traffic classes:
+
+| Class | Capacity | Saturation |
+|---|---|---|
+| Response / protocol-critical control / heartbeat / cancel | 64 | fail-closed: `IPC_QUEUE_OVERLOAD` then disconnect; never silent drop |
+| Snapshot / resync | 8 | fail-closed for that snapshot; never silent drop |
+| Ordinary events | subscriber ring 256 | GapEvent + NeedsResync; never block Authority Core |
+
+A slow event subscriber must not block Authority progress. Event flood must not starve responses, cancel, heartbeat, or snapshot.
 
 ## Cancellation
 
-Control `Cancel{correlationId}` is best effort. It never claims rollback after Authority commit.
+Control `semanticType=cancel` payload `Cancel{correlationId}` is best effort. Response state is one of `unknown`, `cancelling`, `cancelled`, `alreadyCompleted`. It never claims rollback after Authority commit. Duplicate cancel is idempotent. Cancel of an unknown correlation returns `unknown` without disconnecting. Cancellation does not bypass final security rechecks.
 
-## Events/backpressure
+## Events / Gap / snapshot
 
-Core event feed is monotonic. Subscriber ring = 256. Overflow emits `GapEvent{fromSeq,toSeq}`; client requests snapshot and resumes from returned sequence. Slow consumers never block Authority Core.
+Core owns the event sequence for one `eventStreamId` (per Core process instance).
 
-## Reconnect
+- First ordinary event `seq` = 1. `snapshotSeq = 0` means no ordinary events are covered.
+- Ordinary events are strictly increasing by 1 with no silent skips.
+- Subscriber ring capacity = 256 retained ordinary events.
+- Overflow of a live subscriber emits one `GapEvent{eventStreamId,fromSeq,toSeq}` where `fromSeq` and `toSeq` are **inclusive** of the exact missing ordinary seq range, then the subscription enters `NeedsResync`.
+- Repeated overflow coalesces into that single outstanding gap; Core does not enqueue an unbounded GapEvent list.
+- While `NeedsResync`, later ordinary events are not presented as a complete trustworthy stream.
+- Snapshot/resync uses the snapshot traffic class and must still make progress when the ordinary event path is saturated.
 
-100ms exponential backoff to 5s max + jitter. Reauthenticate, handshake, `GetStateSnapshot(lastKnownSeq)`, resubscribe. Agent run resume happens only after principal/session binding is restored.
+Reconnect:
+
+```text
+connect → bootstrap authenticate → Hello/HelloAck (eventStreamId)
+→ GetStateSnapshot(lastKnownSeq, lastEventStreamId)
+→ snapshotSeq + eventStreamId
+→ SubscribeEvents(eventStreamId, afterSeq=snapshotSeq)
+→ resume seq > snapshotSeq
+```
+
+If `lastEventStreamId` does not match the current epoch, Core sets `resyncRequired=true` and the client must not treat previous seq values as missing messages to replay. Snapshot payloads are typed transport DTOs, never Domain entities, and are not Authority Source of Truth.
+
+Safe automatic replay after reconnect: Hello, heartbeat, GetStateSnapshot, SubscribeEvents. Business mutations are not auto-replayed.
 
 ## Heartbeat
 
-Default 5s; 3 missed => evict. Tunable implementation detail.
+Default 5s; 3 missed => evict. Heartbeat is a control message and coexists with in-flight requests under multiplexing.
 
-## RunSession binding
+Reconnect backoff: 100ms exponential to 5s max + jitter.
 
-Agent command includes Core-issued opaque handle. Core checks channel/session + token hash + runId + workerInstanceId + project scope + expiry/revocation. Caller-supplied role/capability is ignored for authorization.
+## RunSession binding and TTL
+
+Agent command includes Core-issued opaque handle (`RunSessionProof`). Core checks authenticated channel/session + token hash + runId + workerInstanceId + project scope + expiry/revocation + durable run + durable role reload + current Runtime Permission. Caller-supplied role/capability/project root is ignored for authorization.
+
+`CreateRunSessionRequest.expiresAtMs` is an optional **requested upper bound**. Core owns:
+
+- `DefaultTtl` = 1 hour
+- `MaximumTtl` = 8 hours
+- `DefaultTtl <= MaximumTtl`
+
+Issuance:
+
+```text
+requested = expiresAtMs present ? fromUnix(expiresAtMs) : now + DefaultTtl
+if requested <= now → fail
+actualExpiresAt = min(requested, now + MaximumTtl)
+```
+
+Persisted and returned expiry is `actualExpiresAt`. A huge caller timestamp cannot exceed `MaximumTtl`. Session issuance without a Core-owned trusted launch record / channel binding fails closed (`SECURITY_TRUSTED_BINDING_UNAVAILABLE`). Principal kind is Core-owned: Runtime cannot become `USER_INTERACTIVE`; IPC cannot select `CORE_INTERNAL`.
 
 ## BlobRef
 
@@ -93,4 +173,4 @@ Agent command includes Core-issued opaque handle. Core checks channel/session + 
 
 ## Contract tests
 
-Golden JSON for every v1 message, optional-field compatibility, malformed frame/JSON, max size, auth rejection, protocol mismatch, gap/snapshot, cancellation, reconnect, and RunSession binding.
+Golden JSON for every v1 message, semantic discriminator, optional-field compatibility, malformed frame/JSON, max size, auth rejection, protocol mismatch, multiplex correlation, gap/snapshot/epoch, cancellation, reconnect, and RunSession binding/TTL clamp.

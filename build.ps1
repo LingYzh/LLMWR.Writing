@@ -60,6 +60,22 @@ function Invoke-Build {
     Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @('build', $solutionPath, '--configuration', $Configuration, '--no-restore')
 }
 
+function Invoke-ApplicationTests {
+    Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @(
+        'run',
+        '--project', (Join-Path $repositoryRoot 'tests\LLMW.Writing.Application.Tests\LLMW.Writing.Application.Tests.csproj'),
+        '--configuration', $Configuration,
+        '--no-build')
+}
+
+function Invoke-DomainTests {
+    Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @(
+        'run',
+        '--project', (Join-Path $repositoryRoot 'tests\LLMW.Writing.Domain.Tests\LLMW.Writing.Domain.Tests.csproj'),
+        '--configuration', $Configuration,
+        '--no-build')
+}
+
 function Invoke-ContractsTests {
     Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @(
         'run',
@@ -96,6 +112,8 @@ switch ($Target) {
         Invoke-Restore
         Invoke-Build
         Invoke-ContractsTests
+        Invoke-DomainTests
+        Invoke-ApplicationTests
         Invoke-InfrastructureTests
     }
     'IntegrationTest' {
@@ -110,6 +128,8 @@ switch ($Target) {
         Invoke-Restore
         Invoke-Build
         Invoke-ContractsTests
+        Invoke-DomainTests
+        Invoke-ApplicationTests
         Invoke-InfrastructureTests
         Invoke-IntegrationTests
         throw 'Packaging is intentionally deferred to WP23; no package artifact is produced by WP00.'

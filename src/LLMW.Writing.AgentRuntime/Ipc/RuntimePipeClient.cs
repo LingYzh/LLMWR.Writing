@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Contracts.Ipc;
 
 namespace LLMW.Writing.AgentRuntime.Ipc;
@@ -6,19 +7,21 @@ namespace LLMW.Writing.AgentRuntime.Ipc;
 internal sealed class RuntimePipeClient
 {
     private readonly string _workspaceInstanceId;
-    private readonly string _bootstrapToken;
+    private readonly string _launcherBootstrapToken;
     private readonly TimeSpan _heartbeatInterval;
 
     public RuntimePipeClient(string workspaceInstanceId, string bootstrapToken, TimeSpan heartbeatInterval)
     {
         _workspaceInstanceId = workspaceInstanceId;
-        _bootstrapToken = bootstrapToken;
+        _launcherBootstrapToken = bootstrapToken;
         _heartbeatInterval = heartbeatInterval;
     }
 
     public async Task RunWithReconnectAsync(CancellationToken cancellationToken)
     {
-        var retryDelay = TimeSpan.FromMilliseconds(100);
+        var retryDelay = TimeSpan.FromMilliseconds(IpcProtocol.ReconnectInitialBackoffMs);
+        var currentToken = _launcherBootstrapToken;
+        var retriedLauncherSecret = false;
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -30,8 +33,31 @@ internal sealed class RuntimePipeClient
                     PipeDirection.InOut,
                     PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await client.ConnectAsync(cancellationToken).ConfigureAwait(false);
-                await AuthenticateAndHeartbeatAsync(client, cancellationToken).ConfigureAwait(false);
-                retryDelay = TimeSpan.FromMilliseconds(100);
+                await using var session = await IpcClientSession.HandshakeAsync(
+                        client,
+                        _workspaceInstanceId,
+                        currentToken,
+                        IpcClientKind.AgentRuntime,
+                        _heartbeatInterval,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(session.RotatedBootstrapToken))
+                {
+                    currentToken = session.RotatedBootstrapToken;
+                    retriedLauncherSecret = false;
+                }
+
+                retryDelay = TimeSpan.FromMilliseconds(IpcProtocol.ReconnectInitialBackoffMs);
+                await WaitUntilDisconnectedAsync(session, cancellationToken).ConfigureAwait(false);
+            }
+            catch (IpcProtocolException exception) when (
+                exception.ErrorCode is IpcErrorCodes.AuthBootstrapRejected or IpcErrorCodes.AuthBootstrapReplay &&
+                !retriedLauncherSecret &&
+                !StringComparer.Ordinal.Equals(currentToken, _launcherBootstrapToken))
+            {
+                currentToken = _launcherBootstrapToken;
+                retriedLauncherSecret = true;
+                continue;
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -50,51 +76,14 @@ internal sealed class RuntimePipeClient
         }
     }
 
-    private async Task AuthenticateAndHeartbeatAsync(Stream stream, CancellationToken cancellationToken)
+    private static async Task WaitUntilDisconnectedAsync(IpcClientSession session, CancellationToken cancellationToken)
     {
-        var hello = new HelloRequest(
-            IpcProtocol.MinimumSupportedVersion,
-            IpcProtocol.MaximumSupportedVersion,
-            _bootstrapToken,
-            IpcClientKind.AgentRuntime,
-            Guid.NewGuid());
-        await RuntimePipeTransport.WriteAsync(
-                stream,
-                IpcEnvelopeFactory.Create(IpcMessageType.Control, _workspaceInstanceId, hello),
-                IpcJsonContext.Default.HelloRequestEnvelope,
-                cancellationToken)
-            .ConfigureAwait(false);
-
-        var acknowledgement = await RuntimePipeTransport.ReadAsync(
-                stream,
-                IpcJsonContext.Default.HelloAckEnvelope,
-                cancellationToken)
-            .ConfigureAwait(false);
-        if (acknowledgement.Payload.NegotiatedProtocol != IpcProtocol.Version1)
+        try
         {
-            throw new IOException("Core selected an unsupported IPC protocol.");
+            await session.Events.Completion.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
-
-        var sequence = 0L;
-        while (!cancellationToken.IsCancellationRequested)
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
-            await Task.Delay(_heartbeatInterval, cancellationToken).ConfigureAwait(false);
-            sequence++;
-            await RuntimePipeTransport.WriteAsync(
-                    stream,
-                    IpcEnvelopeFactory.Create(IpcMessageType.Control, _workspaceInstanceId, new Heartbeat(sequence)),
-                    IpcJsonContext.Default.HeartbeatEnvelope,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            var heartbeatAck = await RuntimePipeTransport.ReadAsync(
-                    stream,
-                    IpcJsonContext.Default.HeartbeatAckEnvelope,
-                    cancellationToken)
-                .ConfigureAwait(false);
-            if (heartbeatAck.Payload.Sequence != sequence)
-            {
-                throw new IOException("Core acknowledged an unexpected heartbeat sequence.");
-            }
         }
     }
 
@@ -105,47 +94,5 @@ internal sealed class RuntimePipeClient
     }
 
     private static TimeSpan NextRetryDelay(TimeSpan current) =>
-        TimeSpan.FromMilliseconds(Math.Min(5000, current.TotalMilliseconds * 2));
-}
-
-internal static class RuntimePipeTransport
-{
-    public static async Task WriteAsync<TPayload>(
-        Stream stream,
-        IpcEnvelope<TPayload> envelope,
-        System.Text.Json.Serialization.Metadata.JsonTypeInfo<IpcEnvelope<TPayload>> typeInfo,
-        CancellationToken cancellationToken)
-    {
-        var payload = IpcJson.Serialize(envelope, typeInfo);
-        await stream.WriteAsync(IpcFrameHeader.Create(payload.Length), cancellationToken).ConfigureAwait(false);
-        await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
-        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-    }
-
-    public static async Task<IpcEnvelope<TPayload>> ReadAsync<TPayload>(
-        Stream stream,
-        System.Text.Json.Serialization.Metadata.JsonTypeInfo<IpcEnvelope<TPayload>> typeInfo,
-        CancellationToken cancellationToken)
-    {
-        var header = new byte[sizeof(int)];
-        await ReadExactlyAsync(stream, header, cancellationToken).ConfigureAwait(false);
-        var payload = new byte[IpcFrameHeader.Parse(header)];
-        await ReadExactlyAsync(stream, payload, cancellationToken).ConfigureAwait(false);
-        return IpcJson.Deserialize(payload, typeInfo);
-    }
-
-    private static async Task ReadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken cancellationToken)
-    {
-        var totalRead = 0;
-        while (totalRead < buffer.Length)
-        {
-            var read = await stream.ReadAsync(buffer[totalRead..], cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                throw new EndOfStreamException("Core closed the IPC channel.");
-            }
-
-            totalRead += read;
-        }
-    }
+        TimeSpan.FromMilliseconds(Math.Min(IpcProtocol.ReconnectMaximumBackoffMs, current.TotalMilliseconds * 2));
 }

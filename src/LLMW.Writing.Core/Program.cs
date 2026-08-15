@@ -1,3 +1,7 @@
+using LLMW.Writing.Application.Ipc;
+using LLMW.Writing.Application.Security;
+using LLMW.Writing.Contracts.Ipc;
+
 namespace LLMW.Writing.Core;
 
 internal static class Program
@@ -21,14 +25,32 @@ internal static class Program
             throw new InvalidOperationException("Core requires separate launcher-provided UI and Agent Runtime bootstrap tokens.");
         }
 
+        var eventRing = new IpcEventRing(Guid.NewGuid().ToString("D"));
+        var bindings = new TrustedIpcBindingRegistry();
+        var uiOptions = new IpcServerOptions
+        {
+            WorkspaceInstanceId = workspaceInstanceId,
+            ExpectedClientKind = IpcClientKind.Ui,
+            Bootstrap = new IpcBootstrapAuthenticator(uiBootstrapToken),
+            EventRing = eventRing,
+            Bindings = bindings,
+            NativeUi = new TrustedNativePrincipalSource("core-native-ui")
+        };
+        var runtimeOptions = new IpcServerOptions
+        {
+            WorkspaceInstanceId = workspaceInstanceId,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(runtimeBootstrapToken),
+            EventRing = eventRing,
+            Bindings = bindings
+        };
+
         var uiServer = new Ipc.CorePipeServer(
-            LLMW.Writing.Contracts.Ipc.IpcPipeNames.Core(workspaceInstanceId),
-            LLMW.Writing.Contracts.Ipc.IpcClientKind.Ui,
-            uiBootstrapToken);
+            IpcPipeNames.Core(workspaceInstanceId),
+            uiOptions);
         var runtimeServer = new Ipc.CorePipeServer(
-            LLMW.Writing.Contracts.Ipc.IpcPipeNames.Runtime(workspaceInstanceId),
-            LLMW.Writing.Contracts.Ipc.IpcClientKind.AgentRuntime,
-            runtimeBootstrapToken);
+            IpcPipeNames.Runtime(workspaceInstanceId),
+            runtimeOptions);
         await Task.WhenAll(
                 uiServer.RunAsync(shutdown.Token),
                 runtimeServer.RunAsync(shutdown.Token))
