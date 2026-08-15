@@ -220,6 +220,51 @@ Envelope `runId` / `workerInstanceId` / `channelId` claims never select the trus
 
 Queue saturation returns `outcome=queued`. Missing `Agent.Spawn` returns `AGENT_SPAWN_DENIED`. Illegal depth 5 returns `AGENT_DEPTH_LIMIT`. Depth spoof returns `AGENT_DEPTH_SPOOF`. UNKNOWN side effect returns `AGENT_UNKNOWN_SIDE_EFFECT` and does not create an automatic Attempt.
 
+## WP13 Oversight / Result / Specialist / Background commands
+
+These are typed semantic commands. They are not generic CRUD/SQL, do not serialize Domain entities, and do not expose a user-to-Specialist direct-message API.
+
+There is no `sendMessageToSpecialist`, `appendSpecialistInstruction`, or `forceSpecialistComplete`.
+
+Authorization classes:
+
+- **USER_INTERACTIVE (UI channel):** `setOversightOverride`, Specialist create/update/duplicate/validate/test-run, Background stop/list/get, `getEffectiveOversight`, `getResultArtifact`, `listPendingApprovals`, `resolveRuntimeGrill` (Author-required).
+- **Agent Runtime management channel:** `createResultDependency`, `updateResultDependency`, `refreshResultDependencyStatus`, `getTaskHandoff`, query surfaces shared with UI.
+- **Agent RunSession:** `submitResultArtifact`, `requestTaskCompletion`, `proposeResultDependencyChange`, `resolveRuntimeGrill` only when effective Oversight is `AGENT_DELEGATED`.
+
+Agent cannot set `AGENT_DELEGATED` on itself. Built-in Specialist mutation is rejected (`SPECIALIST_IMMUTABLE`). Result Artifact is untrusted analysis data and does not become Canon.
+
+`background_tasks.kind` stores versioned canonical JSON `BackgroundExecutionKindV1` (kind + execution identity). Application Oversight defaults and User Library Specialists are not stored as the global Source of Truth inside a single `project.db`.
+
+Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL is immediately active when no Run is in-flight. During in-flight execution, Core stores a documented pending-bind token `pending:{overrideId}` (not a Checkpoint v1 id). The next `persistCheckpoint` replaces that token with the new checkpoint id; Domain activation then requires that checkpoint to exist.
+
+| semanticType | Request | Response |
+|---|---|---|
+| `requestTaskCompletion` | `taskId` + session | `outcome` pass/fail/semantic-review + failures |
+| `submitResultArtifact` | task + canonical JSON columns + session | `resultArtifactId` |
+| `getResultArtifact` | `taskId` | canonical Result Artifact columns |
+| `getTaskHandoff` | consumer task | Result refs, optional evidence, warnings; transcript omitted |
+| `createResultDependency` | consumer/producer/`required`\|`advisory`\|`optional` | dependency id + status |
+| `updateResultDependency` | orchestrator kind/status | effective edge |
+| `proposeResultDependencyChange` | proposed kind + reason | recorded; effective kind unchanged unless orchestrator applies |
+| `refreshResultDependencyStatus` | producer/consumer | updated count |
+| `getEffectiveOversight` | project/storyline/task | both axes + winning scope |
+| `setOversightOverride` | scope + both axes + optional checkpoint | override id; USER_INTERACTIVE only |
+| `listPendingApprovals` | optional run | pending tool + runtime_grill items |
+| `resolveRuntimeGrill` | approval + resolution | status; author or delegated per Oversight |
+| `listSpecialists` | optional scope | summaries (built-in/user/project) |
+| `getSpecialist` | profile id | definition JSON |
+| `createSpecialist` | scope + definition JSON | profile id or validation errors |
+| `updateSpecialist` | profile id + definition | rejects built-in |
+| `duplicateSpecialist` | source + target scope | new profile + base digest |
+| `validateSpecialist` | definition JSON | structured errors |
+| `createSpecialistTestRun` | profile | child run or `SPECIALIST_TEST_UNAVAILABLE` |
+| `listBackgroundTasks` | optional owner run | durable rows |
+| `getBackgroundTask` | id | status/identity/checkpoint/duration |
+| `stopBackgroundTask` | id | cancels owned execution only |
+
+WP13 error codes include: `OVERSIGHT_MUTATION_DENIED`, `COMPLETION_CONTRACT_FAILED`, `SEMANTIC_REVIEW_REQUIRED`, `RESULT_REQUIRED_STALE`, `RUNTIME_GRILL_AUTHOR_REQUIRED`, `RUNTIME_GRILL_ALREADY_RESOLVED`, `SPECIALIST_IMMUTABLE`, `SPECIALIST_VALIDATION_FAILED`, `SPECIALIST_TEST_UNAVAILABLE`, `BACKGROUND_ILLEGAL_TRANSITION`.
+
 ## BlobRef
 
 `{digest,size,locator}` where locator is an artifact/read handle resolved by Core, never a general filesystem path capability.

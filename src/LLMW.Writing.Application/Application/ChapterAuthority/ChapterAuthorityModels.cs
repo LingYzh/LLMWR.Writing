@@ -133,7 +133,8 @@ public sealed record CandidateAcceptanceContext(
     string? AcceptanceId,
     string? ManuscriptRevisionId,
     string? MaterializedRelativePath,
-    string? AcceptedById);
+    string? AcceptedById,
+    string AcceptedByKind = "AUTHOR_CONFIRMED");
 
 public sealed record PersistCandidateRequest(
     string ChapterId,

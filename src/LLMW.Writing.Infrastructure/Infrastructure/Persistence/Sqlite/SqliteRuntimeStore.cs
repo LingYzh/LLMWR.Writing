@@ -5,7 +5,7 @@ using LLMW.Writing.Infrastructure.Persistence;
 
 namespace LLMW.Writing.Infrastructure.Persistence.Sqlite;
 
-public sealed class SqliteRuntimeStore : IRuntimePersistence
+public sealed partial class SqliteRuntimeStore : IRuntimePersistence
 {
     private readonly string databasePath;
     private readonly SqliteDatabaseConnectionFactory connectionFactory;
@@ -94,7 +94,7 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
                 INSERT INTO tasks(
                     task_id, run_id, parent_task_id, task_kind, status, priority, completion_contract_json, created_at_ms, updated_at_ms)
                 VALUES (
-                    $task_id, $run_id, $parent_task_id, $task_kind, $status, $priority, NULL, $created_at_ms, $updated_at_ms);
+                    $task_id, $run_id, $parent_task_id, $task_kind, $status, $priority, $completion_contract_json, $created_at_ms, $updated_at_ms);
                 """);
             Add(command, "$task_id", task.TaskId);
             Add(command, "$run_id", task.RunId);
@@ -102,6 +102,7 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
             Add(command, "$task_kind", task.TaskKind);
             Add(command, "$status", task.Status);
             Add(command, "$priority", task.Priority);
+            Add(command, "$completion_contract_json", (object?)task.CompletionContractJson ?? DBNull.Value);
             Add(command, "$created_at_ms", task.CreatedAtMs);
             Add(command, "$updated_at_ms", task.UpdatedAtMs);
             command.ExecuteNonQuery();
@@ -139,11 +140,12 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
             using var command = Create(lease, """
                 INSERT INTO result_dependencies(
                     dependency_id, consumer_task_id, producer_task_id, result_artifact_id, dependency_kind, status)
-                VALUES ($dependency_id, $consumer_task_id, $producer_task_id, NULL, $dependency_kind, $status);
+                VALUES ($dependency_id, $consumer_task_id, $producer_task_id, $result_artifact_id, $dependency_kind, $status);
                 """);
             Add(command, "$dependency_id", dependency.DependencyId);
             Add(command, "$consumer_task_id", dependency.ConsumerTaskId);
             Add(command, "$producer_task_id", dependency.ProducerTaskId);
+            Add(command, "$result_artifact_id", (object?)dependency.ResultArtifactId ?? DBNull.Value);
             Add(command, "$dependency_kind", dependency.DependencyKind);
             Add(command, "$status", dependency.Status);
             command.ExecuteNonQuery();
@@ -241,7 +243,7 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
         {
             using var lease = Open();
             using var command = Create(lease, """
-                SELECT task_id, run_id, parent_task_id, task_kind, status, priority, created_at_ms, updated_at_ms
+                SELECT task_id, run_id, parent_task_id, task_kind, status, priority, created_at_ms, updated_at_ms, completion_contract_json
                 FROM tasks WHERE task_id=$id;
                 """);
             Add(command, "$id", taskId);
@@ -407,6 +409,19 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
                 action();
                 transaction.Commit();
             }
+            catch
+            {
+                try
+                {
+                    transaction.Rollback();
+                }
+                catch (Exception rollback) when (rollback is not OperationCanceledException)
+                {
+                    _ = rollback;
+                }
+
+                throw;
+            }
             finally
             {
                 ambientTransaction = null;
@@ -488,7 +503,7 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT task_id, run_id, parent_task_id, task_kind, status, priority, created_at_ms, updated_at_ms
+            SELECT task_id, run_id, parent_task_id, task_kind, status, priority, created_at_ms, updated_at_ms, completion_contract_json
             FROM tasks ORDER BY created_at_ms, task_id;
             """;
         using var reader = command.ExecuteReader();
@@ -524,7 +539,7 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = """
-            SELECT dependency_id, consumer_task_id, producer_task_id, dependency_kind, status
+            SELECT dependency_id, consumer_task_id, producer_task_id, dependency_kind, status, result_artifact_id
             FROM result_dependencies ORDER BY dependency_id;
             """;
         using var reader = command.ExecuteReader();
@@ -536,7 +551,8 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
                 reader.GetString(1),
                 reader.GetString(2),
                 reader.GetString(3),
-                reader.GetString(4)));
+                reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5)));
         }
 
         return list;
@@ -608,7 +624,8 @@ public sealed class SqliteRuntimeStore : IRuntimePersistence
             reader.GetString(4),
             reader.GetInt32(5),
             reader.GetInt64(6),
-            reader.GetInt64(7));
+            reader.GetInt64(7),
+            reader.IsDBNull(8) ? null : reader.GetString(8));
 
     private static DurableAttemptRecord ReadAttempt(DbDataReader reader) =>
         new(

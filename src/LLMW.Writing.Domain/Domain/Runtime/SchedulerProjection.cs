@@ -114,7 +114,8 @@ public sealed record DurableTaskRecord(
     string Status,
     int Priority,
     long CreatedAtMs,
-    long UpdatedAtMs);
+    long UpdatedAtMs,
+    string? CompletionContractJson = null);
 
 public sealed record DurableAttemptRecord(
     string AttemptId,
@@ -129,7 +130,8 @@ public sealed record DurableDependencyRecord(
     string ConsumerTaskId,
     string ProducerTaskId,
     string DependencyKind,
-    string Status);
+    string Status,
+    string? ResultArtifactId = null);
 
 public sealed record DurableToolCallRecord(
     string ToolCallId,
@@ -191,12 +193,7 @@ public static class StructuralReadiness
                 continue;
             }
 
-            if (!StringComparer.Ordinal.Equals(dependency.DependencyKind, RequiredKind))
-            {
-                continue;
-            }
-
-            if (!StringComparer.Ordinal.Equals(dependency.Status, SatisfiedStatus))
+            if (ResultDependencyPolicy.HardBlocks(dependency))
             {
                 return false;
             }

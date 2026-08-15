@@ -325,6 +325,7 @@ public sealed class RuntimeSchedulerService
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
         var id = Guid.NewGuid().ToString("D");
         store.InsertCheckpoint(new DurableCheckpointRecord(id, runId, taskId, schemaVersion, payloadJson, inputDigestSetJson, now));
+        store.BindPendingOversightOverrides(id, now);
         return RuntimeResults.Success(id);
     }
 

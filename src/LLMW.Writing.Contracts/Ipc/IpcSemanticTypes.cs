@@ -40,6 +40,28 @@ public static class IpcSemanticTypes
     public const string ReleaseRunWorker = "releaseRunWorker";
     public const string ReconcileRunWorkers = "reconcileRunWorkers";
     public const string SpawnChildRun = "spawnChildRun";
+    public const string RequestTaskCompletion = "requestTaskCompletion";
+    public const string SubmitResultArtifact = "submitResultArtifact";
+    public const string GetResultArtifact = "getResultArtifact";
+    public const string GetTaskHandoff = "getTaskHandoff";
+    public const string CreateResultDependency = "createResultDependency";
+    public const string UpdateResultDependency = "updateResultDependency";
+    public const string ProposeResultDependencyChange = "proposeResultDependencyChange";
+    public const string RefreshResultDependencyStatus = "refreshResultDependencyStatus";
+    public const string GetEffectiveOversight = "getEffectiveOversight";
+    public const string SetOversightOverride = "setOversightOverride";
+    public const string ListPendingApprovals = "listPendingApprovals";
+    public const string ResolveRuntimeGrill = "resolveRuntimeGrill";
+    public const string ListSpecialists = "listSpecialists";
+    public const string GetSpecialist = "getSpecialist";
+    public const string CreateSpecialist = "createSpecialist";
+    public const string UpdateSpecialist = "updateSpecialist";
+    public const string DuplicateSpecialist = "duplicateSpecialist";
+    public const string ValidateSpecialist = "validateSpecialist";
+    public const string CreateSpecialistTestRun = "createSpecialistTestRun";
+    public const string ListBackgroundTasks = "listBackgroundTasks";
+    public const string GetBackgroundTask = "getBackgroundTask";
+    public const string StopBackgroundTask = "stopBackgroundTask";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -77,7 +99,29 @@ public static class IpcSemanticTypes
         LaunchRunWorker,
         ReleaseRunWorker,
         ReconcileRunWorkers,
-        SpawnChildRun
+        SpawnChildRun,
+        RequestTaskCompletion,
+        SubmitResultArtifact,
+        GetResultArtifact,
+        GetTaskHandoff,
+        CreateResultDependency,
+        UpdateResultDependency,
+        ProposeResultDependencyChange,
+        RefreshResultDependencyStatus,
+        GetEffectiveOversight,
+        SetOversightOverride,
+        ListPendingApprovals,
+        ResolveRuntimeGrill,
+        ListSpecialists,
+        GetSpecialist,
+        CreateSpecialist,
+        UpdateSpecialist,
+        DuplicateSpecialist,
+        ValidateSpecialist,
+        CreateSpecialistTestRun,
+        ListBackgroundTasks,
+        GetBackgroundTask,
+        StopBackgroundTask
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();

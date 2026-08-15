@@ -7,6 +7,7 @@ using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
+using LLMW.Writing.Infrastructure.Specialists;
 
 namespace LLMW.Writing.Core;
 
@@ -105,6 +106,18 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new CoreAuthorizationService(),
                     bindings: bindings,
                     sessions: sessions);
+                var userLibraryRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "LLMW.Writing",
+                    "user-specialists");
+                var wp13 = new Wp13RuntimeService(
+                    store,
+                    scheduler,
+                    SystemSecurityClock.Instance,
+                    new MemoryApplicationOversightDefaults(),
+                    new FileUserSpecialistProfileStore(userLibraryRoot),
+                    SyntheticBuiltInSpecialistCatalog.Instance,
+                    UnavailableSemanticCompletionEvaluator.Instance);
 
                 bindings.Register(new TrustedIpcLaunchRecord(
                     AuthenticatedClientKind.AgentRuntime,
@@ -113,7 +126,11 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     scope));
                 runtimeBindingInstalled = true;
 
-                commands.Inner = new CompositeIpcCommandHandler(this, new RuntimeIpcCommandHandler(scheduler, workspaceInstanceId));
+                commands.Inner = new CompositeIpcCommandHandler(
+                    this,
+                    new RuntimeIpcCommandHandler(scheduler, workspaceInstanceId),
+                    new Wp13IpcCommandHandler(wp13, workspaceInstanceId));
+                wp13.RecoverBackgroundTasks();
                 runSessions.PublishOnce(sessions);
                 published = sessions;
                 opened = true;

@@ -16,5 +16,9 @@ public static class RuntimeManagementCatalog
         IpcSemanticTypes.ClassifyResume or
         IpcSemanticTypes.LaunchRunWorker or
         IpcSemanticTypes.ReleaseRunWorker or
-        IpcSemanticTypes.ReconcileRunWorkers;
+        IpcSemanticTypes.ReconcileRunWorkers or
+        IpcSemanticTypes.CreateResultDependency or
+        IpcSemanticTypes.UpdateResultDependency or
+        IpcSemanticTypes.RefreshResultDependencyStatus or
+        IpcSemanticTypes.GetTaskHandoff;
 }

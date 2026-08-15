@@ -26,8 +26,9 @@ internal static class Program
             MissingSecurityPolicyFailsClosed();
             var wp10 = Wp10SandboxApplicationTests.Run();
             var wp11 = Wp11ApplicationTests.Run();
+            var wp13 = Wp13ApplicationTests.Run();
             var wp12 = Wp12ApplicationTests.Run();
-            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10 + wp11 + wp12}).");
+            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10 + wp11 + wp12 + wp13}).");
             return 0;
         }
         catch (Exception exception)

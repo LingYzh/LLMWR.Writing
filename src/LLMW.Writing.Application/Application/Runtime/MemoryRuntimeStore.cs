@@ -12,6 +12,14 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
     private readonly Dictionary<string, DurableCheckpointRecord> checkpoints = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DurableToolCallRecord> toolCalls = new(StringComparer.Ordinal);
     private readonly List<DurableDependencyRecord> dependencies = [];
+    private readonly Dictionary<string, DurableResultArtifactRecord> resultArtifacts = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, EvidenceRecord> evidence = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, OversightOverrideRecord> oversight = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DelegatedDecisionRecord> delegated = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DurableApprovalRecord> approvals = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DurableBackgroundTaskRecord> background = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DurableProjectSpecialistRecord> specialists = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> completionContracts = new(StringComparer.Ordinal);
 
     public SchedulerSnapshot LoadSnapshot()
     {
@@ -54,6 +62,11 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             tasks[task.TaskId] = task;
+            if (!string.IsNullOrWhiteSpace(task.CompletionContractJson))
+            {
+                completionContracts[task.TaskId] = task.CompletionContractJson;
+            }
+
             return task;
         }
     }
@@ -165,7 +178,12 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
     {
         lock (gate)
         {
-            return tasks.TryGetValue(taskId, out var record) ? record : null;
+            return tasks.TryGetValue(taskId, out var record)
+                ? record with
+                {
+                    CompletionContractJson = completionContracts.GetValueOrDefault(taskId)
+                }
+                : null;
         }
     }
 
@@ -277,6 +295,282 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             action();
+        }
+    }
+
+    public void UpdateTaskCompletionContract(string taskId, string? completionContractJson)
+    {
+        lock (gate)
+        {
+            if (string.IsNullOrWhiteSpace(completionContractJson))
+            {
+                completionContracts.Remove(taskId);
+            }
+            else
+            {
+                completionContracts[taskId] = completionContractJson;
+            }
+
+            if (tasks.TryGetValue(taskId, out var task))
+            {
+                tasks[taskId] = task with { CompletionContractJson = completionContractJson };
+            }
+        }
+    }
+
+    public DurableResultArtifactRecord InsertResultArtifact(DurableResultArtifactRecord artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (gate)
+        {
+            resultArtifacts[artifact.ResultArtifactId] = artifact;
+            return artifact;
+        }
+    }
+
+    public DurableResultArtifactRecord? GetLatestResultArtifact(string taskId)
+    {
+        lock (gate)
+        {
+            return resultArtifacts.Values
+                .Where(item => StringComparer.Ordinal.Equals(item.TaskId, taskId))
+                .OrderByDescending(item => item.ProducedAtMs)
+                .ThenByDescending(item => item.ResultArtifactId, StringComparer.Ordinal)
+                .FirstOrDefault();
+        }
+    }
+
+    public DurableResultArtifactRecord? GetResultArtifact(string resultArtifactId)
+    {
+        lock (gate)
+        {
+            return resultArtifacts.TryGetValue(resultArtifactId, out var record) ? record : null;
+        }
+    }
+
+    public void InsertEvidence(EvidenceRecord evidence)
+    {
+        ArgumentNullException.ThrowIfNull(evidence);
+        lock (gate)
+        {
+            this.evidence[evidence.EvidenceId] = evidence;
+        }
+    }
+
+    public IReadOnlyList<EvidenceRecord> EvidenceForTask(string taskId)
+    {
+        lock (gate)
+        {
+            return evidence.Values.Where(item => StringComparer.Ordinal.Equals(item.TaskId, taskId)).ToArray();
+        }
+    }
+
+    public void MarkEvidenceStale(string evidenceId, bool stale)
+    {
+        lock (gate)
+        {
+            if (evidence.TryGetValue(evidenceId, out var current))
+            {
+                evidence[evidenceId] = current with { Stale = stale };
+            }
+        }
+    }
+
+    public DurableDependencyRecord? GetDependency(string dependencyId)
+    {
+        lock (gate)
+        {
+            return dependencies.FirstOrDefault(item => StringComparer.Ordinal.Equals(item.DependencyId, dependencyId));
+        }
+    }
+
+    public IReadOnlyList<DurableDependencyRecord> DependenciesForConsumer(string consumerTaskId)
+    {
+        lock (gate)
+        {
+            return dependencies.Where(item => StringComparer.Ordinal.Equals(item.ConsumerTaskId, consumerTaskId)).ToArray();
+        }
+    }
+
+    public void UpdateDependencyRecord(string dependencyId, string kind, string status, string? resultArtifactId)
+    {
+        lock (gate)
+        {
+            for (var index = 0; index < dependencies.Count; index++)
+            {
+                if (StringComparer.Ordinal.Equals(dependencies[index].DependencyId, dependencyId))
+                {
+                    var current = dependencies[index];
+                    dependencies[index] = current with
+                    {
+                        DependencyKind = kind,
+                        Status = status,
+                        ResultArtifactId = resultArtifactId
+                    };
+                }
+            }
+        }
+    }
+
+    public void InsertOversightOverride(OversightOverrideRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            oversight[record.OverrideId] = record;
+        }
+    }
+
+    public IReadOnlyList<OversightOverrideRecord> ListOversightOverrides()
+    {
+        lock (gate)
+        {
+            return oversight.Values.OrderBy(item => item.CreatedAtMs).ThenBy(item => item.OverrideId, StringComparer.Ordinal).ToArray();
+        }
+    }
+
+    public void BindPendingOversightOverrides(string checkpointId, long checkpointCreatedAtMs)
+    {
+        _ = checkpointCreatedAtMs;
+        lock (gate)
+        {
+            foreach (var pair in oversight.ToArray())
+            {
+                if (OversightActivation.IsPendingBind(pair.Value.EffectiveAfterCheckpointId))
+                {
+                    oversight[pair.Key] = pair.Value with { EffectiveAfterCheckpointId = checkpointId };
+                }
+            }
+        }
+    }
+
+    public void InsertDelegatedDecision(DelegatedDecisionRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            delegated[record.DelegatedDecisionId] = record;
+        }
+    }
+
+    public IReadOnlyList<DelegatedDecisionRecord> ListDelegatedDecisions()
+    {
+        lock (gate)
+        {
+            return delegated.Values.OrderBy(item => item.DecidedAtMs).ToArray();
+        }
+    }
+
+    public void InsertApproval(DurableApprovalRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            approvals[record.ApprovalId] = record;
+        }
+    }
+
+    public DurableApprovalRecord? GetApproval(string approvalId)
+    {
+        lock (gate)
+        {
+            return approvals.TryGetValue(approvalId, out var record) ? record : null;
+        }
+    }
+
+    public void UpdateApproval(DurableApprovalRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            approvals[record.ApprovalId] = record;
+        }
+    }
+
+    public IReadOnlyList<DurableApprovalRecord> ListApprovals(string? runId)
+    {
+        lock (gate)
+        {
+            return approvals.Values
+                .Where(item => runId is null || StringComparer.Ordinal.Equals(item.RunId, runId))
+                .OrderBy(item => item.CreatedAtMs)
+                .ToArray();
+        }
+    }
+
+    public void InsertBackgroundTask(DurableBackgroundTaskRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            background[record.BackgroundTaskId] = record;
+        }
+    }
+
+    public void UpdateBackgroundTask(DurableBackgroundTaskRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            background[record.BackgroundTaskId] = record;
+        }
+    }
+
+    public DurableBackgroundTaskRecord? GetBackgroundTask(string backgroundTaskId)
+    {
+        lock (gate)
+        {
+            return background.TryGetValue(backgroundTaskId, out var record) ? record : null;
+        }
+    }
+
+    public IReadOnlyList<DurableBackgroundTaskRecord> ListBackgroundTasks(string? ownerRunId)
+    {
+        lock (gate)
+        {
+            return background.Values
+                .Where(item => ownerRunId is null || StringComparer.Ordinal.Equals(item.OwnerRunId, ownerRunId))
+                .OrderBy(item => item.StartedAtMs)
+                .ToArray();
+        }
+    }
+
+    public void UpsertProjectSpecialist(DurableProjectSpecialistRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        lock (gate)
+        {
+            specialists[record.SpecialistProfileId] = record;
+        }
+    }
+
+    public DurableProjectSpecialistRecord? GetProjectSpecialist(string profileId)
+    {
+        lock (gate)
+        {
+            return specialists.TryGetValue(profileId, out var record) ? record : null;
+        }
+    }
+
+    public IReadOnlyList<DurableProjectSpecialistRecord> ListProjectSpecialists()
+    {
+        lock (gate)
+        {
+            return specialists.Values.OrderBy(item => item.Name, StringComparer.Ordinal).ToArray();
+        }
+    }
+
+    public DurableAttemptRecord? FindActiveAttempt(string taskId)
+    {
+        lock (gate)
+        {
+            return attempts.Values
+                .Where(item =>
+                    StringComparer.Ordinal.Equals(item.TaskId, taskId) &&
+                    (StringComparer.Ordinal.Equals(item.Status, "starting") ||
+                     StringComparer.Ordinal.Equals(item.Status, "running")))
+                .OrderByDescending(item => item.AttemptNo)
+                .FirstOrDefault();
         }
     }
 }

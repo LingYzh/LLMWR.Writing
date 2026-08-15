@@ -1,8 +1,10 @@
 using System.Text.Json;
 using LLMW.Writing.Application.Authority;
+using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Domain.Narrative;
 using LLMW.Writing.Application.Reconcile;
 using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.NarrativeChange;
@@ -15,6 +17,8 @@ public sealed class NarrativeChangeService
     private readonly INarrativeImpactAnalyzer impactAnalyzer;
     private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
     private readonly IAuthorizationService authorizationService;
+    private readonly IEffectiveOversightSource oversightSource;
+    private readonly IDelegatedDecisionSink delegatedDecisionSink;
 
     public NarrativeChangeService(
         IImmutableBlobStore blobStore,
@@ -22,7 +26,9 @@ public sealed class NarrativeChangeService
         ISemanticDependencyAssessor semanticDependencyAssessor,
         INarrativeImpactAnalyzer impactAnalyzer,
         IAuthoritySurfaceHealthGate authoritySurfaceHealthGate,
-        IAuthorizationService? authorizationService = null)
+        IAuthorizationService? authorizationService = null,
+        IEffectiveOversightSource? oversightSource = null,
+        IDelegatedDecisionSink? delegatedDecisionSink = null)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.store = store ?? throw new ArgumentNullException(nameof(store));
@@ -30,6 +36,8 @@ public sealed class NarrativeChangeService
         this.impactAnalyzer = impactAnalyzer ?? throw new ArgumentNullException(nameof(impactAnalyzer));
         this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
         this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
+        this.oversightSource = oversightSource ?? FailClosedOversightSource.Instance;
+        this.delegatedDecisionSink = delegatedDecisionSink ?? NullDelegatedDecisionSink.Instance;
     }
 
     public NarrativeChangeResult<CreateWorkingNarrativeChangeSetResult> CreateWorkingChangeSet(
@@ -125,23 +133,36 @@ public sealed class NarrativeChangeService
             return authorization;
         }
 
-        if (command.Principal?.Kind != PrincipalKind.UserInteractive)
+        var principalKind = command.Principal?.Kind;
+        if (principalKind == PrincipalKind.UserInteractive)
+        {
+            if (command.DeciderKind != NarrativeDecisionKind.AuthorConfirmed)
+            {
+                return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                    NarrativeChangeError.DecisionAuthorityNotAvailable,
+                    command.DeciderKind.ToString());
+            }
+        }
+        else if (principalKind == PrincipalKind.AgentRun)
+        {
+            var policy = oversightSource.Resolve(command.Principal?.ProjectScope?.ProjectId.ToString("D"), null, null);
+            if (!policy.NarrativeDelegated || command.DeciderKind != NarrativeDecisionKind.AgentDelegated)
+            {
+                return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
+                    NarrativeChangeError.DecisionAuthorityNotAvailable,
+                    "Effective Oversight remains AUTHOR_CONFIRMED_REQUIRED.");
+            }
+        }
+        else
         {
             return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
                 NarrativeChangeError.DecisionAuthorityNotAvailable,
-                "WP09 does not activate AgentDelegated Narrative Authority.");
+                "Formal narrative change requires USER_INTERACTIVE or effective AGENT_DELEGATED Oversight.");
         }
 
         if (string.IsNullOrWhiteSpace(command.ChangeSetId) || string.IsNullOrWhiteSpace(command.IdempotencyKey))
         {
             return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(NarrativeChangeError.ChangeSetNotApplicable);
-        }
-
-        if (command.DeciderKind != NarrativeDecisionKind.AuthorConfirmed)
-        {
-            return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
-                NarrativeChangeError.DecisionAuthorityNotAvailable,
-                command.DeciderKind.ToString());
         }
 
         var resolvingIds = new HashSet<string>(
@@ -199,10 +220,9 @@ public sealed class NarrativeChangeService
             var commitAuthorization = Authorize<ApplyNarrativeChangeSetResult>(
                 command.Principal,
                 Capability.AuthorityAccept);
-            if (commitAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+            if (commitAuthorization is not null)
             {
-                return commitAuthorization ?? NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
-                    NarrativeChangeError.DecisionAuthorityNotAvailable);
+                return commitAuthorization;
             }
 
             var applied = store.Apply(
@@ -216,6 +236,20 @@ public sealed class NarrativeChangeService
             if (!applied.Succeeded)
             {
                 return new NarrativeChangeResult<ApplyNarrativeChangeSetResult>(null, applied.Failure);
+            }
+
+            if (command.DeciderKind == NarrativeDecisionKind.AgentDelegated)
+            {
+                var policy = oversightSource.Resolve(command.Principal?.ProjectScope?.ProjectId.ToString("D"), null, null);
+                delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
+                    applied.Value!.ChangeSetId,
+                    applied.Value.TransactionId,
+                    OversightScopeKind.Project,
+                    command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? applied.Value.ChangeSetId,
+                    command.Principal?.ToString() ?? "agent",
+                    policy,
+                    null,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
             }
 
             var warnings = analysis?.Warnings ?? [];

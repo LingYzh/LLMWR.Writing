@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -172,6 +173,12 @@ public static class SecretRedaction
 
 public static class CanonicalJson
 {
+    public static string Sha256Hex(string canonicalUtf8)
+    {
+        ArgumentNullException.ThrowIfNull(canonicalUtf8);
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalUtf8))).ToLowerInvariant();
+    }
+
     public static string WriteCheckpoint(CheckpointV1 checkpoint)
     {
         ArgumentNullException.ThrowIfNull(checkpoint);

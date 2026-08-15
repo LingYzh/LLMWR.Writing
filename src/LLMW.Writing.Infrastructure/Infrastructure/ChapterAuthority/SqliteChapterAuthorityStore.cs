@@ -2,6 +2,7 @@ using System.Data.Common;
 using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.ChapterAuthority;
+using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
@@ -235,7 +236,10 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             AcceptanceId = acceptanceId,
             ManuscriptRevisionId = revisionId,
             MaterializedRelativePath = request.MaterializedRelativePath,
-            AcceptedById = request.AcceptedById
+            AcceptedById = request.AcceptedById,
+            AcceptedByKind = request.Decision.AuthorityKind == DecisionAuthorityKind.AgentDelegated
+                ? "AGENT_DELEGATED"
+                : "AUTHOR_CONFIRMED"
         };
     }
 
@@ -337,13 +341,14 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
                 acceptance_id,scope_kind,scope_id,candidate_id,manuscript_revision_id,review_attempt_id,
                 accepted_by_kind,accepted_by_id,transaction_id,accepted_at_ms)
             VALUES($acceptance_id,'chapter',$chapter_id,$candidate_id,$revision_id,$review_id,
-                   'AUTHOR_CONFIRMED',$accepted_by_id,$transaction_id,$now);
+                   $accepted_by_kind,$accepted_by_id,$transaction_id,$now);
             """,
             ("$acceptance_id", context.AcceptanceId),
             ("$chapter_id", context.ChapterId),
             ("$candidate_id", context.CandidateId),
             ("$revision_id", context.ManuscriptRevisionId),
             ("$review_id", context.ReviewAttemptId),
+            ("$accepted_by_kind", context.AcceptedByKind),
             ("$accepted_by_id", context.AcceptedById ?? "user-interactive"),
             ("$transaction_id", context.TransactionId),
             ("$now", now));

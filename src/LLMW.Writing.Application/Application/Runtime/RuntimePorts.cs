@@ -14,7 +14,15 @@ public enum RuntimeError
     CheckpointCorrupt,
     Cancelled,
     BindingUnavailable,
-    WorkerLaunchFailed
+    WorkerLaunchFailed,
+    CompletionFailed,
+    SemanticReviewRequired,
+    OversightDenied,
+    GrillAuthorRequired,
+    GrillAlreadyResolved,
+    SpecialistImmutable,
+    SpecialistInvalid,
+    BackgroundIllegalTransition
 }
 
 public sealed record RuntimeFailure(RuntimeError Code, string? Detail = null);
@@ -41,7 +49,11 @@ public enum SchedulerFaultPoint
     AfterWorkerLaunchBeforeAck,
     CheckpointWrite,
     CancelRacingStart,
-    BudgetChangeDuringDispatch
+    BudgetChangeDuringDispatch,
+    AfterResultBeforeTaskComplete,
+    AfterTaskBeforeResultPersist,
+    GrillResolutionRace,
+    BackgroundStopRaceComplete
 }
 
 public interface ISchedulerFaultInjector
@@ -123,6 +135,60 @@ public interface IRuntimePersistence
     void MarkRunningToolCallsUnknown(string runId);
 
     void InTransaction(Action action);
+
+    void UpdateTaskCompletionContract(string taskId, string? completionContractJson);
+
+    DurableResultArtifactRecord InsertResultArtifact(DurableResultArtifactRecord artifact);
+
+    DurableResultArtifactRecord? GetLatestResultArtifact(string taskId);
+
+    DurableResultArtifactRecord? GetResultArtifact(string resultArtifactId);
+
+    void InsertEvidence(EvidenceRecord evidence);
+
+    IReadOnlyList<EvidenceRecord> EvidenceForTask(string taskId);
+
+    void MarkEvidenceStale(string evidenceId, bool stale);
+
+    DurableDependencyRecord? GetDependency(string dependencyId);
+
+    IReadOnlyList<DurableDependencyRecord> DependenciesForConsumer(string consumerTaskId);
+
+    void UpdateDependencyRecord(string dependencyId, string kind, string status, string? resultArtifactId);
+
+    void InsertOversightOverride(OversightOverrideRecord record);
+
+    IReadOnlyList<OversightOverrideRecord> ListOversightOverrides();
+
+    void BindPendingOversightOverrides(string checkpointId, long checkpointCreatedAtMs);
+
+    void InsertDelegatedDecision(DelegatedDecisionRecord record);
+
+    IReadOnlyList<DelegatedDecisionRecord> ListDelegatedDecisions();
+
+    void InsertApproval(DurableApprovalRecord record);
+
+    DurableApprovalRecord? GetApproval(string approvalId);
+
+    void UpdateApproval(DurableApprovalRecord record);
+
+    IReadOnlyList<DurableApprovalRecord> ListApprovals(string? runId);
+
+    void InsertBackgroundTask(DurableBackgroundTaskRecord record);
+
+    void UpdateBackgroundTask(DurableBackgroundTaskRecord record);
+
+    DurableBackgroundTaskRecord? GetBackgroundTask(string backgroundTaskId);
+
+    IReadOnlyList<DurableBackgroundTaskRecord> ListBackgroundTasks(string? ownerRunId);
+
+    void UpsertProjectSpecialist(DurableProjectSpecialistRecord record);
+
+    DurableProjectSpecialistRecord? GetProjectSpecialist(string profileId);
+
+    IReadOnlyList<DurableProjectSpecialistRecord> ListProjectSpecialists();
+
+    DurableAttemptRecord? FindActiveAttempt(string taskId);
 }
 
 public sealed record WorkerLaunchRequest(

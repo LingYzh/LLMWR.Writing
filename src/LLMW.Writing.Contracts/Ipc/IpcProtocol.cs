@@ -199,6 +199,16 @@ public static class IpcErrorCodes
     public const string AgentUnknownSideEffect = "AGENT_UNKNOWN_SIDE_EFFECT";
     public const string AgentCheckpointUnsupported = "AGENT_CHECKPOINT_UNSUPPORTED";
     public const string AgentIllegalTransition = "AGENT_ILLEGAL_TRANSITION";
+    public const string OversightMutationDenied = "OVERSIGHT_MUTATION_DENIED";
+    public const string CompletionContractFailed = "COMPLETION_CONTRACT_FAILED";
+    public const string SemanticReviewRequired = "SEMANTIC_REVIEW_REQUIRED";
+    public const string ResultRequiredStale = "RESULT_REQUIRED_STALE";
+    public const string RuntimeGrillAuthorRequired = "RUNTIME_GRILL_AUTHOR_REQUIRED";
+    public const string RuntimeGrillAlreadyResolved = "RUNTIME_GRILL_ALREADY_RESOLVED";
+    public const string SpecialistImmutable = "SPECIALIST_IMMUTABLE";
+    public const string SpecialistValidationFailed = "SPECIALIST_VALIDATION_FAILED";
+    public const string SpecialistTestUnavailable = "SPECIALIST_TEST_UNAVAILABLE";
+    public const string BackgroundIllegalTransition = "BACKGROUND_ILLEGAL_TRANSITION";
 }
 
 public static class IpcServerCapabilities

@@ -1,10 +1,12 @@
 using LLMW.Writing.Application.Authority;
+using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
 using LLMW.Writing.Application.Reconcile;
 using LLMW.Writing.Application.Security;
+using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.ChapterAuthority;
@@ -20,6 +22,8 @@ public sealed class ChapterAuthorityService
     private readonly IChapterReviewer reviewer;
     private readonly IAuthoritySurfaceHealthGate authoritySurfaceHealthGate;
     private readonly IAuthorizationService authorizationService;
+    private readonly IEffectiveOversightSource oversightSource;
+    private readonly IDelegatedDecisionSink delegatedDecisionSink;
 
     public ChapterAuthorityService(
         IImmutableBlobStore blobStore,
@@ -27,7 +31,9 @@ public sealed class ChapterAuthorityService
         IChapterAuthorityStore store,
         IChapterReviewer reviewer,
         IAuthoritySurfaceHealthGate authoritySurfaceHealthGate,
-        IAuthorizationService? authorizationService = null)
+        IAuthorizationService? authorizationService = null,
+        IEffectiveOversightSource? oversightSource = null,
+        IDelegatedDecisionSink? delegatedDecisionSink = null)
     {
         this.blobStore = blobStore ?? throw new ArgumentNullException(nameof(blobStore));
         this.transactionCoordinator = transactionCoordinator ?? throw new ArgumentNullException(nameof(transactionCoordinator));
@@ -35,6 +41,8 @@ public sealed class ChapterAuthorityService
         this.reviewer = reviewer ?? throw new ArgumentNullException(nameof(reviewer));
         this.authoritySurfaceHealthGate = authoritySurfaceHealthGate ?? throw new ArgumentNullException(nameof(authoritySurfaceHealthGate));
         this.authorizationService = authorizationService ?? DenyAllAuthorizationService.Instance;
+        this.oversightSource = oversightSource ?? FailClosedOversightSource.Instance;
+        this.delegatedDecisionSink = delegatedDecisionSink ?? NullDelegatedDecisionSink.Instance;
     }
 
     public ChapterAuthorityResult<SubmitChapterDraftResult> SubmitChapterDraft(
@@ -243,11 +251,10 @@ public sealed class ChapterAuthorityService
             return authorization;
         }
 
-        if (command.Principal?.Kind != PrincipalKind.UserInteractive)
+        var formal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out var authorityKind);
+        if (formal is not null)
         {
-            return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
-                ChapterAuthorityError.AcceptanceNotAuthorized,
-                "WP09 does not activate AgentDelegated acceptance.");
+            return formal;
         }
 
         var context = store.LoadAcceptanceContext(command.CandidateId);
@@ -268,10 +275,17 @@ public sealed class ChapterAuthorityService
                 var recoveryAuthorization = Authorize<AcceptChapterCandidateResult>(
                     command.Principal,
                     Capability.AuthorityAccept);
-                if (recoveryAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+                if (recoveryAuthorization is not null)
                 {
-                    return recoveryAuthorization ?? ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
-                        ChapterAuthorityError.AcceptanceNotAuthorized);
+                    return recoveryAuthorization;
+                }
+
+                var recoveryFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(
+                    command.Principal,
+                    out _);
+                if (recoveryFormal is not null)
+                {
+                    return recoveryFormal;
                 }
 
                 return ChapterAuthorityResults.Success(
@@ -295,8 +309,10 @@ public sealed class ChapterAuthorityService
 
             var decision = new AcceptanceDecisionContext(
                 true,
-                DecisionAuthorityKind.AuthorConfirmed,
-                command.OversightMode,
+                authorityKind,
+                authorityKind == DecisionAuthorityKind.AgentDelegated
+                    ? NarrativeOversightMode.Auto
+                    : command.OversightMode,
                 BypassPermissions: false);
 
             var transitionAuthorization = Authorize<AcceptChapterCandidateResult>(
@@ -379,10 +395,15 @@ public sealed class ChapterAuthorityService
             var commitAuthorization = Authorize<AcceptChapterCandidateResult>(
                 command.Principal,
                 Capability.AuthorityAccept);
-            if (commitAuthorization is not null || command.Principal?.Kind != PrincipalKind.UserInteractive)
+            if (commitAuthorization is not null)
             {
-                return commitAuthorization ?? ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
-                    ChapterAuthorityError.AcceptanceNotAuthorized);
+                return commitAuthorization;
+            }
+
+            var commitFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out _);
+            if (commitFormal is not null)
+            {
+                return commitFormal;
             }
 
             if (requiresPreparation)
@@ -394,8 +415,25 @@ public sealed class ChapterAuthorityService
                     new PrepareAcceptanceRequest(context, decision, command.AcceptedById, relativePath));
             }
 
-            return ChapterAuthorityResults.Success(
-                store.CommitAcceptance(context, cancellationToken));
+            var committed = store.CommitAcceptance(context, cancellationToken);
+            if (authorityKind == DecisionAuthorityKind.AgentDelegated)
+            {
+                var policy = oversightSource.Resolve(
+                    command.Principal?.ProjectScope?.ProjectId.ToString("D"),
+                    null,
+                    null);
+                delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
+                    committed.AcceptanceId,
+                    committed.TransactionId,
+                    OversightScopeKind.Project,
+                    command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
+                    command.Principal?.ToString() ?? "agent",
+                    policy,
+                    null,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+            }
+
+            return ChapterAuthorityResults.Success(committed);
         }
         catch (Exception exception)
         {
@@ -438,6 +476,35 @@ public sealed class ChapterAuthorityService
                 principal is null ? ChapterAuthorityError.InvalidPrincipal : ChapterAuthorityError.CapabilityDenied,
                 string.Join(',', decision.Reasons))
         };
+    }
+
+    private ChapterAuthorityResult<T>? EnsureFormalNarrativeDecision<T>(
+        CallerPrincipal? principal,
+        out DecisionAuthorityKind authorityKind)
+    {
+        authorityKind = DecisionAuthorityKind.AuthorConfirmed;
+        if (principal?.Kind == PrincipalKind.UserInteractive)
+        {
+            return null;
+        }
+
+        if (principal?.Kind != PrincipalKind.AgentRun)
+        {
+            return ChapterAuthorityResults.Fail<T>(
+                ChapterAuthorityError.AcceptanceNotAuthorized,
+                "Formal acceptance requires USER_INTERACTIVE or effective AGENT_DELEGATED Oversight.");
+        }
+
+        var policy = oversightSource.Resolve(principal.ProjectScope?.ProjectId.ToString("D"), null, null);
+        if (!policy.NarrativeDelegated)
+        {
+            return ChapterAuthorityResults.Fail<T>(
+                ChapterAuthorityError.AcceptanceNotAuthorized,
+                "Effective Oversight remains AUTHOR_CONFIRMED_REQUIRED.");
+        }
+
+        authorityKind = DecisionAuthorityKind.AgentDelegated;
+        return null;
     }
 
     private static ChapterAuthorityResult<T> TransitionFailure<T>(AuthorityRejection? rejection)

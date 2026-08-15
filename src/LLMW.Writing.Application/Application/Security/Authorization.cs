@@ -1,3 +1,4 @@
+using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.Security;
@@ -41,10 +42,14 @@ public interface IAuthorizationService
 public sealed class CoreAuthorizationService : IAuthorizationService
 {
     private readonly ISecurityPolicySource policySource;
+    private readonly IEffectiveOversightSource? oversightSource;
 
-    public CoreAuthorizationService(ISecurityPolicySource? policySource = null)
+    public CoreAuthorizationService(
+        ISecurityPolicySource? policySource = null,
+        IEffectiveOversightSource? oversightSource = null)
     {
         this.policySource = policySource ?? FailClosedSecurityPolicySource.Instance;
+        this.oversightSource = oversightSource;
     }
 
     public CapabilityDecision Authorize(CallerPrincipal? principal, AuthorizationRequest request)
@@ -55,6 +60,13 @@ public sealed class CoreAuthorizationService : IAuthorizationService
             return InvalidPrincipal(request.Capability);
         }
 
+        var oversight = oversightSource?.Resolve(principal.ProjectScope?.ProjectId.ToString("D"), null, null);
+        var permission = oversight is { Active: true }
+            ? oversight.RuntimePermission
+            : principal.RuntimePermissionMode;
+        var narrativeAvailable = principal.Kind == PrincipalKind.AgentRun &&
+                                 (oversight?.NarrativeDelegated ?? false);
+
         var policy = policySource.Resolve(principal, request.Capability);
         if (policy is null)
         {
@@ -62,21 +74,22 @@ public sealed class CoreAuthorizationService : IAuthorizationService
                 request.Capability,
                 principal.Kind,
                 principal.Role,
-                principal.RuntimePermissionMode));
+                permission,
+                NarrativeAuthorityAvailable: narrativeAvailable));
         }
 
         return CapabilityEvaluator.Evaluate(new CapabilityEvaluationRequest(
             request.Capability,
             principal.Kind,
             principal.Role,
-            principal.RuntimePermissionMode,
+            permission,
             policy.ProductAllowed,
             policy.ToolGranted,
             policy.ExtensionGranted,
             policy.ProjectTrusted,
             policy.Scope,
             policy.HardDeny,
-            policy.NarrativeAuthorityAvailable,
+            narrativeAvailable,
             policy.ExplicitUserTask));
     }
 

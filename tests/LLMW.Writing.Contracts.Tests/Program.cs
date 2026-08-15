@@ -27,6 +27,7 @@ internal static class Program
             RunSessionContractCannotSelectTrustedPrincipalOrBinding();
             Wp11ContractTests.Run();
             Wp12ContractTests.Run();
+            Wp13ContractTests.Run();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }

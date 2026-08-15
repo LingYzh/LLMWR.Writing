@@ -656,6 +656,20 @@ public static class IpcServerSession
                     return;
                 }
             }
+            else if (Wp13CommandCatalog.IsUiOwned(wire.SemanticType) && options.ExpectedClientKind != IpcClientKind.Ui)
+            {
+                TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.OversightMutationDenied, "This WP13 mutation requires USER_INTERACTIVE.", wire.SemanticType);
+                return;
+            }
+            else if (Wp13CommandCatalog.IsDualQuery(wire.SemanticType) && options.ExpectedClientKind == IpcClientKind.AgentRuntime)
+            {
+                TryBindTrustedChannel();
+                if (channel is null)
+                {
+                    TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.TrustedBindingUnavailable, "Trusted Runtime launch binding is unavailable.", wire.SemanticType);
+                    return;
+                }
+            }
             else if (options.ExpectedClientKind == IpcClientKind.Ui)
             {
                 principal = options.NativeUi?.ResolveUserInteractive();
