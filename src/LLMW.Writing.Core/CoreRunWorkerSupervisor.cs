@@ -22,6 +22,7 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
     private readonly string workerExecutablePath;
     private readonly CallerPrincipal launchPrincipal;
     private readonly ProjectScope projectScope;
+    private readonly RunSessionService sessions;
     private int sequence;
 
     public CoreRunWorkerSupervisor(
@@ -32,7 +33,8 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
         string workspaceInstanceId,
         string workerExecutablePath,
         CallerPrincipal launchPrincipal,
-        ProjectScope projectScope)
+        ProjectScope projectScope,
+        RunSessionService sessions)
     {
         this.broker = broker ?? throw new ArgumentNullException(nameof(broker));
         this.sandboxHost = sandboxHost ?? throw new ArgumentNullException(nameof(sandboxHost));
@@ -44,6 +46,7 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
         this.workerExecutablePath = workerExecutablePath;
         this.launchPrincipal = launchPrincipal ?? throw new ArgumentNullException(nameof(launchPrincipal));
         this.projectScope = projectScope ?? throw new ArgumentNullException(nameof(projectScope));
+        this.sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
     }
 
     public WorkerLaunchResult Launch(WorkerLaunchRequest request)
@@ -101,7 +104,8 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
                     Bootstrap = new IpcBootstrapAuthenticator(bootstrap),
                     EventRing = eventRing,
                     Bindings = bindings,
-                    LaunchBindingId = bindingId
+                    LaunchBindingId = bindingId,
+                    RunSessions = sessions
                 };
                 var capturedPipe = pipe;
                 var capturedLifetime = lifetime;
@@ -136,7 +140,7 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
                     throw new InvalidOperationException(launched.DenyReason ?? "Worker launch failed closed.");
                 }
 
-                workers[workerId] = new LiveEntry(workerId, bindingId, request.RunId, launched.Process, lifetime, pipe);
+                workers[workerId] = new LiveEntry(workerId, bindingId, channelId, request.RunId, launched.Process, lifetime, pipe);
                 return new WorkerLaunchResult(workerId, bindingId, channelId);
             }
             catch
@@ -155,6 +159,12 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
             return false;
         }
 
+        sessions.RevokeByChannelWorker(new AuthenticatedChannelContext(
+            entry.ChannelInstanceId,
+            AuthenticatedClientKind.Worker,
+            entry.WorkerInstanceId,
+            projectScope,
+            entry.RunId));
         entry.Process.Terminate();
         entry.Lifetime.Cancel();
         entry.Process.Dispose();
@@ -175,6 +185,7 @@ internal sealed class CoreRunWorkerSupervisor : IRunWorkerSupervisor
     private sealed record LiveEntry(
         string WorkerInstanceId,
         string LaunchBindingId,
+        string ChannelInstanceId,
         string RunId,
         ISandboxedWorkerProcess Process,
         CancellationTokenSource Lifetime,

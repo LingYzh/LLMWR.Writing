@@ -184,7 +184,15 @@ Persisted and returned expiry is `actualExpiresAt`. A huge caller timestamp cann
 
 These are coarse Runtime-orchestration operations. They are not generic SQL/CRUD, do not serialize Domain entities, and do not expose `ISandboxHost`, raw SQLite, trusted-binding mutation, or caller-selected principals.
 
-Authenticated Agent Runtime channel + Core-owned Runtime launch binding is required. They do **not** mint `CORE_INTERNAL`. `spawnChildRun` additionally requires a Core-issued parent `RunSessionProof` and `Agent.Spawn`. Child `createRun` depth is derived from the durable parent; callers cannot choose `depth`. Live subagent creation uses `spawnChildRun`, not a lower-level Worker launch API.
+Authenticated Agent Runtime channel + Core-owned Runtime launch binding is required. They do **not** mint `CORE_INTERNAL`.
+
+`openProject` binds an **existing** valid LLMW project. `RequestedPath` is a user request, not Project identity and not sandbox truth. Core canonicalizes the path, rejects reparse/junction escape, requires `<root>/project.llmw.json`, reads `projectId` from that descriptor (UUIDv7), validates `formatVersion`/`schemaVersion` = 1, and opens only `<root>/.llmw/project.db` that is already schema v1. Future/unsupported descriptor or DB versions are refused without mutation. OpenProject does not create a Project, does not create `project.db`, and does not derive `ProjectId` from the path.
+
+`createRun` is **root Run** management creation. `ParentRunId` MUST be null; a non-null parent is `AGENT_SPAWN_DENIED` and creates no row. Child Runs are created only by `spawnChildRun` after a Core-issued parent `RunSessionProof`, parent Run/task identity, `Agent.Spawn`, cancellation/UNKNOWN gates, derived depth, shared budget, and `child.WorkflowRunId == parent.WorkflowRunId`. Callers cannot choose `depth`.
+
+Capacity-full but otherwise authorized `spawnChildRun` persists a durable child Run with `status=queued` and returns that `childRunId`. It does not launch a Worker and does not occupy a dispatch slot. Restart/rebuild must observe the same queued child.
+
+`launchRunWorker` requires a Scheduler dispatch reservation: Run `starting`, Task `running`, Attempt `starting`, with matching identities. It is not an independent launch API and must not create a Worker for a Run that never dispatched. Adaptive budget decrease does not revoke an already-reserved Starting Run.
 
 Worker trusted launch records are keyed by a Core-owned `launchBindingId` (16 hex), not by `AuthenticatedClientKind` alone. Each record may carry a composition-owned `BoundRunId`. A Worker cannot bind by kind, cannot select another Worker's record via payload `runId`/`workerInstanceId`/`channelId`, and cannot issue a `RunSession` for a different Run than `BoundRunId`.
 
@@ -192,7 +200,7 @@ Worker trusted launch records are keyed by a Core-owned `launchBindingId` (16 he
 |---|---|---|
 | `loadSchedulerSnapshot` | optional `workflowRunId` | rebuildable snapshot + READY/blocked projection |
 | `createWorkflowRun` | optional `storylineId` | durable workflow identity |
-| `createRun` | `workflowRunId`, `role`, optional parent | durable run + derived depth |
+| `createRun` | `workflowRunId`, `role`; `parentRunId` must be null | root run only (`depth=0`); non-null parent denied |
 | `createTask` | `runId`, `taskKind`, `priority` | durable task |
 | `dispatchReadyTask` | `taskId` | atomic READY→RUNNING + Attempt, or `queued` |
 | `cancelRuntimeScope` | `scopeKind`=`workflowRun`\|`run`\|`task`, `scopeId` | cascade cancel |
@@ -202,7 +210,7 @@ Worker trusted launch records are keyed by a Core-owned `launchBindingId` (16 he
 | `launchRunWorker` | durable `runId`/`taskId`/`attemptId` | Core-owned `workerInstanceId`/`launchBindingId` |
 | `releaseRunWorker` | Core-owned `workerInstanceId` | released |
 | `reconcileRunWorkers` | empty | orphan/liveness classifications |
-| `spawnChildRun` | parent run/task + optional requested depth + session | `spawned`/`queued`/`denied` |
+| `spawnChildRun` | parent run/task + optional requested depth + session | `spawned`/`queued` with durable `childRunId`, or denied |
 
 Envelope `runId` / `workerInstanceId` / `channelId` claims never select the trusted launch record. Worker pipes are `llmw-writing-<workspace>-w-<16-hex-launchBindingId>` and admit one connection. Bootstrap for a Worker is a Core-issued one-shot secret distinct from UI/Runtime/Core bootstrap tokens.
 

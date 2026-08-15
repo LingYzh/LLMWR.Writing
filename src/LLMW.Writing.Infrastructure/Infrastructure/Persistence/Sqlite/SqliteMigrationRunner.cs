@@ -56,6 +56,26 @@ public sealed class SqliteMigrationRunner
         return Verify(connection, applied);
     }
 
+    public static DatabaseMigrationResult ValidateExistingV1WithoutMutation(string databasePath)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        var fullPath = Path.GetFullPath(databasePath);
+        if (!File.Exists(fullPath))
+        {
+            throw new MigrationIntegrityException("Existing project.db is missing.");
+        }
+
+        var version = InspectExistingDatabaseWithoutMutation(fullPath);
+        if (version != CurrentSchemaVersion)
+        {
+            throw new MigrationIntegrityException(
+                $"Existing project.db user_version {version} is not schema v1; refused without mutation.");
+        }
+
+        using var connection = SqliteDatabaseConnectionFactory.OpenReadOnly(fullPath);
+        return Verify(connection, applied: false);
+    }
+
     private static int InspectExistingDatabaseWithoutMutation(string databasePath)
     {
         if (!File.Exists(databasePath))

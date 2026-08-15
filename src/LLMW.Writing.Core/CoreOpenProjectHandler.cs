@@ -1,11 +1,10 @@
-using System.Security.Cryptography;
-using System.Text;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
+using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
 
@@ -61,30 +60,29 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 return Task.FromResult<IpcApplicationCommandResult?>(Error(context, IpcErrorCodes.ProtocolViolation, "A project is already open in this Core process."));
             }
 
-            if (!TryBindTrustedRoot(request.RequestedPath, out var trustedRoot, out var deny))
+            var bind = ExistingProjectPreflight.TryBind(request.RequestedPath);
+            if (!bind.Succeeded)
             {
-                return Task.FromResult<IpcApplicationCommandResult?>(Error(context, IpcErrorCodes.BindingMismatch, deny));
+                return Task.FromResult<IpcApplicationCommandResult?>(
+                    Error(context, IpcErrorCodes.BindingMismatch, bind.DenyReason ?? "Existing project preflight failed."));
             }
 
-            var databasePath = Path.Combine(trustedRoot, "project.db");
-            new SqliteMigrationRunner().Migrate(databasePath, "wp12", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
-            var projectId = ProjectIdFromTrustedRoot(trustedRoot);
-            var scope = new ProjectScope(projectId, workspaceInstanceId);
+            var scope = new ProjectScope(bind.ProjectId, workspaceInstanceId);
             bindings.Register(new TrustedIpcLaunchRecord(
                 AuthenticatedClientKind.AgentRuntime,
                 runtimeWorkerInstanceId,
                 runtimeChannelInstanceId,
                 scope));
 
-            var sessionStore = new SqliteRunSessionStore(databasePath);
-            var store = new SqliteRuntimeStore(databasePath);
+            var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
+            var store = new SqliteRuntimeStore(bind.DatabasePath);
             var sessions = new RunSessionService(sessionStore);
-            var sandboxHost = CreateSandboxHost(trustedRoot, scope);
+            var sandboxHost = CreateSandboxHost(bind.CanonicalRoot, scope);
             var broker = new TrustedSandboxBroker(
                 new CoreAuthorizationService(),
                 sandboxHost,
                 UnavailableSandboxPathGuard.Instance,
-                new SandboxProjectContext(trustedRoot, scope),
+                new SandboxProjectContext(bind.CanonicalRoot, scope),
                 sessionRevalidator: new RunSessionRevalidator(sessionStore));
             var workerExe = Path.Combine(AppContext.BaseDirectory, "worker", "LLMW.Writing.Worker.exe");
             var supervisor = new CoreRunWorkerSupervisor(
@@ -95,7 +93,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 workspaceInstanceId,
                 workerExe,
                 nativeUi.ResolveUserInteractive(),
-                scope);
+                scope,
+                sessions);
             var scheduler = new RuntimeSchedulerService(
                 store,
                 new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
@@ -111,7 +110,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     IpcMessageType.Response,
                     IpcSemanticTypes.OpenProject,
                     workspaceInstanceId,
-                    new OpenProjectResponse(projectId.ToString("D")),
+                    new OpenProjectResponse(bind.ProjectId.ToString("D")),
                     context.EnvelopeProjectId,
                     context.EnvelopeRunId,
                     context.CorrelationId,
@@ -119,44 +118,6 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 IpcJsonContext.Default.OpenProjectResponseEnvelope);
             return Task.FromResult<IpcApplicationCommandResult?>(new IpcApplicationCommandResult(response));
         }
-    }
-
-    private static bool TryBindTrustedRoot(string requestedPath, out string trustedRoot, out string deny)
-    {
-        trustedRoot = "";
-        deny = "Caller ProjectRoot is not security truth; Core could not bind a trusted existing project directory.";
-        if (string.IsNullOrWhiteSpace(requestedPath))
-        {
-            return false;
-        }
-
-        try
-        {
-            var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(requestedPath));
-            if (!Directory.Exists(full))
-            {
-                deny = "The requested project directory does not exist.";
-                return false;
-            }
-
-            trustedRoot = full;
-            return true;
-        }
-        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException or IOException)
-        {
-            deny = "The requested project path could not be canonicalized.";
-            return false;
-        }
-    }
-
-    private static Guid ProjectIdFromTrustedRoot(string trustedRoot)
-    {
-        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(trustedRoot));
-        var bytes = hash.AsSpan(0, 16).ToArray();
-        bytes[6] = (byte)((bytes[6] & 0x0f) | 0x40);
-        bytes[8] = (byte)((bytes[8] & 0x3f) | 0x80);
-        var id = new Guid(bytes);
-        return id == Guid.Empty ? Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab") : id;
     }
 
     private static ISandboxHost CreateSandboxHost(string trustedRoot, ProjectScope scope)

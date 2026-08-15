@@ -34,8 +34,14 @@ internal static class Wp12ApplicationTests
         TrustedLaunchEnvironmentRejectsCoreBootstrap();
         ManagementCommandsRequireRuntimeChannel();
         IpcSurfaceStillCannotReachSandboxHost();
-        Console.WriteLine("Application WP12 scheduler tests passed (17).");
-        return 17;
+        CreateRunWithParentIsDeniedAndRootCreateRunStillWorks();
+        SpawnChildRunRequiresSessionAndCannotBypassAgentSpawn();
+        LaunchRequiresDispatchReservationAndIgnoresLaterBudgetDrop();
+        CapacityFullSpawnPersistsQueuedChild();
+        TaskCancelDoesNotCancelSiblingOrContainingRun();
+        WorkerRunSessionCompositionFailsClosedAndRevokesOwnSession();
+        Console.WriteLine("Application WP12 scheduler tests passed (23).");
+        return 23;
     }
 
     private static void ConcurrentWorkerBindingsRemainDistinctAndForgedIdsAreDenied()
@@ -127,23 +133,35 @@ internal static class Wp12ApplicationTests
 
     private static void DepthFiveAndSpoofAreDenied()
     {
-        var service = CreateService(out _, out var auth);
+        var service = CreateService(out _, out var auth, out var store);
         auth.Allow = true;
         var workflow = Success(service.CreateWorkflowRun("wf-d"));
         var root = Success(service.CreateRun(workflow.WorkflowRunId, "pm", null, "d0"));
         AssertEqual(0, root.Depth, "Root depth must be 0.");
-        var current = root;
+        Success(service.CreateTask(root.RunId, "write", 1, null, "d0-task"));
+        var currentRunId = root.RunId;
+        var currentTaskId = "d0-task";
+        string? depthThreeRunId = null;
+        string? depthThreeTaskId = null;
         for (var depth = 1; depth <= 4; depth++)
         {
-            current = Success(service.CreateRun(workflow.WorkflowRunId, "writer", current.RunId, "d" + depth));
-            AssertEqual(depth, current.Depth, "Derived child depth drifted.");
+            var spawned = Success(service.SpawnChildRun(currentRunId, currentTaskId, "writer", null, Principal()));
+            AssertEqual(depth, spawned.Depth, "Derived child depth drifted.");
+            AssertTrue(!string.IsNullOrWhiteSpace(spawned.ChildRunId), "Authorized spawn must persist a child Run.");
+            currentRunId = spawned.ChildRunId!;
+            currentTaskId = store.LoadSnapshot().Tasks.Single(task => StringComparer.Ordinal.Equals(task.RunId, currentRunId)).TaskId;
+            if (depth == 3)
+            {
+                depthThreeRunId = currentRunId;
+                depthThreeTaskId = currentTaskId;
+            }
         }
 
-        var denied = service.CreateRun(workflow.WorkflowRunId, "writer", current.RunId, "d5");
-        AssertEqual(RuntimeError.DepthLimit, denied.Failure?.Code, "Depth 5 must be denied.");
-        var spawnSpoof = service.SpawnChildRun(root.RunId, "missing", "writer", 0, Principal());
+        var deniedCreate = service.CreateRun(workflow.WorkflowRunId, "writer", currentRunId, "d5");
+        AssertEqual(RuntimeError.SpawnDenied, deniedCreate.Failure?.Code, "createRun must not create a child Run.");
+        var spawnSpoof = service.SpawnChildRun(depthThreeRunId!, depthThreeTaskId!, "writer", 0, Principal());
         AssertEqual(RuntimeError.DepthSpoof, spawnSpoof.Failure?.Code, "Spoofed depth=0 on a child must be rejected, not clamped.");
-        var fromFour = service.SpawnChildRun(current.RunId, "missing", "writer", null, Principal());
+        var fromFour = service.SpawnChildRun(currentRunId, currentTaskId, "writer", null, Principal());
         AssertEqual(RuntimeError.DepthLimit, fromFour.Failure?.Code, "Spawn from depth 4 must be DEPTH_LIMIT.");
     }
 
@@ -159,12 +177,13 @@ internal static class Wp12ApplicationTests
         auth.Allow = true;
         for (var index = 0; index < 4; index++)
         {
-            var run = Success(service.CreateRun(workflow.WorkflowRunId, "writer", parent.RunId, "child-" + index));
-            DispatchAndLaunch(service, run.RunId, "ct-" + index);
+            var run = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "occ-" + index));
+            DispatchAndLaunch(service, run.RunId, "ot-" + index);
         }
 
         var queued = Success(service.SpawnChildRun(parent.RunId, "spawn-task", "writer", null, Principal()));
         AssertEqual("queued", queued.Outcome, "Capacity full must queue a valid spawn.");
+        AssertTrue(!string.IsNullOrWhiteSpace(queued.ChildRunId), "Queued spawn must persist a child Run id.");
     }
 
     private static void CancelledParentCannotSpawn()
@@ -253,18 +272,19 @@ internal static class Wp12ApplicationTests
 
     private static void CancelCascadeIsScopedAndIdempotent()
     {
-        var service = CreateService(out var workers, out _);
+        var service = CreateService(out var workers, out var auth, out var store);
+        auth.Allow = true;
         var wfA = Success(service.CreateWorkflowRun("wf-a"));
         var wfB = Success(service.CreateWorkflowRun("wf-b"));
         var root = Success(service.CreateRun(wfA.WorkflowRunId, "writer", null, "cancel-root"));
-        var child = Success(service.CreateRun(wfA.WorkflowRunId, "writer", root.RunId, "cancel-child"));
-        var other = Success(service.CreateRun(wfB.WorkflowRunId, "writer", null, "cancel-other"));
         Success(service.CreateTask(root.RunId, "write", 1, null, "t-root"));
-        Success(service.CreateTask(child.RunId, "write", 1, null, "t-child"));
+        var child = Success(service.SpawnChildRun(root.RunId, "t-root", "writer", null, Principal()));
+        var other = Success(service.CreateRun(wfB.WorkflowRunId, "writer", null, "cancel-other"));
         Success(service.CreateTask(other.RunId, "write", 1, null, "t-other"));
+        var childTaskId = store.LoadSnapshot().Tasks.Single(task => StringComparer.Ordinal.Equals(task.RunId, child.ChildRunId)).TaskId;
         var dRoot = Success(service.DispatchReadyTask("t-root"));
         Success(service.LaunchRunWorker(dRoot.RunId, dRoot.TaskId, dRoot.AttemptId));
-        var dChild = Success(service.DispatchReadyTask("t-child"));
+        var dChild = Success(service.DispatchReadyTask(childTaskId));
         Success(service.LaunchRunWorker(dChild.RunId, dChild.TaskId, dChild.AttemptId));
         var dOther = Success(service.DispatchReadyTask("t-other"));
         Success(service.LaunchRunWorker(dOther.RunId, dOther.TaskId, dOther.AttemptId));
@@ -273,7 +293,7 @@ internal static class Wp12ApplicationTests
         AssertEqual(string.Join(',', first.AffectedRunIds.OrderBy(id => id, StringComparer.Ordinal)),
             string.Join(',', second.AffectedRunIds.OrderBy(id => id, StringComparer.Ordinal)),
             "Cancel must be idempotent.");
-        AssertTrue(first.AffectedRunIds.Contains("cancel-root") && first.AffectedRunIds.Contains("cancel-child"),
+        AssertTrue(first.AffectedRunIds.Contains("cancel-root") && first.AffectedRunIds.Contains(child.ChildRunId!),
             "Cancel missed descendants.");
         AssertTrue(!first.AffectedRunIds.Contains("cancel-other"), "Cancel leaked into another WorkflowRun.");
         AssertTrue(!workers.IsAlive(workers.Snapshot().First(item => item.RunId == "cancel-root").WorkerInstanceId),
@@ -332,7 +352,7 @@ internal static class Wp12ApplicationTests
         var dispatched = Success(service.DispatchReadyTask("one-task"));
         Success(service.LaunchRunWorker(dispatched.RunId, dispatched.TaskId, dispatched.AttemptId));
         var second = service.LaunchRunWorker(dispatched.RunId, dispatched.TaskId, dispatched.AttemptId);
-        AssertEqual(RuntimeError.WorkerLaunchFailed, second.Failure?.Code, "A second live Worker for the same Run must be rejected.");
+        AssertEqual(RuntimeError.IllegalTransition, second.Failure?.Code, "A second live Worker for the same Run must not bypass the dispatch reservation.");
         AssertEqual(1, workers.Snapshot().Count(item => item.Alive), "Worker process identity must not be reused or duplicated.");
     }
 
@@ -451,6 +471,329 @@ internal static class Wp12ApplicationTests
             "WP12 IPC must not expose sandbox execution.");
     }
 
+    private static void CreateRunWithParentIsDeniedAndRootCreateRunStillWorks()
+    {
+        var service = CreateService(out _, out var auth);
+        auth.Allow = true;
+        var workflow = Success(service.CreateWorkflowRun("wf-root-only"));
+        var root = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "root-ok"));
+        AssertEqual(0, root.Depth, "Root createRun must remain depth 0.");
+        Success(service.CreateTask(root.RunId, "write", 1, null, "root-task"));
+        var otherWf = Success(service.CreateWorkflowRun("wf-other"));
+        AssertEqual(RuntimeError.SpawnDenied, service.CreateRun(otherWf.WorkflowRunId, "writer", root.RunId, "cross").Failure?.Code,
+            "createRun must not attach a child to another workflow.");
+        var token = IpcBootstrapToken.Create();
+        var bindings = new TrustedIpcBindingRegistry();
+        bindings.Register(new TrustedIpcLaunchRecord(AuthenticatedClientKind.AgentRuntime, "runtime-1", "runtime-ch", Scope));
+        RunHosted(token, new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            Bindings = bindings,
+            Commands = new RuntimeIpcCommandHandler(service, Workspace)
+        }, async client =>
+        {
+            try
+            {
+                await client.RequestAsync(
+                    IpcSemanticTypes.CreateRun,
+                    new CreateRunRequest(workflow.WorkflowRunId, "writer", root.RunId, "ipc-child"),
+                    IpcJsonContext.Default.CreateRunRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunResponseEnvelope,
+                    CancellationToken.None);
+                throw new InvalidOperationException("IPC createRun(parentRunId) must be denied.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.AgentSpawnDenied, exception.ErrorCode, "Non-null ParentRunId over createRun must be AGENT_SPAWN_DENIED.");
+            }
+
+            var created = await client.RequestAsync(
+                IpcSemanticTypes.CreateRun,
+                new CreateRunRequest(workflow.WorkflowRunId, "writer", null, "ipc-root"),
+                IpcJsonContext.Default.CreateRunRequestEnvelope,
+                IpcJsonContext.Default.CreateRunResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(0, created.Payload.Depth, "Root IPC createRun must still work.");
+        }, IpcClientKind.AgentRuntime);
+        AssertTrue(service.LoadSnapshot().Runs.All(run => run.ParentRunId is null),
+            "Denied createRun must not persist a child.");
+    }
+
+    private static void SpawnChildRunRequiresSessionAndCannotBypassAgentSpawn()
+    {
+        var token = IpcBootstrapToken.Create();
+        var bindings = new TrustedIpcBindingRegistry();
+        bindings.Register(new TrustedIpcLaunchRecord(AuthenticatedClientKind.AgentRuntime, "runtime-1", "runtime-ch", Scope));
+        var service = CreateService(out _, out var auth);
+        var workflow = Success(service.CreateWorkflowRun("wf-spawn-ipc"));
+        var parent = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "spawn-ipc-parent"));
+        Success(service.CreateTask(parent.RunId, "write", 1, null, "spawn-ipc-task"));
+        RunHosted(token, new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            Bindings = bindings,
+            Commands = new RuntimeIpcCommandHandler(service, Workspace)
+        }, async client =>
+        {
+            try
+            {
+                await client.RequestAsync(
+                    IpcSemanticTypes.SpawnChildRun,
+                    new SpawnChildRunRequest(parent.RunId, "spawn-ipc-task", "writer", null, null),
+                    IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                    IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                    CancellationToken.None);
+                throw new InvalidOperationException("spawnChildRun without a RunSession must fail closed.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.InvalidSession, exception.ErrorCode, "No RunSession must not create a child through spawnChildRun.");
+            }
+        }, IpcClientKind.AgentRuntime);
+
+        auth.Allow = false;
+        AssertEqual(RuntimeError.SpawnDenied, service.SpawnChildRun(parent.RunId, "spawn-ipc-task", "writer", null, Principal()).Failure?.Code,
+            "Agent.Spawn denied cannot be bypassed by the scheduler spawn path.");
+        AssertEqual(RuntimeError.SpawnDenied, service.CreateRun(workflow.WorkflowRunId, "writer", parent.RunId, "bypass").Failure?.Code,
+            "Agent.Spawn denied cannot be bypassed by createRun.");
+    }
+
+    private static void LaunchRequiresDispatchReservationAndIgnoresLaterBudgetDrop()
+    {
+        var policy = new MutableConcurrencyBudgetPolicy();
+        var store = new MemoryRuntimeStore();
+        var workers = new FakeRunWorkerSupervisor();
+        var service = new RuntimeSchedulerService(store, policy, new FixedClock(1_000), workers);
+        var workflow = Success(service.CreateWorkflowRun("wf-launch"));
+        var created = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "created-run"));
+        Success(service.CreateTask(created.RunId, "write", 1, null, "created-task"));
+        store.InsertAttempt(new DurableAttemptRecord(
+            "created-attempt",
+            "created-task",
+            1,
+            AttemptStatusCodec.ToDurableValue(AttemptStatus.Starting),
+            1,
+            null));
+        AssertEqual(RuntimeError.IllegalTransition, service.LaunchRunWorker(created.RunId, "created-task", "created-attempt").Failure?.Code,
+            "Created Run cannot launch.");
+
+        var ready = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "ready-run"));
+        Success(service.CreateTask(ready.RunId, "write", 1, null, "ready-task"));
+        AssertEqual("ready", store.GetTask("ready-task")?.Status, "Fresh task should be ready.");
+        AssertEqual(RuntimeError.NotFound, service.LaunchRunWorker(ready.RunId, "ready-task", "old-attempt").Failure?.Code,
+            "Ready Task cannot launch with an arbitrary Attempt.");
+
+        var failed = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "fail-run"));
+        Success(service.CreateTask(failed.RunId, "write", 1, null, "fail-task"));
+        var failDispatch = Success(service.DispatchReadyTask("fail-task"));
+        store.UpdateTaskStatus("fail-task", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Failed), 2);
+        store.UpdateAttemptStatus(failDispatch.AttemptId, AttemptStatusCodec.ToDurableValue(AttemptStatus.Failed), 2);
+        store.UpdateRunStatus(failed.RunId, RunStatusCodec.ToDurableValue(RunStatus.Failed), 2);
+        AssertEqual(RuntimeError.IllegalTransition, service.LaunchRunWorker(failed.RunId, "fail-task", failDispatch.AttemptId).Failure?.Code,
+            "Failed task Attempt cannot bypass dispatch.");
+
+        var paused = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "pause-run"));
+        Success(service.CreateTask(paused.RunId, "write", 1, null, "pause-task"));
+        var pauseDispatch = Success(service.DispatchReadyTask("pause-task"));
+        store.UpdateTaskStatus("pause-task", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Paused), 2);
+        store.UpdateAttemptStatus(pauseDispatch.AttemptId, AttemptStatusCodec.ToDurableValue(AttemptStatus.Interrupted), 2);
+        store.UpdateRunStatus(paused.RunId, RunStatusCodec.ToDurableValue(RunStatus.Paused), 2);
+        AssertEqual(RuntimeError.IllegalTransition, service.LaunchRunWorker(paused.RunId, "pause-task", pauseDispatch.AttemptId).Failure?.Code,
+            "Paused task Attempt cannot bypass dispatch.");
+
+        var retried = Success(service.RetryTask("fail-task"));
+        AssertEqual(RuntimeError.IllegalTransition, service.LaunchRunWorker(failed.RunId, "fail-task", retried.AttemptId).Failure?.Code,
+            "RetryTask alone must not manufacture a launchable Worker.");
+
+        var reserved = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "reserved-run"));
+        Success(service.CreateTask(reserved.RunId, "write", 1, null, "reserved-task"));
+        var reservedDispatch = Success(service.DispatchReadyTask("reserved-task"));
+        policy.SetEffective(1);
+        var launched = Success(service.LaunchRunWorker(reservedDispatch.RunId, reservedDispatch.TaskId, reservedDispatch.AttemptId));
+        AssertTrue(!string.IsNullOrWhiteSpace(launched.WorkerInstanceId), "Already-reserved STARTING Run must still launch after a budget drop.");
+        policy.SetEffective(4);
+
+        var cancelled = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "cancel-launch"));
+        Success(service.CreateTask(cancelled.RunId, "write", 1, null, "cancel-launch-task"));
+        var cancelDispatch = Success(service.DispatchReadyTask("cancel-launch-task"));
+        Success(service.CancelScope("run", cancelled.RunId));
+        AssertEqual(RuntimeError.IllegalTransition, service.LaunchRunWorker(cancelled.RunId, "cancel-launch-task", cancelDispatch.AttemptId).Failure?.Code,
+            "Cancelled/terminal Run cannot launch.");
+    }
+
+    private static void CapacityFullSpawnPersistsQueuedChild()
+    {
+        var service = CreateService(out var workers, out var auth, out var store);
+        auth.Allow = true;
+        var workflow = Success(service.CreateWorkflowRun("wf-queue"));
+        var parent = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "queue-parent"));
+        Success(service.CreateTask(parent.RunId, "write", 1, null, "queue-parent-task"));
+        for (var index = 0; index < 4; index++)
+        {
+            var run = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "queue-occ-" + index));
+            DispatchAndLaunch(service, run.RunId, "queue-ot-" + index);
+        }
+
+        var queued = Success(service.SpawnChildRun(parent.RunId, "queue-parent-task", "writer", null, Principal()));
+        AssertEqual("queued", queued.Outcome, "Capacity-full spawn must queue.");
+        AssertTrue(!string.IsNullOrWhiteSpace(queued.ChildRunId), "Queued spawn must return a durable ChildRunId.");
+        AssertEqual("queued", store.GetRun(queued.ChildRunId!)?.Status, "Queued child must persist status=queued.");
+        AssertEqual(parent.WorkflowRunId, store.GetRun(queued.ChildRunId!)?.WorkflowRunId, "Child must share the parent WorkflowRun.");
+        AssertEqual(4, workers.Snapshot().Count(item => item.Alive), "Queued spawn must not launch a fifth Worker.");
+
+        var rebuilt = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            new FixedClock(1_000),
+            workers,
+            auth);
+        AssertEqual("queued", rebuilt.LoadSnapshot().Runs.Single(run => run.RunId == queued.ChildRunId).Status,
+            "Rebuild must observe the same queued child.");
+        AssertEqual(1, rebuilt.LoadSnapshot().Runs.Count(run => run.RunId == queued.ChildRunId),
+            "Restart/rebuild must not duplicate the queued child.");
+
+        Success(service.CancelScope("run", "queue-occ-0"));
+        var childTask = store.LoadSnapshot().Tasks.Single(task => StringComparer.Ordinal.Equals(task.RunId, queued.ChildRunId));
+        var dispatched = Success(service.DispatchReadyTask(childTask.TaskId));
+        AssertEqual("dispatched", dispatched.Outcome, "A queued child must proceed through the normal scheduler path after a slot is released.");
+        Success(service.LaunchRunWorker(dispatched.RunId, dispatched.TaskId, dispatched.AttemptId));
+        AssertEqual(4, workers.Snapshot().Count(item => item.Alive), "Released slot plus queued child must not exceed four live Workers.");
+    }
+
+    private static void TaskCancelDoesNotCancelSiblingOrContainingRun()
+    {
+        var sessionStore = new MemoryRunSessionStore();
+        sessionStore.Runs["task-run"] = new DurableRunIdentity("task-run", "writer");
+        var sessions = new RunSessionService(sessionStore);
+        var store = new MemoryRuntimeStore();
+        var workers = new FakeRunWorkerSupervisor();
+        var auth = new AllowSpawnAuth { Allow = true };
+        var service = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            new FixedClock(1_000),
+            workers,
+            auth,
+            sessions: sessions);
+        var workflow = Success(service.CreateWorkflowRun("wf-task-cancel"));
+        var run = Success(service.CreateRun(workflow.WorkflowRunId, "writer", null, "task-run"));
+        Success(service.CreateTask(run.RunId, "write", 1, null, "task-a"));
+        Success(service.CreateTask(run.RunId, "write", 1, null, "task-b"));
+        var dispatchedA = Success(service.DispatchReadyTask("task-a"));
+        Success(service.LaunchRunWorker(dispatchedA.RunId, dispatchedA.TaskId, dispatchedA.AttemptId));
+        var channel = new AuthenticatedChannelContext("channel-task", AuthenticatedClientKind.Worker, "worker-task", Scope, "task-run");
+        var issued = sessions.Create(new LLMW.Writing.Application.Security.CreateRunSessionRequest("task-run", channel, null));
+        AssertTrue(issued.Succeeded, "RunSession for the containing Run must exist before task cancel.");
+
+        var first = Success(service.CancelScope("task", "task-a"));
+        var second = Success(service.CancelScope("task", "task-a"));
+        AssertEqual("cancelled", store.GetTask("task-a")?.Status, "Target task must be cancelled.");
+        AssertEqual("ready", store.GetTask("task-b")?.Status, "Sibling Task B must remain valid.");
+        AssertEqual("running", store.GetRun(run.RunId)?.Status, "Containing Run must not be cancelled by Task A.");
+        AssertTrue(!first.AffectedRunIds.Contains(run.RunId), "Task cancel must not list the containing Run.");
+        AssertEqual(string.Join(',', first.AffectedRunIds), string.Join(',', second.AffectedRunIds), "Task cancel must be idempotent.");
+        AssertEqual("cancelled", store.GetAttempt(dispatchedA.AttemptId)?.Status, "Active Attempt for the target task must be cancelled.");
+        AssertTrue(workers.IsAlive(workers.Snapshot().Single(item => item.RunId == run.RunId).WorkerInstanceId),
+            "Task cancel must not kill the Run Worker.");
+        AssertTrue(sessionStore.FindByHandleId(issued.Value!.HandleId)?.RevokedAtMs is null,
+            "RunSession must not be globally revoked solely by Task A cancellation.");
+
+        var wfB = Success(service.CreateWorkflowRun("wf-task-other"));
+        var other = Success(service.CreateRun(wfB.WorkflowRunId, "writer", null, "task-other"));
+        Success(service.CreateTask(other.RunId, "write", 1, null, "task-other-t"));
+        var otherDispatch = Success(service.DispatchReadyTask("task-other-t"));
+        Success(service.LaunchRunWorker(otherDispatch.RunId, otherDispatch.TaskId, otherDispatch.AttemptId));
+        Success(service.CancelScope("run", run.RunId));
+        AssertEqual("cancelled", store.GetTask("task-b")?.Status, "Run cancel must still cancel remaining descendants.");
+        AssertEqual("running", store.GetRun(other.RunId)?.Status, "Unrelated Run must remain.");
+        AssertTrue(workers.IsAlive(workers.Snapshot().First(item => item.RunId == other.RunId).WorkerInstanceId),
+            "Unrelated Worker must remain.");
+        Success(service.CancelScope("workflowRun", wfB.WorkflowRunId));
+        AssertEqual("cancelled", store.GetRun(other.RunId)?.Status, "Workflow cancel must still cascade that workflow.");
+    }
+
+    private static void WorkerRunSessionCompositionFailsClosedAndRevokesOwnSession()
+    {
+        var sessionStore = new MemoryRunSessionStore();
+        sessionStore.Runs["run-a"] = new DurableRunIdentity("run-a", "writer");
+        sessionStore.Runs["run-b"] = new DurableRunIdentity("run-b", "writer");
+        var sessions = new RunSessionService(sessionStore);
+        var registry = new TrustedIpcBindingRegistry();
+        registry.Register(new TrustedIpcLaunchRecord(
+            AuthenticatedClientKind.Worker, "worker-a", "channel-a", Scope, "aaaaaaaaaaaaaaaa", "run-a"));
+        var token = IpcBootstrapToken.Create();
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.Worker,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            Bindings = registry,
+            LaunchBindingId = "aaaaaaaaaaaaaaaa",
+            RunSessions = sessions
+        };
+        AssertTrue(options.RunSessions is not null, "Production-equivalent Worker server composition must have RunSessions.");
+
+        RunHosted(token, options, async client =>
+        {
+            var issued = await WorkerSessionBootstrap.EstablishAsync(client, "run-a", CancellationToken.None);
+            AssertEqual("run-a", issued.RunId, "Correct Worker must obtain a session for BoundRunId.");
+            try
+            {
+                await WorkerSessionBootstrap.EstablishAsync(client, "run-b", CancellationToken.None);
+                throw new InvalidOperationException("Worker A must not obtain a Run B session.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.BindingMismatch, exception.ErrorCode, "Worker A cannot obtain Run B session.");
+            }
+        }, IpcClientKind.Worker);
+
+        AssertTrue(sessionStore.All().All(item => item.RevokedAtMs is not null),
+            "Worker disconnect must revoke its own session.");
+
+        var other = sessions.Create(new LLMW.Writing.Application.Security.CreateRunSessionRequest(
+            "run-b",
+            new AuthenticatedChannelContext("channel-b", AuthenticatedClientKind.Worker, "worker-b", Scope, "run-b"),
+            null));
+        AssertTrue(other.Succeeded, "Unrelated Worker session must still be issuable.");
+        sessions.RevokeByChannelWorker(new AuthenticatedChannelContext("channel-a", AuthenticatedClientKind.Worker, "worker-a", Scope, "run-a"));
+        AssertTrue(sessionStore.FindByHandleId(other.Value!.HandleId)?.RevokedAtMs is null,
+            "Unrelated Worker session must survive another Worker's revocation.");
+
+        var missingToken = IpcBootstrapToken.Create();
+        var missingRegistry = new TrustedIpcBindingRegistry();
+        missingRegistry.Register(new TrustedIpcLaunchRecord(
+            AuthenticatedClientKind.Worker, "worker-miss", "channel-miss", Scope, "bbbbbbbbbbbbbbbb", "run-a"));
+        try
+        {
+            RunHosted(missingToken, new IpcServerOptions
+            {
+                WorkspaceInstanceId = Workspace,
+                ExpectedClientKind = IpcClientKind.Worker,
+                Bootstrap = new IpcBootstrapAuthenticator(missingToken),
+                EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+                Bindings = missingRegistry,
+                LaunchBindingId = "bbbbbbbbbbbbbbbb"
+            }, async client =>
+            {
+                await WorkerSessionBootstrap.EstablishAsync(client, "run-a", CancellationToken.None);
+            }, IpcClientKind.Worker);
+            throw new InvalidOperationException("Missing RunSession service must make Worker startup fail closed.");
+        }
+        catch (IpcProtocolException exception)
+        {
+            AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
+                "Session failure must not be swallowed.");
+        }
+    }
+
     private static void DispatchAndLaunch(RuntimeSchedulerService service, string runId, string taskId)
     {
         Success(service.CreateTask(runId, "write", 1, null, taskId));
@@ -551,6 +894,82 @@ internal static class Wp12ApplicationTests
 
             left.Dispose();
             right.Dispose();
+        }
+    }
+
+    private sealed class MemoryRunSessionStore : IRunSessionStore
+    {
+        public Dictionary<string, DurableRunIdentity> Runs { get; } = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, StoredRunSession> byHandle = new(StringComparer.Ordinal);
+
+        public DurableRunIdentity? LoadRun(string runId) =>
+            Runs.TryGetValue(runId, out var run) ? run : null;
+
+        public StoredRunSession IssueReplacingActive(PersistRunSessionRequest request)
+        {
+            var stored = new StoredRunSession(
+                Guid.NewGuid().ToString("D"),
+                request.RunId,
+                request.WorkerInstanceId,
+                request.ChannelInstanceId,
+                request.ProjectScope,
+                request.TokenHash,
+                request.ExpiresAtMs,
+                null,
+                request.CreatedAtMs);
+            byHandle[stored.HandleId] = stored;
+            return stored;
+        }
+
+        public StoredRunSession? FindByTokenHash(string tokenHash) =>
+            byHandle.Values.FirstOrDefault(item => StringComparer.Ordinal.Equals(item.TokenHash, tokenHash));
+
+        public StoredRunSession? FindByHandleId(string handleId) =>
+            byHandle.TryGetValue(handleId, out var session) ? session : null;
+
+        public StoredRunSession[] All() => byHandle.Values.ToArray();
+
+        public int RevokeHandle(string handleId, long revokedAtMs)
+        {
+            if (!byHandle.TryGetValue(handleId, out var session) || session.RevokedAtMs is not null)
+            {
+                return 0;
+            }
+
+            byHandle[handleId] = session with { RevokedAtMs = revokedAtMs };
+            return 1;
+        }
+
+        public int RevokeByRun(string runId, long revokedAtMs)
+        {
+            var count = 0;
+            foreach (var pair in byHandle.ToArray())
+            {
+                if (StringComparer.Ordinal.Equals(pair.Value.RunId, runId) && pair.Value.RevokedAtMs is null)
+                {
+                    byHandle[pair.Key] = pair.Value with { RevokedAtMs = revokedAtMs };
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
+        public int RevokeByChannelWorker(string channelInstanceId, string workerInstanceId, long revokedAtMs)
+        {
+            var count = 0;
+            foreach (var pair in byHandle.ToArray())
+            {
+                if (StringComparer.Ordinal.Equals(pair.Value.ChannelInstanceId, channelInstanceId) &&
+                    StringComparer.Ordinal.Equals(pair.Value.WorkerInstanceId, workerInstanceId) &&
+                    pair.Value.RevokedAtMs is null)
+                {
+                    byHandle[pair.Key] = pair.Value with { RevokedAtMs = revokedAtMs };
+                    count++;
+                }
+            }
+
+            return count;
         }
     }
 

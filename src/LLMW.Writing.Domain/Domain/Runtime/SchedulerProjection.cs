@@ -267,8 +267,12 @@ public static class SchedulerProjection
                 continue;
             }
 
-            if (status is TaskStatus.Ready or TaskStatus.Pending or TaskStatus.Failed or TaskStatus.Paused
-                or TaskStatus.Blocked)
+            if (status is TaskStatus.Failed or TaskStatus.Paused)
+            {
+                continue;
+            }
+
+            if (status is TaskStatus.Ready or TaskStatus.Pending or TaskStatus.Blocked)
             {
                 ready.Enqueue(task);
             }
@@ -384,6 +388,90 @@ public static class CancellationCascade
             .Select(task => task.TaskId)
             .OrderBy(id => id, StringComparer.Ordinal)
             .ToArray();
+    }
+
+    public static IReadOnlyList<string> CascadeOwnedTaskIds(string originTaskId, SchedulerSnapshot snapshot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(originTaskId);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var childrenByParent = new Dictionary<string, List<DurableTaskRecord>>(StringComparer.Ordinal);
+        foreach (var task in snapshot.Tasks)
+        {
+            if (string.IsNullOrWhiteSpace(task.ParentTaskId))
+            {
+                continue;
+            }
+
+            if (!childrenByParent.TryGetValue(task.ParentTaskId, out var children))
+            {
+                children = [];
+                childrenByParent[task.ParentTaskId] = children;
+            }
+
+            children.Add(task);
+        }
+
+        foreach (var pair in childrenByParent)
+        {
+            pair.Value.Sort((left, right) => string.CompareOrdinal(left.TaskId, right.TaskId));
+        }
+
+        var owned = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        void Walk(string taskId)
+        {
+            if (!seen.Add(taskId))
+            {
+                return;
+            }
+
+            owned.Add(taskId);
+            if (childrenByParent.TryGetValue(taskId, out var children))
+            {
+                foreach (var child in children)
+                {
+                    Walk(child.TaskId);
+                }
+            }
+        }
+
+        if (snapshot.Tasks.Any(task => StringComparer.Ordinal.Equals(task.TaskId, originTaskId)))
+        {
+            Walk(originTaskId);
+        }
+
+        owned.Sort(StringComparer.Ordinal);
+        return owned;
+    }
+
+    public static IReadOnlyList<string> CascadeOwnedChildRunIds(string originTaskId, SchedulerSnapshot snapshot)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(originTaskId);
+        ArgumentNullException.ThrowIfNull(snapshot);
+        var origin = snapshot.Tasks.FirstOrDefault(task => StringComparer.Ordinal.Equals(task.TaskId, originTaskId));
+        if (origin is null)
+        {
+            return [];
+        }
+
+        var ownedTasks = new HashSet<string>(CascadeOwnedTaskIds(originTaskId, snapshot), StringComparer.Ordinal);
+        var direct = snapshot.Runs
+            .Where(run =>
+                !StringComparer.Ordinal.Equals(run.RunId, origin.RunId) &&
+                snapshot.Tasks.Any(task =>
+                    StringComparer.Ordinal.Equals(task.RunId, run.RunId) &&
+                    task.ParentTaskId is not null &&
+                    ownedTasks.Contains(task.ParentTaskId)))
+            .Select(run => run.RunId)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray();
+        var all = new List<string>();
+        foreach (var runId in direct)
+        {
+            all.AddRange(CascadeRunIds(runId, snapshot));
+        }
+
+        return all.Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToArray();
     }
 
     public static IReadOnlyList<string> CascadeAttemptIds(IReadOnlyList<string> taskIds, SchedulerSnapshot snapshot)

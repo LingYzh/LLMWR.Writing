@@ -84,6 +84,10 @@ internal static class Wp12ContractTests
             IpcJsonContext.Default.CreateRunRequestEnvelope,
             "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"createRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"workflowRunId\":\"wf-1\",\"role\":\"pm\"}}");
         AssertGolden(
+            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.CreateRun, new CreateRunRequest("wf-1", "pm", "run-parent", null)),
+            IpcJsonContext.Default.CreateRunRequestEnvelope,
+            "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"createRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"workflowRunId\":\"wf-1\",\"role\":\"pm\",\"parentRunId\":\"run-parent\"}}");
+        AssertGolden(
             Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.CreateRun, new CreateRunResponse("run-1", 0, "created")),
             IpcJsonContext.Default.CreateRunResponseEnvelope,
             "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"createRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"runId\":\"run-1\",\"depth\":0,\"status\":\"created\"}}");
@@ -174,9 +178,9 @@ internal static class Wp12ContractTests
             IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
             "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"spawnChildRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"parentRunId\":\"run-1\",\"parentTaskId\":\"task-1\",\"role\":\"writer\"}}");
         AssertGolden(
-            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.SpawnChildRun, new SpawnChildRunResponse("queued", null, 1, null)),
+            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.SpawnChildRun, new SpawnChildRunResponse("queued", "run-2", 1, null)),
             IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
-            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"spawnChildRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"outcome\":\"queued\",\"depth\":1}}");
+            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"spawnChildRun\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"outcome\":\"queued\",\"childRunId\":\"run-2\",\"depth\":1}}");
     }
 
     private static void SpawnRequestDoesNotCarryPrincipalSelectors()

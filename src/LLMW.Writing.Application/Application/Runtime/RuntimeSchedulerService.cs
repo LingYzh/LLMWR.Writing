@@ -50,6 +50,11 @@ public sealed class RuntimeSchedulerService
 
     public RuntimeResult<DurableRunRecord> CreateRun(string workflowRunId, string role, string? parentRunId, string? runId)
     {
+        if (!string.IsNullOrWhiteSpace(parentRunId))
+        {
+            return RuntimeResults.Fail<DurableRunRecord>(RuntimeError.SpawnDenied, "createRun-is-root-only");
+        }
+
         if (store.GetWorkflowRun(workflowRunId) is null)
         {
             return RuntimeResults.Fail<DurableRunRecord>(RuntimeError.NotFound, "workflow");
@@ -57,30 +62,13 @@ public sealed class RuntimeSchedulerService
 
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
         var id = string.IsNullOrWhiteSpace(runId) ? Guid.NewGuid().ToString("D") : runId;
-        var depth = DelegationDepth.RootDepth;
-        if (!string.IsNullOrWhiteSpace(parentRunId))
-        {
-            var parent = store.GetRun(parentRunId);
-            if (parent is null)
-            {
-                return RuntimeResults.Fail<DurableRunRecord>(RuntimeError.NotFound, "parent-run");
-            }
-
-            if (!DelegationDepth.CanSpawnFrom(parent.Depth))
-            {
-                return RuntimeResults.Fail<DurableRunRecord>(RuntimeError.DepthLimit, "depth-5");
-            }
-
-            depth = DelegationDepth.ChildDepth(parent.Depth);
-        }
-
         var run = new DurableRunRecord(
             id,
             workflowRunId,
-            parentRunId,
+            null,
             role,
             RunStatusCodec.ToDurableValue(RunStatus.Created),
-            depth,
+            DelegationDepth.RootDepth,
             now,
             now);
         return RuntimeResults.Success(store.InsertRun(run));
@@ -206,27 +194,37 @@ public sealed class RuntimeSchedulerService
     public RuntimeResult<CancelRuntimeScopeResponseModel> CancelScope(string scopeKind, string scopeId)
     {
         var snapshot = store.LoadSnapshot();
-        IReadOnlyList<string> runIds = scopeKind switch
-        {
-            "workflowRun" => snapshot.Runs
-                .Where(run => StringComparer.Ordinal.Equals(run.WorkflowRunId, scopeId))
-                .Select(run => run.RunId)
-                .ToArray(),
-            "run" => CancellationCascade.CascadeRunIds(scopeId, snapshot),
-            "task" => snapshot.Tasks.Any(task => StringComparer.Ordinal.Equals(task.TaskId, scopeId))
-                ? [snapshot.Tasks.First(task => StringComparer.Ordinal.Equals(task.TaskId, scopeId)).RunId]
-                : [],
-            _ => []
-        };
-        if (runIds.Count == 0)
-        {
-            return RuntimeResults.Success(new CancelRuntimeScopeResponseModel(true, []));
-        }
-
-        var taskIds = CancellationCascade.CascadeTaskIds(runIds, snapshot);
+        IReadOnlyList<string> runIds;
+        IReadOnlyList<string> taskIds;
         if (scopeKind == "task")
         {
-            taskIds = [scopeId];
+            if (!snapshot.Tasks.Any(task => StringComparer.Ordinal.Equals(task.TaskId, scopeId)))
+            {
+                return RuntimeResults.Success(new CancelRuntimeScopeResponseModel(true, []));
+            }
+
+            taskIds = CancellationCascade.CascadeOwnedTaskIds(scopeId, snapshot);
+            runIds = CancellationCascade.CascadeOwnedChildRunIds(scopeId, snapshot);
+            var descendantTasks = CancellationCascade.CascadeTaskIds(runIds, snapshot);
+            taskIds = taskIds.Concat(descendantTasks).Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToArray();
+        }
+        else
+        {
+            runIds = scopeKind switch
+            {
+                "workflowRun" => snapshot.Runs
+                    .Where(run => StringComparer.Ordinal.Equals(run.WorkflowRunId, scopeId))
+                    .Select(run => run.RunId)
+                    .ToArray(),
+                "run" => CancellationCascade.CascadeRunIds(scopeId, snapshot),
+                _ => []
+            };
+            if (runIds.Count == 0)
+            {
+                return RuntimeResults.Success(new CancelRuntimeScopeResponseModel(true, []));
+            }
+
+            taskIds = CancellationCascade.CascadeTaskIds(runIds, snapshot);
         }
 
         var attemptIds = CancellationCascade.CascadeAttemptIds(taskIds, snapshot);
@@ -369,9 +367,14 @@ public sealed class RuntimeSchedulerService
             return RuntimeResults.Fail<WorkerLaunchResult>(RuntimeError.NotFound, "identity-mismatch");
         }
 
-        if (RunStatusCodec.TryParse(run.Status, out var runStatus) && runStatus == RunStatus.Cancelled)
+        if (!RunStatusCodec.TryParse(run.Status, out var runStatus) ||
+            !TaskStatusCodec.TryParse(task.Status, out var taskStatus) ||
+            !AttemptStatusCodec.TryParse(attempt.Status, out var attemptStatus) ||
+            runStatus != RunStatus.Starting ||
+            taskStatus != RuntimeTaskStatus.Running ||
+            attemptStatus != AttemptStatus.Starting)
         {
-            return RuntimeResults.Fail<WorkerLaunchResult>(RuntimeError.Cancelled);
+            return RuntimeResults.Fail<WorkerLaunchResult>(RuntimeError.IllegalTransition, "dispatch-reservation-required");
         }
 
         if (workers.Snapshot().Any(item => item.Alive && StringComparer.Ordinal.Equals(item.RunId, runId)))
@@ -559,6 +562,25 @@ public sealed class RuntimeSchedulerService
             return RuntimeResults.Fail<SpawnChildRunResponseModel>(RuntimeError.NotFound, "parent-run");
         }
 
+        var parentTask = store.GetTask(parentTaskId);
+        if (parentTask is null)
+        {
+            return RuntimeResults.Fail<SpawnChildRunResponseModel>(RuntimeError.NotFound, "parent-task");
+        }
+
+        if (!StringComparer.Ordinal.Equals(parentTask.RunId, parentRunId))
+        {
+            return RuntimeResults.Fail<SpawnChildRunResponseModel>(RuntimeError.SpawnDenied, "parent-task-scope");
+        }
+
+        if (TaskStatusCodec.TryParse(parentTask.Status, out var parentTaskStatus) &&
+            parentTaskStatus is RuntimeTaskStatus.Cancelled or RuntimeTaskStatus.Completed)
+        {
+            return RuntimeResults.Fail<SpawnChildRunResponseModel>(
+                parentTaskStatus == RuntimeTaskStatus.Cancelled ? RuntimeError.Cancelled : RuntimeError.SpawnDenied,
+                "parent-task");
+        }
+
         var parentCancelled = RunStatusCodec.TryParse(parent.Status, out var parentStatus) &&
                               parentStatus == RunStatus.Cancelled;
         var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(store.ToolCallsFor(parentRunId, parentTaskId), parentTaskId);
@@ -589,18 +611,50 @@ public sealed class RuntimeSchedulerService
             return RuntimeResults.Fail<SpawnChildRunResponseModel>(error, decision.Denial.ToString());
         }
 
-        if (decision.Outcome == SpawnOutcomeKind.Queued)
-        {
-            return RuntimeResults.Success(new SpawnChildRunResponseModel("queued", null, decision.DerivedDepth, null));
-        }
-
-        var created = CreateRun(parent.WorkflowRunId, role, parentRunId, null);
+        var status = decision.Outcome == SpawnOutcomeKind.Queued ? RunStatus.Queued : RunStatus.Created;
+        var created = CreateChildRunAfterAuthorizedSpawn(parent, role, decision.DerivedDepth!.Value, status, parentTaskId);
         if (!created.Succeeded || created.Value is null)
         {
             return RuntimeResults.Fail<SpawnChildRunResponseModel>(created.Failure?.Code ?? RuntimeError.NotFound, created.Failure?.Detail);
         }
 
-        return RuntimeResults.Success(new SpawnChildRunResponseModel("spawned", created.Value.RunId, created.Value.Depth, null));
+        var outcome = decision.Outcome == SpawnOutcomeKind.Queued ? "queued" : "spawned";
+        return RuntimeResults.Success(new SpawnChildRunResponseModel(outcome, created.Value.RunId, created.Value.Depth, null));
+    }
+
+    private RuntimeResult<DurableRunRecord> CreateChildRunAfterAuthorizedSpawn(
+        DurableRunRecord parent,
+        string role,
+        int derivedDepth,
+        RunStatus status,
+        string parentTaskId)
+    {
+        var now = clock.UtcNow.ToUnixTimeMilliseconds();
+        var run = new DurableRunRecord(
+            Guid.NewGuid().ToString("D"),
+            parent.WorkflowRunId,
+            parent.RunId,
+            role,
+            RunStatusCodec.ToDurableValue(status),
+            derivedDepth,
+            now,
+            now);
+        DurableRunRecord stored = run;
+        store.InTransaction(() =>
+        {
+            stored = store.InsertRun(run);
+            var taskStatus = RuntimeTaskStatus.Ready;
+            store.InsertTask(new DurableTaskRecord(
+                Guid.NewGuid().ToString("D"),
+                stored.RunId,
+                parentTaskId,
+                "spawned",
+                TaskStatusCodec.ToDurableValue(taskStatus),
+                1,
+                now,
+                now));
+        });
+        return RuntimeResults.Success(stored);
     }
 
     public void RecordUnknownToolCall(string runId, string taskId, string toolName)

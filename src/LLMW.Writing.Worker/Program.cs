@@ -35,6 +35,10 @@ internal static class Program
         var pipeName = Environment.GetEnvironmentVariable("LLMW_WORKER_PIPE_NAME")
             ?? throw new InvalidOperationException("Worker requires LLMW_WORKER_PIPE_NAME.");
         var runId = Environment.GetEnvironmentVariable("LLMW_RUN_ID");
+        if (string.IsNullOrWhiteSpace(runId))
+        {
+            throw new InvalidOperationException("Sandboxed Worker requires LLMW_RUN_ID.");
+        }
 
         var client = new NamedPipeClientStream(
             ".",
@@ -51,22 +55,9 @@ internal static class Program
                 shutdown.Token)
             .ConfigureAwait(false);
 
-        if (!string.IsNullOrWhiteSpace(runId))
-        {
-            try
-            {
-                await session.RequestAsync(
-                        IpcSemanticTypes.CreateRunSession,
-                        new CreateRunSessionRequest(runId, null),
-                        IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
-                        IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
-                        shutdown.Token)
-                    .ConfigureAwait(false);
-            }
-            catch (IpcProtocolException)
-            {
-            }
-        }
+        var issued = await WorkerSessionBootstrap.EstablishAsync(session, runId, shutdown.Token).ConfigureAwait(false);
+        var retainedOpaqueToken = issued.OpaqueToken;
+        _ = retainedOpaqueToken;
 
         await Task.Delay(Timeout.InfiniteTimeSpan, shutdown.Token).ConfigureAwait(false);
     }

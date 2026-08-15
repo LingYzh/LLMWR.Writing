@@ -90,6 +90,11 @@ public sealed class RuntimeIpcCommandHandler : IIpcApplicationCommandHandler
     private IpcApplicationCommandResult CreateRun(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.CreateRunRequest);
+        if (!string.IsNullOrWhiteSpace(request.ParentRunId))
+        {
+            return Error(context, IpcErrorCodes.AgentSpawnDenied, "createRun creates root Runs only; child Runs require spawnChildRun.");
+        }
+
         var result = scheduler.CreateRun(request.WorkflowRunId, request.Role, request.ParentRunId, request.RunId);
         return result.Succeeded && result.Value is not null
             ? Respond(context, new CreateRunResponse(result.Value.RunId, result.Value.Depth, result.Value.Status), IpcJsonContext.Default.CreateRunResponseEnvelope)

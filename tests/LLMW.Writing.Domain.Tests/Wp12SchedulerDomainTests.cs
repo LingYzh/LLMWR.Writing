@@ -27,6 +27,8 @@ internal static partial class Program
         Run(nameof(UnknownSideEffectBlocksAutomaticRetry), UnknownSideEffectBlocksAutomaticRetry);
         Run(nameof(RequiredUnsatisfiedDependencyBlocksDispatch), RequiredUnsatisfiedDependencyBlocksDispatch);
         Run(nameof(DepthSpoofIsRejectedWithoutClamping), DepthSpoofIsRejectedWithoutClamping);
+        Run(nameof(FailedAndPausedTasksAreNotReadyAfterRebuild), FailedAndPausedTasksAreNotReadyAfterRebuild);
+        Run(nameof(TaskCancelCascadeOwnsDescendantsWithoutTheContainingRun), TaskCancelCascadeOwnsDescendantsWithoutTheContainingRun);
     }
 
     private static void ReadyQueueOrdersByPriorityThenStableCreationThenTaskId()
@@ -306,8 +308,60 @@ internal static partial class Program
         AssertEqual(SpawnOutcomeKind.Allowed, legal.Outcome, "Derived depth 4 must be allowed.");
     }
 
-    private static DurableTaskRecord Task(string id, int priority, long created, string status = "ready", string runId = "run") =>
-        new(id, runId, null, "write", status, priority, created, created);
+    private static void FailedAndPausedTasksAreNotReadyAfterRebuild()
+    {
+        var snapshot = Snapshot(
+            [Run("root", null, 0, "running")],
+            [
+                Task("failed", 9, 1, "failed", "root"),
+                Task("paused", 8, 2, "paused", "root"),
+                Task("ready", 1, 3, "ready", "root"),
+                Task("pending", 1, 4, "pending", "root"),
+                Task("blocked-status", 1, 5, "blocked", "root"),
+                Task("done", 9, 6, "completed", "root"),
+                Task("cancelled", 9, 7, "cancelled", "root"),
+                Task("struct-blocked", 1, 8, "pending", "root")
+            ],
+            dependencies:
+            [
+                new DurableDependencyRecord("dep-1", "struct-blocked", "ready", "required", "unsatisfied")
+            ]);
+        var view = SchedulerProjection.Rebuild(snapshot, ConcurrencyBudget.Default);
+        AssertTrue(!view.ReadyTaskIds.Contains("failed"), "Failed tasks must not become READY on rebuild.");
+        AssertTrue(!view.ReadyTaskIds.Contains("paused"), "Paused tasks must not become READY on rebuild.");
+        AssertTrue(!view.ReadyTaskIds.Contains("done"), "Completed tasks must never requeue.");
+        AssertTrue(!view.ReadyTaskIds.Contains("cancelled"), "Cancelled tasks must never requeue.");
+        AssertTrue(view.BlockedTaskIds.Contains("struct-blocked"), "Structurally blocked tasks must remain blocked.");
+        AssertEqual("ready,pending,blocked-status", string.Join(',', view.ReadyTaskIds),
+            "Ready/Pending/structurally-unblocked Blocked may enqueue; Failed/Paused must not.");
+        var again = SchedulerProjection.Rebuild(snapshot, ConcurrencyBudget.Default);
+        AssertEqual(string.Join(',', view.ReadyTaskIds), string.Join(',', again.ReadyTaskIds), "Rebuild ordering must stay deterministic.");
+    }
+
+    private static void TaskCancelCascadeOwnsDescendantsWithoutTheContainingRun()
+    {
+        var snapshot = Snapshot(
+            [
+                Run("root", null, 0, "running"),
+                Run("owned-child", "root", 1, "running"),
+                Run("unrelated", null, 0, "running")
+            ],
+            [
+                Task("t-a", 1, 1, "running", "root"),
+                Task("t-b", 1, 2, "ready", "root"),
+                Task("t-owned", 1, 3, "ready", "owned-child", "t-a"),
+                Task("t-unrelated", 1, 4, "ready", "unrelated")
+            ]);
+        var ownedTasks = CancellationCascade.CascadeOwnedTaskIds("t-a", snapshot);
+        AssertTrue(ownedTasks.Contains("t-a") && ownedTasks.Contains("t-owned") && !ownedTasks.Contains("t-b"),
+            "Task cancel ownership must follow durable parent_task_id only.");
+        var ownedRuns = CancellationCascade.CascadeOwnedChildRunIds("t-a", snapshot);
+        AssertTrue(ownedRuns.Contains("owned-child") && !ownedRuns.Contains("root") && !ownedRuns.Contains("unrelated"),
+            "Task cancel must not treat the containing Run as cancelled.");
+    }
+
+    private static DurableTaskRecord Task(string id, int priority, long created, string status = "ready", string runId = "run", string? parentTaskId = null) =>
+        new(id, runId, parentTaskId, "write", status, priority, created, created);
 
     private static DurableRunRecord Run(string id, string? parent, int depth, string status, string workflow = "wf-1") =>
         new(id, workflow, parent, "pm", status, depth, 1, 1);
