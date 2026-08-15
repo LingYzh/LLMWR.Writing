@@ -12,6 +12,6 @@
 5. **队列**：critical outbound 64（响应/控制/心跳/取消，满则 fail-closed，不静默丢）；snapshot outbound 8；in-flight request 32。事件不走无界队列。
 6. **RunSession TTL**：DefaultTtl=1h，MaximumTtl=8h。`ExpiresAtMs` 仅为调用方上限；`actual = min(requested or now+Default, now+Maximum)`。调用方不能用巨大时间戳换更长会话。
 7. **可信绑定**：`AuthenticatedChannelContext` 只来自 Core 拥有的 `ITrustedIpcBindingRegistry`。无 launch record 则 CreateRunSession **fail-closed**。禁止把 envelope/Hello 的 run/worker/project/role 当授权真相。
-8. **Bootstrap**：同进程首次 Hello 成功后轮换内存 secret，经 HelloAck 下发；每端点最多一条已认证连接。Core 重启后环境 token 重新生效。客户端不得自动重放业务 mutation。
+8. **Bootstrap**：Hello 成功后签发一代 pending 轮换凭证，经 HelloAck 下发；客户端首个 post-Hello 帧才提交轮换。HelloAck 丢失可凭原 current 或未确认 pending 重连，不得保留无限旧 token。每端点最多一条已认证连接。Core 重启后环境 token 重新生效。客户端不得自动重放业务 mutation。
 9. **取消**：best-effort；COMMIT 后不得声称 rollback。
 10. **CF-001** 保持 OPEN / WP22。

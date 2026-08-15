@@ -16,7 +16,8 @@ internal static partial class Program
         await MalformedJsonAndMidFrameDisconnectRecoverAsync();
         await CoreRestartForcesEventStreamResyncAsync();
         await ProductionCoreRefusesSessionWithoutTrustedBindingAsync();
-        Console.WriteLine("WP11 IPC integration tests passed (6).");
+        await ProductionReconnectClientRestoresSnapshotAndNewEpochAsync();
+        Console.WriteLine("WP11 IPC integration tests passed (7).");
     }
 
     private static async Task FullIpcSnapshotMultiplexAndUnknownTypeAsync()
@@ -275,6 +276,112 @@ internal static partial class Program
         {
             StopCore(core);
         }
+    }
+
+    private static async Task ProductionReconnectClientRestoresSnapshotAndNewEpochAsync()
+    {
+        var workspaceInstanceId = $"wp11-reconnect-{Guid.NewGuid():N}";
+        var bootstrapToken = IpcBootstrapToken.Create();
+        using var testTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        using var firstCore = StartCore(workspaceInstanceId, IpcBootstrapToken.Create(), bootstrapToken);
+        Process? restarted = null;
+        var recovery = new LLMW.Writing.Application.Ipc.IpcTransportRecovery();
+        var reconnect = new LLMW.Writing.Application.Ipc.IpcReconnectClient(
+            async cancellationToken =>
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    var client = new NamedPipeClientStream(
+                        ".",
+                        IpcPipeNames.Runtime(workspaceInstanceId),
+                        PipeDirection.InOut,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                    try
+                    {
+                        await client.ConnectAsync(cancellationToken).WaitAsync(TimeSpan.FromMilliseconds(500), cancellationToken);
+                        return client;
+                    }
+                    catch (Exception exception) when (
+                        exception is IOException or TimeoutException ||
+                        (exception is OperationCanceledException && !cancellationToken.IsCancellationRequested))
+                    {
+                        await client.DisposeAsync();
+                        await Task.Delay(50, cancellationToken);
+                    }
+                }
+
+                throw new OperationCanceledException(cancellationToken);
+            },
+            workspaceInstanceId,
+            bootstrapToken,
+            IpcClientKind.AgentRuntime,
+            TimeSpan.FromMilliseconds(200),
+            recovery);
+        var run = Task.Run(() => reconnect.RunAsync(testTimeout.Token), testTimeout.Token);
+        try
+        {
+            await WaitUntilAsync(
+                () => recovery.RestoreCount >= 1 && !string.IsNullOrWhiteSpace(recovery.LastEventStreamId),
+                "Production IpcReconnectClient must GetStateSnapshot and SubscribeEvents after Hello.",
+                testTimeout.Token);
+            AssertEqual(0L, recovery.LastKnownSeq, "First Core snapshot watermark must be 0.");
+            var firstEpoch = recovery.LastEventStreamId!;
+            var restores = recovery.RestoreCount;
+            AssertTrue(
+                !IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.SearchNarrative),
+                "Reconnect must not treat business mutations as safe automatic recovery.");
+
+            StopCore(firstCore);
+            restarted = StartCore(workspaceInstanceId, IpcBootstrapToken.Create(), bootstrapToken);
+            await WaitUntilAsync(
+                () => recovery.RestoreCount > restores &&
+                      !string.IsNullOrWhiteSpace(recovery.LastEventStreamId) &&
+                      !StringComparer.Ordinal.Equals(recovery.LastEventStreamId, firstEpoch),
+                "Core restart must force IpcReconnectClient to restore against a new event-stream epoch.",
+                testTimeout.Token);
+            AssertEqual(0L, recovery.LastKnownSeq, "A new Core epoch must not compare previous seq values as continuity.");
+        }
+        finally
+        {
+            testTimeout.Cancel();
+            try
+            {
+                await run.WaitAsync(TimeSpan.FromSeconds(3));
+            }
+            catch (TimeoutException)
+            {
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (AggregateException)
+            {
+            }
+
+            StopCore(firstCore);
+            if (restarted is not null)
+            {
+                StopCore(restarted);
+                restarted.Dispose();
+            }
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, string message, CancellationToken cancellationToken)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (DateTime.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (condition())
+            {
+                return;
+            }
+
+            await Task.Delay(50, cancellationToken);
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private static async Task<NamedPipeClientStream> ConnectRuntimeAsync(string workspaceInstanceId, CancellationToken cancellationToken)

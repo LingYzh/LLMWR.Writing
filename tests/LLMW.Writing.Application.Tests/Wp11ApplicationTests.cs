@@ -1,4 +1,5 @@
 ﻿using System.Globalization;
+using System.Threading.Channels;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
@@ -33,8 +34,14 @@ internal static class Wp11ApplicationTests
         AgentCommandsResolveSessionAndRejectStolenRevokedExpiredProofs();
         StaleSessionAfterDisconnectIsRevoked();
         RuntimeCannotBecomeUserInteractive();
-        Console.WriteLine("Application WP11 IPC tests passed (16).");
-        return 16;
+        BootstrapBadTokenDoesNotRotate();
+        BootstrapAckLossRecoversWithoutCoreRestart();
+        BootstrapRejectsConcurrentAuthenticatedConnection();
+        ClientEventBufferOverflowIsExplicitAndRecoverable();
+        StalledNonReadingPeerUnblocksEndpoint();
+        ProductionReconnectSnapshotSubscribeGapAndEpoch();
+        Console.WriteLine("Application WP11 IPC tests passed (22).");
+        return 22;
     }
 
     private static void TtlPolicyClampsHugeExpiryAndHonorsShorterRequest()
@@ -757,6 +764,393 @@ internal static class Wp11ApplicationTests
         });
     }
 
+    private static void BootstrapBadTokenDoesNotRotate()
+    {
+        var token = IpcBootstrapToken.Create();
+        var authenticator = new IpcBootstrapAuthenticator(token);
+        var rejected = authenticator.Authenticate(IpcBootstrapToken.Create(), IpcClientKind.AgentRuntime, IpcClientKind.AgentRuntime);
+        AssertEqual(false, rejected.Accepted, "A bad bootstrap token must be rejected.");
+        AssertEqual(false, authenticator.HasUnconfirmedRotation, "A bad token must not issue a pending rotation.");
+        var accepted = authenticator.Authenticate(token, IpcClientKind.AgentRuntime, IpcClientKind.AgentRuntime);
+        AssertEqual(true, accepted.Accepted, "The original secret must still authenticate after a rejected Hello.");
+        AssertEqual(true, authenticator.HasUnconfirmedRotation, "A successful Hello must issue a pending rotation.");
+        authenticator.Release();
+        var recovered = authenticator.Authenticate(token, IpcClientKind.AgentRuntime, IpcClientKind.AgentRuntime);
+        AssertEqual(true, recovered.Accepted, "An unconfirmed rotation must still accept the pre-Hello secret.");
+        authenticator.Confirm();
+        authenticator.Release();
+        var stale = authenticator.Authenticate(token, IpcClientKind.AgentRuntime, IpcClientKind.AgentRuntime);
+        AssertEqual(false, stale.Accepted, "The previous secret must be rejected after a committed rotation.");
+        var rotated = authenticator.Authenticate(recovered.RotatedToken!, IpcClientKind.AgentRuntime, IpcClientKind.AgentRuntime);
+        AssertEqual(true, rotated.Accepted, "The committed rotated secret must authenticate.");
+    }
+
+    private static void BootstrapAckLossRecoversWithoutCoreRestart()
+    {
+        var token = IpcBootstrapToken.Create();
+        var authenticator = new IpcBootstrapAuthenticator(token);
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = authenticator,
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D"))
+        };
+
+        RunRaw(options, stream =>
+        {
+            WriteHello(stream, token, 1, 1, IpcClientKind.AgentRuntime, CancellationToken.None);
+            WaitUntil(
+                () => authenticator.HasUnconfirmedRotation && authenticator.HasActiveConnection,
+                "Core must accept Hello before the client obtains HelloAck.");
+        });
+        AssertEqual(true, authenticator.HasUnconfirmedRotation, "ACK-loss must keep the one-generation pending credential.");
+        AssertEqual(false, authenticator.HasActiveConnection, "ACK-loss must release the endpoint reservation.");
+
+        RunHosted(token, options, async client =>
+        {
+            var snapshot = await client.RequestAsync(
+                IpcSemanticTypes.GetStateSnapshot,
+                new GetStateSnapshotRequest(0, null),
+                IpcJsonContext.Default.GetStateSnapshotRequestEnvelope,
+                IpcJsonContext.Default.GetStateSnapshotResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(false, snapshot.Payload.ResyncRequired, "The original secret must recover after HelloAck loss without a Core restart.");
+        });
+
+        try
+        {
+            RunHosted(token, options, _ => Task.CompletedTask);
+            throw new InvalidOperationException("The original secret must be invalid after a completed rotation.");
+        }
+        catch (IpcProtocolException exception)
+        {
+            AssertEqual(IpcErrorCodes.AuthBootstrapRejected, exception.ErrorCode, "Committed rotation must invalidate the previous secret.");
+        }
+    }
+
+    private static void BootstrapRejectsConcurrentAuthenticatedConnection()
+    {
+        var token = IpcBootstrapToken.Create();
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D"))
+        };
+
+        RunHosted(token, options, async client =>
+        {
+            var (left, right) = IpcConnectedStreamPair.Create();
+            using var secondTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var server = Task.Run(() => IpcServerSession.ServeAsync(left, options, secondTimeout.Token), secondTimeout.Token);
+            try
+            {
+                try
+                {
+                    await IpcClientSession.HandshakeAsync(
+                        right,
+                        Workspace,
+                        token,
+                        IpcClientKind.AgentRuntime,
+                        TimeSpan.FromMilliseconds(200),
+                        secondTimeout.Token);
+                    throw new InvalidOperationException("A second concurrent Hello must not authenticate.");
+                }
+                catch (IpcProtocolException exception)
+                {
+                    AssertEqual(IpcErrorCodes.AuthBootstrapReplay, exception.ErrorCode, "A second concurrent Hello must be AUTH_BOOTSTRAP_REPLAY.");
+                }
+            }
+            finally
+            {
+                secondTimeout.Cancel();
+                try
+                {
+                    await server;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (AggregateException)
+                {
+                }
+
+                left.Dispose();
+                right.Dispose();
+            }
+
+            var snapshot = await client.RequestAsync(
+                IpcSemanticTypes.GetStateSnapshot,
+                new GetStateSnapshotRequest(0, null),
+                IpcJsonContext.Default.GetStateSnapshotRequestEnvelope,
+                IpcJsonContext.Default.GetStateSnapshotResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(false, snapshot.Payload.ResyncRequired, "The first authenticated connection must remain usable.");
+        });
+    }
+
+    private static void ClientEventBufferOverflowIsExplicitAndRecoverable()
+    {
+        var token = IpcBootstrapToken.Create();
+        var ring = new IpcEventRing("stream-client-overflow");
+        RunHosted(token, new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = ring
+        }, async client =>
+        {
+            await client.RequestAsync(
+                IpcSemanticTypes.SubscribeEvents,
+                new SubscribeEventsRequest(ring.EventStreamId, 0),
+                IpcJsonContext.Default.SubscribeEventsRequestEnvelope,
+                IpcJsonContext.Default.SubscribeEventsResponseEnvelope,
+                CancellationToken.None);
+            for (var i = 0; i < IpcProtocol.ClientEventBufferCapacity + 8; i++)
+            {
+                ring.PublishNotice("fill", i.ToString(CultureInfo.InvariantCulture));
+            }
+
+            WaitUntil(() => client.HasEventDiscontinuity, "Saturating the client event buffer must record an explicit discontinuity.");
+
+            var snapshot = await client.RequestAsync(
+                IpcSemanticTypes.GetStateSnapshot,
+                new GetStateSnapshotRequest(0, ring.EventStreamId),
+                IpcJsonContext.Default.GetStateSnapshotRequestEnvelope,
+                IpcJsonContext.Default.GetStateSnapshotResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(ring.HeadSeq, snapshot.Payload.SnapshotSeq, "Snapshot responses must still progress after local overflow.");
+            var cancel = await client.CancelAsync(Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"), CancellationToken.None);
+            AssertEqual(CancelResponse.StateUnknown, cancel.State, "Cancel must still progress after local overflow.");
+
+            var seen = new List<long>();
+            while (client.Events.TryRead(out var wire))
+            {
+                if (wire.SemanticType != IpcSemanticTypes.CoreNotice)
+                {
+                    continue;
+                }
+
+                seen.Add(IpcJson.DeserializePayload(wire.Payload, IpcJsonContext.Default.CoreNoticeEvent).Seq);
+            }
+
+            AssertEqual(IpcProtocol.ClientEventBufferCapacity, seen.Count, "The client buffer must remain bounded.");
+            for (var i = 0; i < seen.Count; i++)
+            {
+                AssertEqual(i + 1L, seen[i], "Local overflow must not present a silent seq skip.");
+            }
+
+            AssertTrue(
+                !seen.Contains(IpcProtocol.ClientEventBufferCapacity + 1L),
+                "Later ordinary events must not be exposed as a continuous stream after local loss.");
+
+            var recovery = new IpcTransportRecovery();
+            await recovery.RestoreAsync(client, CancellationToken.None);
+            AssertEqual(false, client.HasEventDiscontinuity, "Snapshot/resubscribe must clear the local discontinuity.");
+            ring.PublishNotice("restored", "tail");
+            using var wait = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            IpcWireEnvelope delivered;
+            do
+            {
+                delivered = await client.Events.ReadAsync(wait.Token);
+            }
+            while (delivered.SemanticType != IpcSemanticTypes.CoreNotice);
+
+            var notice = IpcJson.DeserializePayload(delivered.Payload, IpcJsonContext.Default.CoreNoticeEvent);
+            AssertEqual(ring.HeadSeq, notice.Seq, "Snapshot/resubscribe must restore ordinary-event continuity.");
+        });
+    }
+
+    private static void StalledNonReadingPeerUnblocksEndpoint()
+    {
+        var token = IpcBootstrapToken.Create();
+        var authenticator = new IpcBootstrapAuthenticator(token);
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = authenticator,
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            WriteTimeout = TimeSpan.FromMilliseconds(IpcProtocol.WriteTimeoutMs),
+            DrainTimeout = TimeSpan.FromMilliseconds(IpcProtocol.DrainTimeoutMs)
+        };
+
+        var (left, right) = IpcConnectedStreamPair.Create(segmentCapacity: 1);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        using var sessionCts = new CancellationTokenSource();
+        var server = Task.Run(() => IpcServerSession.ServeAsync(left, options, sessionCts.Token), timeout.Token);
+        string? rotated = null;
+        try
+        {
+            WriteHello(right, token, 1, 1, IpcClientKind.AgentRuntime, timeout.Token);
+            var ack = IpcJson.Deserialize(
+                IpcFrameIO.ReadAsync(right, timeout.Token).GetAwaiter().GetResult(),
+                IpcJsonContext.Default.HelloAckEnvelope);
+            rotated = ack.Payload.RotatedBootstrapToken;
+            WriteHeartbeat(right, 1, timeout.Token);
+            WaitUntil(() => !authenticator.HasUnconfirmedRotation, "The stalled peer must first confirm rotation via a post-Hello frame.");
+            var started = DateTime.UtcNow;
+            sessionCts.Cancel();
+            try
+            {
+                server.WaitAsync(TimeSpan.FromSeconds(8)).GetAwaiter().GetResult();
+            }
+            catch (TimeoutException)
+            {
+                throw new InvalidOperationException("A non-reading peer must not hang writer shutdown beyond the bounded write/drain lifetime.");
+            }
+
+            AssertTrue(
+                DateTime.UtcNow - started < TimeSpan.FromSeconds(8),
+                "Connection shutdown must complete within the bounded write/drain window.");
+        }
+        finally
+        {
+            left.Dispose();
+            right.Dispose();
+        }
+
+        RunHosted(rotated!, options, async client =>
+        {
+            var snapshot = await client.RequestAsync(
+                IpcSemanticTypes.GetStateSnapshot,
+                new GetStateSnapshotRequest(0, null),
+                IpcJsonContext.Default.GetStateSnapshotRequestEnvelope,
+                IpcJsonContext.Default.GetStateSnapshotResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual(false, snapshot.Payload.ResyncRequired, "The endpoint must accept a subsequent connection after a stalled write is cancelled.");
+        });
+    }
+
+    private static void ProductionReconnectSnapshotSubscribeGapAndEpoch()
+    {
+        var token = IpcBootstrapToken.Create();
+        var ring = new IpcEventRing(Guid.NewGuid().ToString("D"));
+        var recorder = new RecordingCommandHandler();
+        var authenticator = new IpcBootstrapAuthenticator(token);
+        IpcServerOptions serveOptions = new()
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = authenticator,
+            EventRing = ring,
+            Commands = recorder
+        };
+        var incoming = System.Threading.Channels.Channel.CreateUnbounded<Stream>();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+        Stream? currentServer = null;
+        var accept = Task.Run(async () =>
+        {
+            while (!timeout.IsCancellationRequested)
+            {
+                var (left, right) = IpcConnectedStreamPair.Create();
+                currentServer = left;
+                incoming.Writer.TryWrite(right);
+                try
+                {
+                    await IpcServerSession.ServeAsync(left, serveOptions, timeout.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (IOException)
+                {
+                }
+                finally
+                {
+                    left.Dispose();
+                }
+            }
+        }, timeout.Token);
+
+        var recovery = new IpcTransportRecovery();
+        var reconnect = new IpcReconnectClient(
+            cancellationToken => incoming.Reader.ReadAsync(cancellationToken).AsTask(),
+            Workspace,
+            token,
+            IpcClientKind.AgentRuntime,
+            TimeSpan.FromMilliseconds(200),
+            recovery);
+        var run = Task.Run(() => reconnect.RunAsync(timeout.Token), timeout.Token);
+        try
+        {
+            WaitUntil(() => recovery.RestoreCount >= 1, "Production reconnect must snapshot and subscribe on first connect.");
+            AssertTrue(
+                StringComparer.Ordinal.Equals(ring.EventStreamId, recovery.LastEventStreamId),
+                "First restore must use the Core-owned epoch.");
+            AssertEqual(0L, recovery.LastKnownSeq, "Empty snapshot watermark must be 0.");
+
+            ring.PublishNotice("one", "1");
+            WaitUntil(() => recovery.LastKnownSeq >= 1, "Ordinary events must advance lastKnownSeq.");
+
+            var restores = recovery.RestoreCount;
+            var epoch = recovery.LastEventStreamId;
+            currentServer!.Dispose();
+            WaitUntil(() => recovery.RestoreCount > restores, "Reconnect on the same epoch must restore.");
+            AssertTrue(
+                StringComparer.Ordinal.Equals(epoch, recovery.LastEventStreamId),
+                "Same-process reconnect must keep the event-stream epoch.");
+            AssertTrue(recovery.LastKnownSeq >= 1, "Reconnect snapshot must keep the trusted watermark.");
+
+            restores = recovery.RestoreCount;
+            for (var i = 0; i < 300; i++)
+            {
+                ring.PublishNotice("flood", i.ToString(CultureInfo.InvariantCulture));
+            }
+
+            WaitUntil(
+                () => recovery.RestoreCount > restores && recovery.LastKnownSeq == ring.HeadSeq,
+                "GapEvent must force snapshot/resubscribe.");
+            ring.PublishNotice("after-gap", "tail");
+            WaitUntil(() => recovery.LastKnownSeq == ring.HeadSeq, "Continuity must resume after Gap recovery.");
+
+            var newRing = new IpcEventRing(Guid.NewGuid().ToString("D"));
+            serveOptions = new IpcServerOptions
+            {
+                WorkspaceInstanceId = Workspace,
+                ExpectedClientKind = IpcClientKind.AgentRuntime,
+                Bootstrap = authenticator,
+                EventRing = newRing,
+                Commands = recorder
+            };
+            restores = recovery.RestoreCount;
+            currentServer!.Dispose();
+            WaitUntil(
+                () => recovery.RestoreCount > restores &&
+                      StringComparer.Ordinal.Equals(recovery.LastEventStreamId, newRing.EventStreamId),
+                "A new epoch must discard previous continuity and resync.");
+            AssertEqual(0L, recovery.LastKnownSeq, "A new epoch snapshot watermark must not compare previous seq values.");
+            AssertTrue(recorder.Kind is null, "Transport recovery must not auto-replay business mutations.");
+            AssertTrue(
+                !IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.SearchNarrative) &&
+                !IpcSemanticTypes.IsSafeToReplayAfterReconnect(IpcSemanticTypes.CreateRunSession),
+                "Business mutations are not in the safe automatic recovery catalog.");
+        }
+        finally
+        {
+            timeout.Cancel();
+            incoming.Writer.TryComplete();
+            try
+            {
+                accept.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+
+            try
+            {
+                run.Wait(TimeSpan.FromSeconds(2));
+            }
+            catch (AggregateException)
+            {
+            }
+        }
+    }
+
     private static AuthenticatedChannelContext Channel() =>
         new("channel-1", AuthenticatedClientKind.AgentRuntime, "worker-1", Scope);
 
@@ -844,6 +1238,37 @@ internal static class Wp11ApplicationTests
                 cancellationToken)
             .GetAwaiter()
             .GetResult();
+    }
+
+    private static void WriteHeartbeat(Stream stream, long sequence, CancellationToken cancellationToken)
+    {
+        var heartbeat = IpcEnvelopeFactory.Create(
+            IpcMessageType.Control,
+            IpcSemanticTypes.Heartbeat,
+            Workspace,
+            new Heartbeat(sequence));
+        IpcFrameIO.WriteAsync(
+                stream,
+                IpcJson.Serialize(heartbeat, IpcJsonContext.Default.HeartbeatEnvelope),
+                cancellationToken)
+            .GetAwaiter()
+            .GetResult();
+    }
+
+    private static void WaitUntil(Func<bool> condition, string message)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (condition())
+            {
+                return;
+            }
+
+            Thread.Sleep(20);
+        }
+
+        throw new InvalidOperationException(message);
     }
 
     private static IpcError ReadError(Stream stream, CancellationToken cancellationToken)

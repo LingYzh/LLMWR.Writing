@@ -31,6 +31,12 @@ public sealed class IpcServerOptions
     public TimeSpan HeartbeatTimeout { get; init; } =
         TimeSpan.FromMilliseconds(IpcProtocol.DefaultHeartbeatIntervalMs * IpcProtocol.MissedHeartbeatsBeforeEvict);
 
+    public TimeSpan WriteTimeout { get; init; } =
+        TimeSpan.FromMilliseconds(IpcProtocol.WriteTimeoutMs);
+
+    public TimeSpan DrainTimeout { get; init; } =
+        TimeSpan.FromMilliseconds(IpcProtocol.DrainTimeoutMs);
+
     public Func<string, Guid, CancellationToken, Task>? DelayAsync { get; init; }
 }
 
@@ -57,7 +63,7 @@ public static class IpcServerSession
     {
         private readonly Stream stream;
         private readonly IpcServerOptions options;
-        private readonly IpcOutboundScheduler scheduler = new();
+        private readonly IpcOutboundScheduler scheduler;
         private readonly IpcInFlightRegistry inFlight = new();
         private readonly object subscriberGate = new();
         private readonly CancellationTokenSource connectionLifetime = new();
@@ -75,6 +81,17 @@ public static class IpcServerSession
         {
             this.stream = stream;
             this.options = options;
+            scheduler = new IpcOutboundScheduler(options.WriteTimeout, options.DrainTimeout);
+            scheduler.Failed += () =>
+            {
+                try
+                {
+                    connectionLifetime.Cancel();
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            };
         }
 
         public async Task RunAsync(CancellationToken cancellationToken)
@@ -287,6 +304,12 @@ public static class IpcServerSession
                 {
                     TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.UnexpectedMessage, "The semantic type does not match messageType.", wire.SemanticType);
                     return;
+                }
+
+                if (wire.SemanticType is IpcSemanticTypes.Heartbeat or IpcSemanticTypes.Cancel ||
+                    wire.MessageType == IpcMessageType.Request)
+                {
+                    options.Bootstrap.Confirm();
                 }
 
                 if (wire.SemanticType == IpcSemanticTypes.Heartbeat)

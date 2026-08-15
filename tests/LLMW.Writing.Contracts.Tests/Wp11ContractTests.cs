@@ -330,6 +330,9 @@ internal static class Wp11ContractTests
     private static void GapSnapshotAndCancelGoldens()
     {
         Program.AssertEqual(256, IpcProtocol.SubscriberRingCapacity, "Subscriber ring capacity must remain 256.");
+        Program.AssertEqual(32, IpcProtocol.ClientEventBufferCapacity, "Client event buffer capacity must remain 32.");
+        Program.AssertEqual(2000, IpcProtocol.WriteTimeoutMs, "Outbound write timeout must remain 2000ms.");
+        Program.AssertEqual(2000, IpcProtocol.DrainTimeoutMs, "Fatal-error drain timeout must remain 2000ms.");
         Program.AssertEqual(1, IpcProtocol.FirstEventSequence, "First ordinary event seq must be 1.");
         Program.AssertEqual(0L, IpcProtocol.EmptySnapshotSequence, "Empty snapshot watermark must be 0.");
         Program.AssertTrue(IpcSemanticTypes.IsWellFormed(IpcSemanticTypes.Gap, IpcMessageType.Event), "GapEvent must be an event.");

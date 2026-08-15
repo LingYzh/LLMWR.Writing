@@ -14,6 +14,7 @@ public sealed record IpcOutboundFrame(IpcOutboundClass Class, byte[] Utf8Json, s
 /// <summary>
 /// Bounded traffic-class queues feeding a single serialized writer.
 /// Critical/snapshot saturation fails closed rather than silently dropping.
+/// Pipe writes are cancellable and time-bounded so a stalled peer cannot hang Core.
 /// </summary>
 public sealed class IpcOutboundScheduler : IAsyncDisposable
 {
@@ -35,8 +36,18 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
 
     private readonly SemaphoreSlim eventPulse = new(0, 1);
     private readonly CancellationTokenSource writerLifetime = new();
+    private readonly TimeSpan writeTimeout;
+    private readonly TimeSpan drainTimeout;
     private Task? writer;
     private int disposed;
+
+    public IpcOutboundScheduler(TimeSpan? writeTimeout = null, TimeSpan? drainTimeout = null)
+    {
+        this.writeTimeout = writeTimeout ?? TimeSpan.FromMilliseconds(IpcProtocol.WriteTimeoutMs);
+        this.drainTimeout = drainTimeout ?? TimeSpan.FromMilliseconds(IpcProtocol.DrainTimeoutMs);
+    }
+
+    public event Action? Failed;
 
     public bool TryEnqueueCritical(byte[] utf8Json, string semanticType) =>
         critical.Writer.TryWrite(new IpcOutboundFrame(IpcOutboundClass.Critical, utf8Json, semanticType));
@@ -80,7 +91,10 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
         {
             try
             {
-                await writer.ConfigureAwait(false);
+                await writer.WaitAsync(writeTimeout + drainTimeout).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
             }
             catch (OperationCanceledException)
             {
@@ -88,10 +102,16 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
             catch (IOException)
             {
             }
+            catch (ChannelClosedException)
+            {
+            }
         }
 
-        writerLifetime.Dispose();
-        eventPulse.Dispose();
+        if (writer is null || writer.IsCompleted)
+        {
+            writerLifetime.Dispose();
+            eventPulse.Dispose();
+        }
     }
 
     private async Task RunAsync(Stream stream, Func<byte[]?> tryPullEvent, CancellationToken cancellationToken)
@@ -105,13 +125,13 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
                 var wrote = false;
                 while (critical.Reader.TryRead(out var criticalFrame))
                 {
-                    await IpcFrameIO.WriteAsync(stream, criticalFrame.Utf8Json, CancellationToken.None).ConfigureAwait(false);
+                    await WriteFrameAsync(stream, criticalFrame.Utf8Json, writeTimeout, token).ConfigureAwait(false);
                     wrote = true;
                 }
 
                 while (snapshot.Reader.TryRead(out var snapshotFrame))
                 {
-                    await IpcFrameIO.WriteAsync(stream, snapshotFrame.Utf8Json, CancellationToken.None).ConfigureAwait(false);
+                    await WriteFrameAsync(stream, snapshotFrame.Utf8Json, writeTimeout, token).ConfigureAwait(false);
                     wrote = true;
                 }
 
@@ -125,7 +145,7 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
                     var eventPayload = tryPullEvent();
                     if (eventPayload is not null)
                     {
-                        await IpcFrameIO.WriteAsync(stream, eventPayload, CancellationToken.None).ConfigureAwait(false);
+                        await WriteFrameAsync(stream, eventPayload, writeTimeout, token).ConfigureAwait(false);
                         continue;
                     }
                 }
@@ -141,12 +161,68 @@ public sealed class IpcOutboundScheduler : IAsyncDisposable
                 await Task.WhenAny(waitCritical, waitSnapshot, waitEvent).ConfigureAwait(false);
             }
         }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        catch (OperationCanceledException)
+        {
+            if (!token.IsCancellationRequested)
+            {
+                NotifyFailed();
+            }
+        }
+        catch (IOException)
+        {
+            NotifyFailed();
+        }
+        catch (ChannelClosedException)
+        {
+            NotifyFailed();
+        }
+        finally
+        {
+            await DrainCriticalAsync(stream).ConfigureAwait(false);
+        }
+    }
+
+    private async Task DrainCriticalAsync(Stream stream)
+    {
+        using var drainLifetime = new CancellationTokenSource(drainTimeout);
+        try
         {
             while (critical.Reader.TryRead(out var criticalFrame))
             {
-                await IpcFrameIO.WriteAsync(stream, criticalFrame.Utf8Json, CancellationToken.None).ConfigureAwait(false);
+                await WriteFrameAsync(stream, criticalFrame.Utf8Json, drainTimeout, drainLifetime.Token)
+                    .ConfigureAwait(false);
             }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (IOException)
+        {
+        }
+        catch (ChannelClosedException)
+        {
+        }
+    }
+
+    private static async Task WriteFrameAsync(
+        Stream stream,
+        byte[] utf8,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        timeoutCts.CancelAfter(timeout);
+        await IpcFrameIO.WriteAsync(stream, utf8, timeoutCts.Token).ConfigureAwait(false);
+    }
+
+    private void NotifyFailed()
+    {
+        try
+        {
+            Failed?.Invoke();
+        }
+        catch (ObjectDisposedException)
+        {
         }
     }
 }

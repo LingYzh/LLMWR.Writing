@@ -25,8 +25,10 @@ Use current-user-only restriction and non-inheritable handles. One duplex connec
 - separate UI/Core and Runtime/Core secret.
 - rotate on reconnect/restart:
   - Core loads the launcher-provided secret at process start and clears the child environment.
-  - After a successful Hello, Core replaces the in-memory authenticator with a new CSPRNG secret and returns it as `HelloAck.rotatedBootstrapToken`.
-  - The previous in-memory secret is no longer accepted for that Core process.
+  - Rotation is **staged**, not committed at `Authenticate` time.
+  - A successful Hello **issues** `HelloAck.rotatedBootstrapToken` as a one-generation pending credential and reserves the endpoint (`activeConnections = 1`). The pre-Hello credential remains `current` until the client sends the first post-Hello frame (heartbeat, cancel, or request) on that connection, which **commits** the pending credential.
+  - If the connection dies before that confirmation, Core `Release`s the reservation without committing. The client may reconnect with the pre-Hello credential **or** the issued pending credential. A new Hello replaces the unused pending credential. This recovers HelloAck loss without keeping an unlimited old-token window.
+  - After a committed rotation, the previous current credential is no longer accepted.
   - Rotation happens only after protocol negotiation, bootstrap token comparison, and `clientKind` binding all succeed. A rejected Hello (wrong token, wrong `clientKind`, or no common protocol) must not consume or rotate the current secret.
   - A second concurrent Hello on the same endpoint is `AUTH_BOOTSTRAP_REPLAY` and disconnects.
   - After Core process restart the launcher-provided environment secret is loaded again. A client that still holds only a previous rotated token may retry **once** with the original launcher secret after `AUTH_BOOTSTRAP_REJECTED`; it must not treat that retry as a business-mutation replay.
@@ -111,6 +113,8 @@ Traffic classes:
 
 A slow event subscriber must not block Authority progress. Event flood must not starve responses, cancel, heartbeat, or snapshot.
 
+Outbound pipe writes use a bounded cancellable lifetime (`WriteTimeoutMs` = 2000). Connection shutdown cancels in-flight writes and best-effort-drains fatal protocol errors for at most `DrainTimeoutMs` = 2000, then disposes the connection so the endpoint can accept again. Authority publish never waits on a stalled peer.
+
 ## Cancellation
 
 Control `semanticType=cancel` payload `Cancel{correlationId}` is best effort. Response state is one of `unknown`, `cancelling`, `cancelled`, `alreadyCompleted`. It never claims rollback after Authority commit. Duplicate cancel is idempotent. Cancel of an unknown correlation returns `unknown` without disconnecting. Cancellation does not bypass final security rechecks.
@@ -138,6 +142,10 @@ connect → bootstrap authenticate → Hello/HelloAck (eventStreamId)
 ```
 
 If `lastEventStreamId` does not match the current epoch, Core sets `resyncRequired=true` and the client must not treat previous seq values as missing messages to replay. Snapshot payloads are typed transport DTOs, never Domain entities, and are not Authority Source of Truth.
+
+The production Runtime reconnect loop (`IpcReconnectClient`) must perform this snapshot/subscribe restore after every successful Hello. It must keep `lastKnownSeq` / `lastEventStreamId` across reconnects, treat `GapEvent` and local client-buffer overflow as `NeedsResync`, and must not present later ordinary events as a continuous stream until snapshot/resubscribe completes.
+
+Client event delivery uses a bounded buffer (`ClientEventBufferCapacity` = 32). The pipe reader must not `Wait` on that buffer. If an ordinary event cannot be retained, the client records an explicit local discontinuity (`NeedsResync`) rather than silently dropping a sequence number. Recovery is the same snapshot/resubscribe path. A slow application consumer must not block responses, heartbeat, cancel, or Authority publish.
 
 Safe automatic replay after reconnect: Hello, heartbeat, GetStateSnapshot, SubscribeEvents. Business mutations are not auto-replayed.
 

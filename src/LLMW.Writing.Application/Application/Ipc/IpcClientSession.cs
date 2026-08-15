@@ -19,13 +19,15 @@ public sealed class IpcClientSession : IAsyncDisposable
         });
     private readonly Dictionary<Guid, TaskCompletionSource<IpcWireEnvelope>> pending = [];
     private readonly Channel<IpcWireEnvelope> events = Channel.CreateBounded<IpcWireEnvelope>(
-        new BoundedChannelOptions(32)
+        new BoundedChannelOptions(IpcProtocol.ClientEventBufferCapacity)
         {
             SingleReader = true,
             SingleWriter = true,
-            FullMode = BoundedChannelFullMode.DropWrite
+            FullMode = BoundedChannelFullMode.Wait
         });
     private readonly object gate = new();
+    private readonly object discontinuityGate = new();
+    private bool hasEventDiscontinuity;
     private readonly CancellationTokenSource lifetime = new();
     private Task? reader;
     private Task? writer;
@@ -47,6 +49,19 @@ public sealed class IpcClientSession : IAsyncDisposable
     public string? RotatedBootstrapToken { get; private set; }
 
     public ChannelReader<IpcWireEnvelope> Events => events.Reader;
+
+    public bool HasEventDiscontinuity
+    {
+        get
+        {
+            lock (discontinuityGate)
+            {
+                return hasEventDiscontinuity;
+            }
+        }
+    }
+
+    public event Action? LocalEventOverflow;
 
     public static async Task<IpcClientSession> HandshakeAsync(
         Stream stream,
@@ -193,6 +208,18 @@ public sealed class IpcClientSession : IAsyncDisposable
         return IpcJson.DeserializePayload(wire.Payload, IpcJsonContext.Default.CancelResponse);
     }
 
+    public void BeginTrustedEventWindow()
+    {
+        lock (discontinuityGate)
+        {
+            hasEventDiscontinuity = false;
+        }
+
+        while (events.Reader.TryRead(out _))
+        {
+        }
+    }
+
     public void FailPendingAsDisconnected()
     {
         TaskCompletionSource<IpcWireEnvelope>[] waiters;
@@ -283,7 +310,7 @@ public sealed class IpcClientSession : IAsyncDisposable
                 var wire = IpcJson.DeserializeWire(frame);
                 if (wire.MessageType == IpcMessageType.Event)
                 {
-                    events.Writer.TryWrite(wire);
+                    DeliverEvent(wire);
                     continue;
                 }
 
@@ -365,6 +392,37 @@ public sealed class IpcClientSession : IAsyncDisposable
         {
             lifetime.Cancel();
         }
+    }
+
+    private void DeliverEvent(IpcWireEnvelope wire)
+    {
+        var ordinary = wire.SemanticType == IpcSemanticTypes.CoreNotice;
+        if (ordinary && HasEventDiscontinuity)
+        {
+            return;
+        }
+
+        if (events.Writer.TryWrite(wire))
+        {
+            return;
+        }
+
+        RecordLocalEventOverflow();
+    }
+
+    private void RecordLocalEventOverflow()
+    {
+        lock (discontinuityGate)
+        {
+            if (hasEventDiscontinuity)
+            {
+                return;
+            }
+
+            hasEventDiscontinuity = true;
+        }
+
+        LocalEventOverflow?.Invoke();
     }
 
     private void CompletePending(Guid requestId)

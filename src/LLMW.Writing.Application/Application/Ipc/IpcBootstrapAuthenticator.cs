@@ -6,12 +6,35 @@ public sealed class IpcBootstrapAuthenticator
 {
     private readonly object gate = new();
     private string current;
+    private string? pending;
     private int activeConnections;
 
     public IpcBootstrapAuthenticator(string initialToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(initialToken);
         current = initialToken;
+    }
+
+    public bool HasUnconfirmedRotation
+    {
+        get
+        {
+            lock (gate)
+            {
+                return pending is not null;
+            }
+        }
+    }
+
+    public bool HasActiveConnection
+    {
+        get
+        {
+            lock (gate)
+            {
+                return activeConnections > 0;
+            }
+        }
     }
 
     public BootstrapAuthResult Authenticate(string supplied, IpcClientKind clientKind, IpcClientKind expectedKind)
@@ -24,17 +47,31 @@ public sealed class IpcBootstrapAuthenticator
                 return BootstrapAuthResult.ReplayDetected();
             }
 
-            var tokenAccepted = IpcBootstrapToken.FixedTimeEquals(current, supplied);
             var kindAccepted = clientKind == expectedKind;
-            if (!tokenAccepted || !kindAccepted)
+            var currentAccepted = IpcBootstrapToken.FixedTimeEquals(current, supplied);
+            var pendingAccepted = pending is not null && IpcBootstrapToken.FixedTimeEquals(pending, supplied);
+            if (!kindAccepted || (!currentAccepted && !pendingAccepted))
             {
                 return BootstrapAuthResult.Rejected();
             }
 
-            var rotated = IpcBootstrapToken.Create();
-            current = rotated;
+            pending = IpcBootstrapToken.Create();
             activeConnections = 1;
-            return BootstrapAuthResult.Succeeded(rotated);
+            return BootstrapAuthResult.Succeeded(pending);
+        }
+    }
+
+    public void Confirm()
+    {
+        lock (gate)
+        {
+            if (pending is null)
+            {
+                return;
+            }
+
+            current = pending;
+            pending = null;
         }
     }
 

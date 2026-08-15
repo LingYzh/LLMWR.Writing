@@ -26,6 +26,9 @@ public static class IpcProtocol
     public const int ReconnectMaximumBackoffMs = 5000;
     public const int FirstEventSequence = 1;
     public const long EmptySnapshotSequence = 0;
+    public const int ClientEventBufferCapacity = 32;
+    public const int WriteTimeoutMs = 2000;
+    public const int DrainTimeoutMs = 2000;
 
     public static bool TryNegotiate(int clientMinimum, int clientMaximum, out int negotiatedVersion)
     {
