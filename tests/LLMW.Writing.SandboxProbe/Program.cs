@@ -19,6 +19,7 @@ internal static class Program
             return args[0] switch
             {
                 "whoami-token" => WhoamiToken(),
+                "whoami-desktop" => WhoamiDesktop(),
                 "argv" => Argv(args),
                 "print-env" => PrintEnv(),
                 "print-env-has" => PrintEnvHas(args),
@@ -56,6 +57,41 @@ internal static class Program
         };
         Console.WriteLine(JsonSerializer.Serialize(payload));
         return 0;
+    }
+
+    private static int WhoamiDesktop()
+    {
+        var station = GetProcessWindowStation();
+        var desktop = GetThreadDesktop(GetCurrentThreadId());
+        var payload = new Dictionary<string, object?>
+        {
+            ["windowStation"] = UserObjectName(station),
+            ["desktop"] = UserObjectName(desktop),
+            ["desktopPath"] = UserObjectName(station) + "\\" + UserObjectName(desktop)
+        };
+        Console.WriteLine(JsonSerializer.Serialize(payload));
+        return 0;
+    }
+
+    private static string UserObjectName(IntPtr handle)
+    {
+        GetUserObjectInformationW(handle, 2, IntPtr.Zero, 0, out var needed);
+        if (needed == 0)
+        {
+            return "";
+        }
+
+        var buffer = Marshal.AllocHGlobal((int)needed);
+        try
+        {
+            return GetUserObjectInformationW(handle, 2, buffer, needed, out _)
+                ? Marshal.PtrToStringUni(buffer) ?? ""
+                : "";
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
     }
 
     private static int Argv(string[] args)
@@ -471,6 +507,18 @@ internal static class Program
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetProcessWindowStation();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetThreadDesktop(uint threadId);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool GetUserObjectInformationW(IntPtr handle, int index, IntPtr information, uint length, out uint lengthNeeded);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);

@@ -83,8 +83,6 @@ internal sealed class WindowsRestrictedTokenFactory
 
         using (processToken)
         {
-            TryEnablePrivilege(processToken, "SeIncreaseQuotaPrivilege");
-            TryEnablePrivilege(processToken, "SeAssignPrimaryTokenPrivilege");
             using var adminSid = NativeSid.CreateWellKnown(NativeConstants.WinBuiltinAdministratorsSid);
             using var powerSid = NativeSid.CreateWellKnown(NativeConstants.WinBuiltinPowerUsersSid);
 

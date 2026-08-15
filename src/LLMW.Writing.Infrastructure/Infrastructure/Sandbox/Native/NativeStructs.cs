@@ -124,6 +124,13 @@ internal struct TOKEN_PRIVILEGES
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct LUID_AND_ATTRIBUTES
+{
+    public LUID Luid;
+    public uint Attributes;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct TOKEN_ELEVATION
 {
     public uint TokenIsElevated;

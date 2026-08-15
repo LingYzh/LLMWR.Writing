@@ -31,12 +31,13 @@ internal static class WindowsSandboxProcessLauncher
         SandboxExecutionRequest request,
         SandboxIdentity identity,
         string workDirectory,
+        string trustedProjectRoot,
         ISandboxFaultInjector faultInjector,
         bool grantInternetClient)
     {
         try
         {
-            using var live = LaunchLive(request, identity, workDirectory, faultInjector, grantInternetClient);
+            using var live = LaunchLive(request, identity, workDirectory, trustedProjectRoot, faultInjector, grantInternetClient);
             return WaitFor(live, request, identity);
         }
         catch (SandboxLayerException exception)
@@ -49,11 +50,12 @@ internal static class WindowsSandboxProcessLauncher
         SandboxExecutionRequest request,
         SandboxIdentity identity,
         string workDirectory,
+        string trustedProjectRoot,
         ISandboxFaultInjector faultInjector)
     {
         try
         {
-            using var live = LaunchLiveCore(request, identity, workDirectory, faultInjector, grantInternetClient: false, enableLpac: false, useRestrictedToken: true, useAppContainer: false);
+            using var live = LaunchLiveCore(request, identity, workDirectory, trustedProjectRoot, faultInjector, grantInternetClient: false, enableLpac: false, useRestrictedToken: true, useAppContainer: false);
             return WaitFor(live, request, identity);
         }
         catch (SandboxLayerException exception)
@@ -66,11 +68,12 @@ internal static class WindowsSandboxProcessLauncher
         SandboxExecutionRequest request,
         SandboxIdentity identity,
         string workDirectory,
+        string trustedProjectRoot,
         ISandboxFaultInjector faultInjector)
     {
         try
         {
-            using var live = LaunchLiveCore(request, identity, workDirectory, faultInjector, grantInternetClient: false, enableLpac: false, useRestrictedToken: false, useAppContainer: true);
+            using var live = LaunchLiveCore(request, identity, workDirectory, trustedProjectRoot, faultInjector, grantInternetClient: false, enableLpac: false, useRestrictedToken: false, useAppContainer: true);
             return WaitFor(live, request, identity);
         }
         catch (SandboxLayerException exception)
@@ -83,16 +86,18 @@ internal static class WindowsSandboxProcessLauncher
         SandboxExecutionRequest request,
         SandboxIdentity identity,
         string workDirectory,
+        string trustedProjectRoot,
         ISandboxFaultInjector faultInjector,
         bool grantInternetClient)
     {
-        return LaunchLiveCore(request, identity, workDirectory, faultInjector, grantInternetClient, enableLpac: false);
+        return LaunchLiveCore(request, identity, workDirectory, trustedProjectRoot, faultInjector, grantInternetClient, enableLpac: false);
     }
 
     private static LiveSandboxLaunch LaunchLiveCore(
         SandboxExecutionRequest request,
         SandboxIdentity identity,
         string workDirectory,
+        string trustedProjectRoot,
         ISandboxFaultInjector faultInjector,
         bool grantInternetClient,
         bool enableLpac,
@@ -113,11 +118,20 @@ internal static class WindowsSandboxProcessLauncher
             throw new SandboxLayerException(SandboxError.SecurityCapabilitiesFailed, "Injected SECURITY_CAPABILITIES failure.");
         }
 
+        if (faultInjector.Fault == SandboxFaultPoint.PrivilegeScopedEnable)
+        {
+            using (PrivilegeScope.EnableOnCurrentProcess("SeIncreaseQuotaPrivilege", faultInjector))
+            {
+            }
+        }
+
         var job = JobObjectController.CreateConfigured(request.EffectiveLimits, faultInjector);
         SafeAccessTokenHandle? restricted = null;
         SafeAccessTokenHandle? appContainerToken = null;
         SafeSidHandle? sidHandle = null;
+        RunCapability? runCapability = null;
         GCHandle capabilitiesHandle = default;
+        GCHandle capabilityEntriesHandle = default;
         var lpacPolicyMemory = IntPtr.Zero;
         SafeFileHandle? stdoutRead = null;
         SafeFileHandle? stdoutWrite = null;
@@ -136,8 +150,16 @@ internal static class WindowsSandboxProcessLauncher
             {
                 restricted = WindowsRestrictedTokenFactory.Create(faultInjector);
             }
-            GrantLaunchSurfaces(request.ExecutablePath, workDirectory, identity.AppContainerSid, faultInjector);
-            AppContainerAclManager.GrantInteractiveDesktop(identity.AppContainerSid, faultInjector);
+
+            var executable = SandboxToolStager.ResolveLaunchExecutable(
+                trustedProjectRoot,
+                request.ExecutablePath,
+                workDirectory,
+                identity.AppContainerSid,
+                faultInjector);
+            GrantWorkSurface(workDirectory, trustedProjectRoot, identity.AppContainerSid, request.Binding, faultInjector);
+            var windowStation = SandboxWindowStation.Ensure();
+            windowStation.GrantSandboxIdentity(identity.AppContainerSid, faultInjector);
             AppContainerNetworkIsolation.EnsureLoopbackNotExempt(identity.AppContainerSid, faultInjector);
             if (!NativeMethods.ConvertStringSidToSidW(identity.AppContainerSid, out var sid) || sid == IntPtr.Zero)
             {
@@ -145,11 +167,22 @@ internal static class WindowsSandboxProcessLauncher
             }
 
             sidHandle = new SafeSidHandle(sid, true, SidReleaseKind.LocalFree);
+            runCapability = RunCapability.Derive(request.Binding.ProjectScope.ProjectId, request.Binding.RunId);
+            GrantWorkCapability(workDirectory, runCapability.SidString, faultInjector);
+            var capabilityEntries = new SID_AND_ATTRIBUTES[]
+            {
+                new()
+                {
+                    Sid = runCapability.SidPointer,
+                    Attributes = NativeConstants.SE_GROUP_ENABLED
+                }
+            };
+            capabilityEntriesHandle = GCHandle.Alloc(capabilityEntries, GCHandleType.Pinned);
             var capabilities = new SECURITY_CAPABILITIES
             {
                 AppContainerSid = sidHandle.DangerousGetHandle(),
-                Capabilities = IntPtr.Zero,
-                CapabilityCount = 0
+                Capabilities = capabilityEntriesHandle.AddrOfPinnedObject(),
+                CapabilityCount = 1
             };
             capabilitiesHandle = GCHandle.Alloc(capabilities, GCHandleType.Pinned);
             var lpacPolicy = IntPtr.Zero;
@@ -170,12 +203,11 @@ internal static class WindowsSandboxProcessLauncher
                 stderrWrite.DangerousGetHandle()
             };
             handleList = GCHandle.Alloc(inheritHandles, GCHandleType.Pinned);
-            var executable = Path.GetFullPath(request.ExecutablePath);
             var flags = NativeConstants.CREATE_SUSPENDED |
                         NativeConstants.CREATE_UNICODE_ENVIRONMENT |
                         NativeConstants.CREATE_NO_WINDOW |
                         NativeConstants.EXTENDED_STARTUPINFO_PRESENT;
-            var desktop = Marshal.StringToHGlobalUni(@"winsta0\default");
+            var desktop = Marshal.StringToHGlobalUni(windowStation.DesktopPath);
             PROCESS_INFORMATION information;
             try
             {
@@ -260,6 +292,7 @@ internal static class WindowsSandboxProcessLauncher
             restricted?.Dispose();
             appContainerToken?.Dispose();
             sidHandle?.Dispose();
+            runCapability?.Dispose();
             attributes?.Dispose();
             if (handleList.IsAllocated)
             {
@@ -269,6 +302,11 @@ internal static class WindowsSandboxProcessLauncher
             if (capabilitiesHandle.IsAllocated)
             {
                 capabilitiesHandle.Free();
+            }
+
+            if (capabilityEntriesHandle.IsAllocated)
+            {
+                capabilityEntriesHandle.Free();
             }
 
             if (lpacPolicyMemory != IntPtr.Zero)
@@ -404,19 +442,23 @@ internal static class WindowsSandboxProcessLauncher
                 return true;
             }
 
-            errors.Add("RestrictedOnly CreateProcessAsUserW=" + restrictedOnlyAsUser);
-            if (TryCreateProcessWhileImpersonating(restricted, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var restrictedOnlyImpersonate))
-            {
-                LastSuccessfulLaunchPath = "RestrictedOnly Impersonate+CreateProcessW";
-                launchError = "";
-                return true;
-            }
-
-            launchError = string.Join(" | ", errors) + " | RestrictedOnly Impersonate+CreateProcessW=" + restrictedOnlyImpersonate;
+            launchError = "RestrictedOnly CreateProcessAsUserW=" + restrictedOnlyAsUser;
             attributes.Dispose();
             attributes = null;
             return false;
         }
+
+        attributes = CreateAttributeList(capabilitiesPointer, handleListPointer, inheritHandles.Length, lpacPolicy, includeSecurityCapabilities: true);
+        if (TryCreateProcessAsUser(restricted, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var documentedError))
+        {
+            LastSuccessfulLaunchPath = "Restricted+SECURITY_CAPABILITIES CreateProcessAsUserW";
+            launchError = "";
+            return true;
+        }
+
+        errors.Add("Restricted+SECURITY_CAPABILITIES CreateProcessAsUserW=" + documentedError);
+        attributes.Dispose();
+        attributes = null;
 
         if (TryCreateAppContainerToken(restricted, capabilities, out appContainerToken) && appContainerToken is not null)
         {
@@ -429,14 +471,6 @@ internal static class WindowsSandboxProcessLauncher
             }
 
             errors.Add("CreateAppContainerToken+CreateProcessAsUserW=" + asUserError);
-            if (TryCreateProcessWithToken(appContainerToken, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var withTokenError))
-            {
-                LastSuccessfulLaunchPath = "CreateAppContainerToken+CreateProcessWithTokenW";
-                launchError = "";
-                return true;
-            }
-
-            errors.Add("CreateProcessWithTokenW=" + withTokenError);
             attributes.Dispose();
             attributes = null;
         }
@@ -445,33 +479,6 @@ internal static class WindowsSandboxProcessLauncher
             errors.Add("CreateAppContainerToken=" + Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
 
-        attributes = CreateAttributeList(capabilitiesPointer, handleListPointer, inheritHandles.Length, lpacPolicy, includeSecurityCapabilities: true);
-        if (TryCreateProcessAsUser(restricted, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var restrictedError))
-        {
-            LastSuccessfulLaunchPath = "Restricted+SECURITY_CAPABILITIES CreateProcessAsUserW";
-            launchError = "";
-            return true;
-        }
-
-        errors.Add("Restricted+SECURITY_CAPABILITIES CreateProcessAsUserW=" + restrictedError);
-        if (TryCreateProcessWithToken(restricted, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var restrictedWithTokenError))
-        {
-            LastSuccessfulLaunchPath = "Restricted+SECURITY_CAPABILITIES CreateProcessWithTokenW";
-            launchError = "";
-            return true;
-        }
-
-        errors.Add("Restricted+SECURITY_CAPABILITIES CreateProcessWithTokenW=" + restrictedWithTokenError);
-        if (TryCreateProcessWhileImpersonating(restricted, executable, commandLineText, flags, environment, workDirectory, inheritHandles, attributes, desktop, out information, out var impersonateError))
-        {
-            LastSuccessfulLaunchPath = "Impersonate+CreateProcessW";
-            launchError = "";
-            return true;
-        }
-
-        errors.Add("Impersonate+CreateProcessW=" + impersonateError);
-        attributes.Dispose();
-        attributes = null;
         launchError = string.Join(" | ", errors);
         return false;
     }
@@ -516,32 +523,54 @@ internal static class WindowsSandboxProcessLauncher
         out PROCESS_INFORMATION information,
         out string error)
     {
-        var startup = CreateStartup(inheritHandles, attributes, desktop);
-        var commandLine = CreateWritableCommandLine(commandLineText);
-        NativeMethods.SetLastError(0);
-        if (NativeMethods.CreateProcessAsUserW(
+        if (TryCreateProcessAsUserCore(
                 token,
                 executable,
-                commandLine,
-                IntPtr.Zero,
-                IntPtr.Zero,
-                true,
+                commandLineText,
                 flags,
                 environment,
                 workDirectory,
-                ref startup,
-                out information))
+                inheritHandles,
+                attributes,
+                desktop,
+                out information,
+                out error))
         {
-            error = "";
             return true;
         }
 
-        error = Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
-        information = default;
-        return false;
+        if (error != NativeConstants.ERROR_PRIVILEGE_NOT_HELD.ToString(System.Globalization.CultureInfo.InvariantCulture))
+        {
+            return false;
+        }
+
+        try
+        {
+            using (PrivilegeScope.EnableOnCurrentProcess("SeIncreaseQuotaPrivilege", NoSandboxFaultInjector.Instance))
+            {
+                return TryCreateProcessAsUserCore(
+                    token,
+                    executable,
+                    commandLineText,
+                    flags,
+                    environment,
+                    workDirectory,
+                    inheritHandles,
+                    attributes,
+                    desktop,
+                    out information,
+                    out error);
+            }
+        }
+        catch (SandboxLayerException exception)
+        {
+            error = exception.Message;
+            information = default;
+            return false;
+        }
     }
 
-    private static bool TryCreateProcessWithToken(
+    private static bool TryCreateProcessAsUserCore(
         SafeAccessTokenHandle token,
         string executable,
         string commandLineText,
@@ -557,11 +586,13 @@ internal static class WindowsSandboxProcessLauncher
         var startup = CreateStartup(inheritHandles, attributes, desktop);
         var commandLine = CreateWritableCommandLine(commandLineText);
         NativeMethods.SetLastError(0);
-        if (NativeMethods.CreateProcessWithTokenW(
+        if (NativeMethods.CreateProcessAsUserW(
                 token,
-                0,
                 executable,
                 commandLine,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                true,
                 flags,
                 environment,
                 workDirectory,
@@ -613,72 +644,6 @@ internal static class WindowsSandboxProcessLauncher
         return false;
     }
 
-    private static bool TryCreateProcessWhileImpersonating(
-        SafeAccessTokenHandle restricted,
-        string executable,
-        string commandLineText,
-        uint flags,
-        IntPtr environment,
-        string workDirectory,
-        IntPtr[] inheritHandles,
-        SafeProcThreadAttributeList attributes,
-        IntPtr desktop,
-        out PROCESS_INFORMATION information,
-        out string error)
-    {
-        information = default;
-        error = "";
-        if (!NativeMethods.DuplicateTokenEx(
-                restricted,
-                NativeConstants.TOKEN_ALL_ACCESS_WIN8,
-                IntPtr.Zero,
-                NativeConstants.SecurityImpersonation,
-                NativeConstants.TokenImpersonation,
-                out var impersonation))
-        {
-            error = "DuplicateTokenEx=" + Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
-            return false;
-        }
-
-        using (impersonation)
-        {
-            if (!NativeMethods.ImpersonateLoggedOnUser(impersonation))
-            {
-                error = "ImpersonateLoggedOnUser=" + Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
-                return false;
-            }
-
-            try
-            {
-                var startup = CreateStartup(inheritHandles, attributes, desktop);
-                var commandLine = CreateWritableCommandLine(commandLineText);
-                NativeMethods.SetLastError(0);
-                if (NativeMethods.CreateProcessW(
-                        executable,
-                        commandLine,
-                        IntPtr.Zero,
-                        IntPtr.Zero,
-                        true,
-                        flags,
-                        environment,
-                        workDirectory,
-                        ref startup,
-                        out information))
-                {
-                    return true;
-                }
-
-                error = Marshal.GetLastWin32Error().ToString(System.Globalization.CultureInfo.InvariantCulture);
-                information = default;
-                return false;
-            }
-            finally
-            {
-                NativeMethods.RevertToSelf();
-            }
-        }
-    }
-
     private static STARTUPINFOEXW CreateStartup(IntPtr[] inheritHandles, SafeProcThreadAttributeList attributes, IntPtr desktop) =>
         new()
         {
@@ -694,32 +659,28 @@ internal static class WindowsSandboxProcessLauncher
             lpAttributeList = attributes.DangerousGetHandle()
         };
 
-    private static void GrantLaunchSurfaces(string executable, string workDirectory, string sid, ISandboxFaultInjector faultInjector)
+    private static void GrantWorkSurface(
+        string workDirectory,
+        string trustedProjectRoot,
+        string appContainerSid,
+        SandboxLaunchBinding binding,
+        ISandboxFaultInjector faultInjector)
     {
-        AppContainerAclManager.GrantMinimum(workDirectory, sid, NativeConstants.SandboxWorkAccess, inherit: true, faultInjector);
-        var exe = Path.GetFullPath(executable);
-        if (SandboxPathPolicy.IsWindowsSystemLocation(exe))
-        {
-            return;
-        }
+        var sandboxRoot = SandboxPathPolicy.SandboxRoot(trustedProjectRoot);
+        Directory.CreateDirectory(sandboxRoot);
+        var runs = Path.Combine(sandboxRoot, "runs");
+        Directory.CreateDirectory(runs);
+        var runDir = Path.Combine(runs, binding.RunId);
+        Directory.CreateDirectory(runDir);
+        Directory.CreateDirectory(workDirectory);
+        AppContainerAclManager.GrantMinimum(sandboxRoot, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);
+        AppContainerAclManager.GrantMinimum(runs, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);
+        AppContainerAclManager.GrantMinimum(runDir, appContainerSid, NativeConstants.FILE_GENERIC_EXECUTE, inherit: false, faultInjector);
+    }
 
-        AppContainerAclManager.GrantMinimum(exe, sid, NativeConstants.SandboxExecuteAccess, inherit: false, faultInjector);
-        var directory = Path.GetDirectoryName(exe);
-        if (!string.IsNullOrWhiteSpace(directory) && !SandboxPathPolicy.IsWindowsSystemLocation(directory))
-        {
-            AppContainerAclManager.GrantMinimumRecursive(directory, sid, NativeConstants.SandboxExecuteAccess, faultInjector);
-            var hostfxr = Path.Combine(directory, "hostfxr.dll");
-            if (File.Exists(hostfxr))
-            {
-                var snapshot = AppContainerAclManager.Read(hostfxr);
-                if (!snapshot.Grants(sid, NativeConstants.FILE_READ_DATA))
-                {
-                    throw new SandboxLayerException(
-                        SandboxError.AppContainerAclFailed,
-                        "AppContainer SID was not granted read access to hostfxr.dll.");
-                }
-            }
-        }
+    private static void GrantWorkCapability(string workDirectory, string capabilitySid, ISandboxFaultInjector faultInjector)
+    {
+        AppContainerAclManager.GrantMinimum(workDirectory, capabilitySid, NativeConstants.SandboxWorkAccess, inherit: true, faultInjector);
     }
 
     private static SafeProcThreadAttributeList CreateAttributeList(
@@ -834,17 +795,10 @@ internal static class WindowsSandboxProcessLauncher
         var sanitized = new Dictionary<string, string>(
             SandboxEnvironmentPolicy.Sanitize(parent, workDirectory, systemRoot, system32, appContainerProfileDirectory),
             StringComparer.OrdinalIgnoreCase);
-        if (request.ExtraEnvironment is not null)
+        var extraError = SandboxEnvironmentPolicy.ValidateExtraEnvironment(request.ExtraEnvironment);
+        if (extraError is not null)
         {
-            foreach (var pair in request.ExtraEnvironment)
-            {
-                if (SandboxEnvironmentPolicy.IsSecretBearingName(pair.Key))
-                {
-                    continue;
-                }
-
-                sanitized[pair.Key] = pair.Value;
-            }
+            throw new SandboxLayerException(extraError.Value, "ExtraEnvironment is not on the independent allowlist.");
         }
 
         var block = string.Join("\0", sanitized.Select(pair => pair.Key + "=" + pair.Value)) + "\0\0";

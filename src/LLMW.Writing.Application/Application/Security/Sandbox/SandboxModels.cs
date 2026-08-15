@@ -2,6 +2,21 @@ using LLMW.Writing.Domain.Security;
 
 namespace LLMW.Writing.Application.Security.Sandbox;
 
+public sealed class SandboxProjectContext
+{
+    public SandboxProjectContext(string trustedProjectRoot, ProjectScope trustedProjectScope)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(trustedProjectRoot);
+        ArgumentNullException.ThrowIfNull(trustedProjectScope);
+        TrustedProjectRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(trustedProjectRoot));
+        TrustedProjectScope = trustedProjectScope;
+    }
+
+    public string TrustedProjectRoot { get; }
+
+    public ProjectScope TrustedProjectScope { get; }
+}
+
 public sealed record SandboxResourceLimits(
     long ProcessMemoryBytes,
     int ActiveProcessLimit,

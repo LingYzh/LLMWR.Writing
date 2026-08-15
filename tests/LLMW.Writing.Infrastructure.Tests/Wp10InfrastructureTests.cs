@@ -25,10 +25,17 @@ internal static partial class Program
         Run(nameof(RestrictedTokenIsActuallyRestricted), RestrictedTokenIsActuallyRestricted);
         Run(nameof(AppContainerAclGrantIsMinimumAndPreservesOwnerSemantics), AppContainerAclGrantIsMinimumAndPreservesOwnerSemantics);
         Run(nameof(JobObjectLimitsAreConfigured), JobObjectLimitsAreConfigured);
+        Run(nameof(CpuJobConfigurationFailureFailsClosed), CpuJobConfigurationFailureFailsClosed);
         Run(nameof(SandboxLaunchOfStagedCmdReportsChildEvidence), SandboxLaunchOfStagedCmdReportsChildEvidence);
         Run(nameof(PathGuardRejectsReparseAndOpenTimeJunctionRace), PathGuardRejectsReparseAndOpenTimeJunctionRace);
         Run(nameof(PathGuardDeniesLlmwAndOutside), PathGuardDeniesLlmwAndOutside);
         Run(nameof(HeadTailCaptureBoundsMemory), HeadTailCaptureBoundsMemory);
+        Run(nameof(CorePrivilegesAreUnchangedAfterSandboxLaunch), CorePrivilegesAreUnchangedAfterSandboxLaunch);
+        Run(nameof(CorePrivilegesAreRestoredAfterFaultedLaunch), CorePrivilegesAreRestoredAfterFaultedLaunch);
+        Run(nameof(DefaultDesktopDaclDoesNotGainAppContainerSid), DefaultDesktopDaclDoesNotGainAppContainerSid);
+        Run(nameof(NetworkIsolationQueryFailureFailsClosed), NetworkIsolationQueryFailureFailsClosed);
+        Run(nameof(NetworkIsolationSetFailureFailsClosed), NetworkIsolationSetFailureFailsClosed);
+        Run(nameof(PrivilegeScopeFaultRestoresPreviousState), PrivilegeScopeFaultRestoresPreviousState);
     }
 
     [SupportedOSPlatform("windows")]
@@ -102,6 +109,15 @@ internal static partial class Program
     }
 
     [SupportedOSPlatform("windows")]
+    private static void CpuJobConfigurationFailureFailsClosed()
+    {
+        var limits = new SandboxResourceLimits(8L * 1024 * 1024, 4, CpuRateHundredthsPercent: 1000);
+        var injected = new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.CpuJobConfiguration };
+        AssertThrows<SandboxLayerException>(() => JobObjectController.CreateConfigured(limits, injected),
+            "CPU job configuration fault injection did not fail closed.");
+    }
+
+    [SupportedOSPlatform("windows")]
     private static void SandboxLaunchOfStagedCmdReportsChildEvidence()
     {
         using var dir = Wp10TempDir.Create();
@@ -120,11 +136,11 @@ internal static partial class Program
             ["/c", "echo", "SANDBOX_OK"],
             project,
             TimeSpan.FromSeconds(10));
-        var result = WindowsSandboxProcessLauncher.Launch(request, identity, work, NoSandboxFaultInjector.Instance, grantInternetClient: false);
+        var result = WindowsSandboxProcessLauncher.Launch(request, identity, work, project, NoSandboxFaultInjector.Instance, grantInternetClient: false);
         if (!result.Succeeded)
         {
-            var appContainerOnly = WindowsSandboxProcessLauncher.LaunchAppContainerOnly(request, identity, work, NoSandboxFaultInjector.Instance);
-            var restrictedOnly = WindowsSandboxProcessLauncher.LaunchRestrictedOnly(request, identity, work, NoSandboxFaultInjector.Instance);
+            var appContainerOnly = WindowsSandboxProcessLauncher.LaunchAppContainerOnly(request, identity, work, project, NoSandboxFaultInjector.Instance);
+            var restrictedOnly = WindowsSandboxProcessLauncher.LaunchRestrictedOnly(request, identity, work, project, NoSandboxFaultInjector.Instance);
             throw new InvalidOperationException(
                 $"staged cmd failed: error={result.Error} deny={result.DenyReason} exit={result.ExitCode} stdout={result.Stdout} stderr={result.Stderr} | appcontainer-only: error={appContainerOnly.Error} deny={appContainerOnly.DenyReason} exit={appContainerOnly.ExitCode} stdout={appContainerOnly.Stdout} | restricted-only: error={restrictedOnly.Error} deny={restrictedOnly.DenyReason} exit={restrictedOnly.ExitCode} stdout={restrictedOnly.Stdout}");
         }
@@ -196,6 +212,160 @@ internal static partial class Program
             "Captured text exceeded the 256KiB head+tail budget.");
         AssertTrue(text.StartsWith(new string('A', 64), StringComparison.Ordinal), "Head bytes were lost.");
         AssertTrue(text.EndsWith(new string('B', 64), StringComparison.Ordinal), "Tail bytes were lost.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void CorePrivilegesAreUnchangedAfterSandboxLaunch()
+    {
+        var before = CoreProcessPrivilegeSnapshot.Capture();
+        using var dir = Wp10TempDir.Create();
+        var project = Path.Combine(dir.Path, "project");
+        Directory.CreateDirectory(project);
+        var work = SandboxPathPolicy.RunWorkDirectory(project, "run-1");
+        Directory.CreateDirectory(work);
+        var cmd = Path.Combine(work, "cmd.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), cmd);
+        var identity = AppContainerProfileManager.CreateOrDerive(Wp10ProjectA, NoSandboxFaultInjector.Instance);
+        var request = new SandboxExecutionRequest(
+            SandboxLaunchBinding.Create("run-1", "w1", new ProjectScope(Wp10ProjectA, "ws")),
+            new TrustedNativePrincipalSource("infra-wp10").ResolveUserInteractive(),
+            Capability.ShellExecute,
+            cmd,
+            ["/c", "echo", "PRIV_OK"],
+            project,
+            TimeSpan.FromSeconds(10));
+        for (var i = 0; i < 8; i++)
+        {
+            _ = WindowsSandboxProcessLauncher.Launch(request, identity, work, project, NoSandboxFaultInjector.Instance, grantInternetClient: false);
+        }
+
+        var after = CoreProcessPrivilegeSnapshot.Capture();
+        AssertEqual(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeIncreaseQuotaPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(after, "SeIncreaseQuotaPrivilege"),
+            "SeIncreaseQuotaPrivilege drifted after sandbox launches.");
+        AssertEqual(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeAssignPrimaryTokenPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(after, "SeAssignPrimaryTokenPrivilege"),
+            "SeAssignPrimaryTokenPrivilege drifted after sandbox launches.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void CorePrivilegesAreRestoredAfterFaultedLaunch()
+    {
+        var before = CoreProcessPrivilegeSnapshot.Capture();
+        using var dir = Wp10TempDir.Create();
+        var project = Path.Combine(dir.Path, "project");
+        Directory.CreateDirectory(project);
+        var work = SandboxPathPolicy.RunWorkDirectory(project, "run-1");
+        Directory.CreateDirectory(work);
+        var cmd = Path.Combine(work, "cmd.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), cmd);
+        var identity = AppContainerProfileManager.CreateOrDerive(Wp10ProjectA, NoSandboxFaultInjector.Instance);
+        var request = new SandboxExecutionRequest(
+            SandboxLaunchBinding.Create("run-1", "w1", new ProjectScope(Wp10ProjectA, "ws")),
+            new TrustedNativePrincipalSource("infra-wp10").ResolveUserInteractive(),
+            Capability.ShellExecute,
+            cmd,
+            ["/c", "echo", "PRIV_FAIL"],
+            project,
+            TimeSpan.FromSeconds(5));
+        var result = WindowsSandboxProcessLauncher.Launch(
+            request,
+            identity,
+            work,
+            project,
+            new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.CreateProcess },
+            grantInternetClient: false);
+        AssertTrue(!result.Succeeded, "Injected CreateProcess fault succeeded.");
+        var after = CoreProcessPrivilegeSnapshot.Capture();
+        AssertEqual(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeIncreaseQuotaPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(after, "SeIncreaseQuotaPrivilege"),
+            "SeIncreaseQuotaPrivilege drifted after a faulted launch.");
+        AssertEqual(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeAssignPrimaryTokenPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(after, "SeAssignPrimaryTokenPrivilege"),
+            "SeAssignPrimaryTokenPrivilege drifted after a faulted launch.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void DefaultDesktopDaclDoesNotGainAppContainerSid()
+    {
+        var winsta = NativeMethods.GetProcessWindowStation();
+        var desktop = NativeMethods.GetThreadDesktop(NativeMethods.GetCurrentThreadId());
+        var beforeStation = AppContainerAclManager.ReadUserObject(winsta);
+        var beforeDesktop = AppContainerAclManager.ReadUserObject(desktop);
+        using var dir = Wp10TempDir.Create();
+        var project = Path.Combine(dir.Path, "project");
+        Directory.CreateDirectory(project);
+        var work = SandboxPathPolicy.RunWorkDirectory(project, "run-desk");
+        Directory.CreateDirectory(work);
+        var cmd = Path.Combine(work, "cmd.exe");
+        File.Copy(Path.Combine(Environment.SystemDirectory, "cmd.exe"), cmd);
+        var identity = AppContainerProfileManager.CreateOrDerive(Wp10ProjectA, NoSandboxFaultInjector.Instance);
+        var request = new SandboxExecutionRequest(
+            SandboxLaunchBinding.Create("run-desk", "w1", new ProjectScope(Wp10ProjectA, "ws-desk")),
+            new TrustedNativePrincipalSource("infra-wp10").ResolveUserInteractive(),
+            Capability.ShellExecute,
+            cmd,
+            ["/c", "echo", "DESK_OK"],
+            project,
+            TimeSpan.FromSeconds(10));
+        _ = WindowsSandboxProcessLauncher.Launch(request, identity, work, project, NoSandboxFaultInjector.Instance, grantInternetClient: false);
+        var afterStation = AppContainerAclManager.ReadUserObject(winsta);
+        var afterDesktop = AppContainerAclManager.ReadUserObject(desktop);
+        AssertEqual(beforeStation.ContainsSid(identity.AppContainerSid), afterStation.ContainsSid(identity.AppContainerSid),
+            "Sandbox launch added the AppContainer SID to the current window station DACL.");
+        AssertEqual(beforeDesktop.ContainsSid(identity.AppContainerSid), afterDesktop.ContainsSid(identity.AppContainerSid),
+            "Sandbox launch added the AppContainer SID to the current default desktop DACL.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void NetworkIsolationQueryFailureFailsClosed()
+    {
+        var identity = AppContainerProfileManager.CreateOrDerive(Wp10ProjectA, NoSandboxFaultInjector.Instance);
+        AssertThrows<SandboxLayerException>(
+            () => AppContainerNetworkIsolation.EnsureLoopbackNotExempt(
+                identity.AppContainerSid,
+                new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.NetworkIsolationQuery }),
+            "Network isolation query failure did not fail closed.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void NetworkIsolationSetFailureFailsClosed()
+    {
+        var identity = AppContainerProfileManager.CreateOrDerive(Wp10ProjectA, NoSandboxFaultInjector.Instance);
+        AssertThrows<SandboxLayerException>(
+            () => AppContainerNetworkIsolation.EnsureLoopbackNotExempt(
+                identity.AppContainerSid,
+                new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.NetworkIsolationSet }),
+            "Network isolation set failure did not fail closed.");
+    }
+
+    [SupportedOSPlatform("windows")]
+    private static void PrivilegeScopeFaultRestoresPreviousState()
+    {
+        var before = CoreProcessPrivilegeSnapshot.Capture();
+        try
+        {
+            using (PrivilegeScope.EnableOnCurrentProcess(
+                       "SeIncreaseQuotaPrivilege",
+                       new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.PrivilegeScopedEnable }))
+            {
+            }
+
+            throw new InvalidOperationException("PrivilegeScopedEnable fault did not throw.");
+        }
+        catch (SandboxLayerException)
+        {
+        }
+
+        var after = CoreProcessPrivilegeSnapshot.Capture();
+        AssertEqual(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeIncreaseQuotaPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(after, "SeIncreaseQuotaPrivilege"),
+            "Scoped privilege fault left SeIncreaseQuotaPrivilege enabled.");
     }
 
     private static void CreateJunction(string link, string target)

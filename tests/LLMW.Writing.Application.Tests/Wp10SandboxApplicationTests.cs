@@ -6,6 +6,8 @@ namespace LLMW.Writing.Application.Tests;
 
 internal static class Wp10SandboxApplicationTests
 {
+    private static readonly ProjectScope Scope = new(Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab"), "ws");
+    private static readonly SandboxProjectContext Context = new(@"C:\proj", Scope);
     private static readonly CallerPrincipal UserPrincipal =
         new TrustedNativePrincipalSource("wp10-application-tests").ResolveUserInteractive();
 
@@ -14,13 +16,17 @@ internal static class Wp10SandboxApplicationTests
         WindowsCommandLineQuotesSpacesQuotesBackslashEmptyAndUnicode();
         ExactCommandFingerprintDoesNotGeneralizePowerShell();
         EnvironmentPolicyStripsSecretsAndDoesNotInheritParentSecret();
+        ExtraEnvironmentOverridesAreRejected();
         PathPolicyUsesProjectUuidAndKeepsWorkOutsideLlmw();
         BrokerDeniesWhenTrustMissingAndDoesNotLaunch();
         BrokerRecheckPreventsLaunchAfterPolicyFlip();
         BrokerKeepsShellAndScriptDistinct();
         BypassStillRequiresSandboxHost();
-        Console.WriteLine("Application WP10 sandbox tests passed (8).");
-        return 8;
+        BrokerRejectsForgedProjectRootWithoutReading();
+        BrokerRejectsForgedProjectScope();
+        BrokerRequiresSessionRevalidationForAgentRun();
+        Console.WriteLine("Application WP10 sandbox tests passed (12).");
+        return 12;
     }
 
     private static void WindowsCommandLineQuotesSpacesQuotesBackslashEmptyAndUnicode()
@@ -68,6 +74,18 @@ internal static class Wp10SandboxApplicationTests
         AssertEqual("8", sanitized["NUMBER_OF_PROCESSORS"], "A safe OS variable was stripped.");
     }
 
+    private static void ExtraEnvironmentOverridesAreRejected()
+    {
+        foreach (var name in new[] { "PATH", "USERPROFILE", "LOCALAPPDATA", "DOTNET_STARTUP_HOOKS", "COMPlus_EnableDiagnostics" })
+        {
+            var extra = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [name] = "attacker" };
+            AssertEqual(SandboxError.EnvironmentRejected, SandboxEnvironmentPolicy.ValidateExtraEnvironment(extra),
+                name + " ExtraEnvironment override was not rejected.");
+        }
+
+        AssertTrue(SandboxEnvironmentPolicy.ValidateExtraEnvironment(null) is null, "Null ExtraEnvironment was rejected.");
+    }
+
     private static void PathPolicyUsesProjectUuidAndKeepsWorkOutsideLlmw()
     {
         var projectA = Guid.Parse("018f3e78-aaaa-7abc-8def-0123456789ab");
@@ -91,7 +109,8 @@ internal static class Wp10SandboxApplicationTests
         var broker = new TrustedSandboxBroker(
             new CoreAuthorizationService(new StaticPolicy(projectTrusted: false)),
             host,
-            new CountingPathGuard());
+            new CountingPathGuard(),
+            Context);
         var result = broker.ExecuteShell(Request(Capability.ShellExecute));
         AssertEqual(SandboxError.TrustRequired, result.Error, "Missing trust did not fail closed.");
         AssertEqual(0, host.Launches, "A trust denial launched a child.");
@@ -101,7 +120,7 @@ internal static class Wp10SandboxApplicationTests
     {
         var host = new CountingHost();
         var policy = new FlipPolicy();
-        var broker = new TrustedSandboxBroker(new CoreAuthorizationService(policy), host, new CountingPathGuard());
+        var broker = new TrustedSandboxBroker(new CoreAuthorizationService(policy), host, new CountingPathGuard(), Context);
         var result = broker.ExecuteShell(Request(Capability.ShellExecute));
         AssertEqual(SandboxError.CapabilityDenied, result.Error, "Final recheck did not deny after the policy flipped.");
         AssertEqual(0, host.Launches, "A flipped policy still started a child.");
@@ -114,7 +133,8 @@ internal static class Wp10SandboxApplicationTests
         var broker = new TrustedSandboxBroker(
             new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
             host,
-            new CountingPathGuard());
+            new CountingPathGuard(),
+            Context);
         var shellAsScript = broker.ExecuteScript(Request(Capability.ShellExecute));
         AssertEqual(SandboxError.CapabilityDenied, shellAsScript.Error, "Shell request was accepted as Script.");
         AssertEqual(0, host.Launches, "Mismatched Shell/Script launched a process.");
@@ -129,9 +149,92 @@ internal static class Wp10SandboxApplicationTests
         var broker = new TrustedSandboxBroker(
             new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
             host,
-            new CountingPathGuard());
+            new CountingPathGuard(),
+            Context);
         var result = broker.ExecuteShell(Request(Capability.ShellExecute));
         AssertEqual(SandboxError.SandboxUnavailable, result.Error, "BYPASS launched without a sandbox host.");
+    }
+
+    private static void BrokerRejectsForgedProjectRootWithoutReading()
+    {
+        var host = new CountingHost();
+        var guard = new CountingPathGuard();
+        var broker = new TrustedSandboxBroker(
+            new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
+            host,
+            guard,
+            Context);
+        var result = broker.ReadFile(new SandboxFileReadRequest(
+            UserPrincipal,
+            Scope,
+            @"C:\stolen",
+            "secret.txt",
+            "run-wp10"));
+        AssertEqual(SandboxError.PathOutOfScope, result.Error, "Forged ProjectRoot was not denied.");
+        AssertEqual(0, guard.Reads, "Broker opened a file using the caller-supplied ProjectRoot.");
+        AssertTrue(result.Bytes is null, "Forged ProjectRoot returned file bytes.");
+    }
+
+    private static void BrokerRejectsForgedProjectScope()
+    {
+        var host = new CountingHost();
+        var broker = new TrustedSandboxBroker(
+            new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
+            host,
+            new CountingPathGuard(),
+            Context);
+        var other = new ProjectScope(Guid.Parse("018f3e78-9999-7abc-8def-0123456789ab"), "other");
+        var result = broker.ReadFile(new SandboxFileReadRequest(
+            UserPrincipal,
+            other,
+            Context.TrustedProjectRoot,
+            ".llmw.sandbox/runs/run-wp10/work/ok.txt",
+            "run-wp10"));
+        AssertEqual(SandboxError.SessionBindingMismatch, result.Error, "Forged ProjectScope was not denied.");
+        AssertEqual(0, host.Launches, "Forged ProjectScope launched a child.");
+    }
+
+    private static void BrokerRequiresSessionRevalidationForAgentRun()
+    {
+        var host = new CountingHost();
+        var agent = CreateAgentPrincipal();
+        var broker = new TrustedSandboxBroker(
+            new CoreAuthorizationService(new StaticPolicy(projectTrusted: true)),
+            host,
+            new CountingPathGuard(),
+            Context);
+        var result = broker.ExecuteShell(Request(Capability.ShellExecute) with { Principal = agent });
+        AssertEqual(SandboxError.SessionBindingMismatch, result.Error, "AgentRun without a revalidator was allowed.");
+        AssertEqual(0, host.Launches, "AgentRun without revalidation launched a child.");
+    }
+
+    private static CallerPrincipal CreateAgentPrincipal()
+    {
+        var store = new MemoryRunSessionStore();
+        store.Runs["run-wp10"] = new DurableRunIdentity("run-wp10", "pm");
+        var clock = new FixedClock(DateTimeOffset.FromUnixTimeMilliseconds(50_000));
+        var sessions = new RunSessionService(store, clock, new FixedPermission(RuntimePermissionMode.AutoApproveScoped));
+        var channel = new AuthenticatedChannelContext(
+            "channel-wp10",
+            AuthenticatedClientKind.AgentRuntime,
+            "worker-wp10",
+            Scope);
+        var issued = sessions.Create(new CreateRunSessionRequest("run-wp10", channel, clock.UtcNow.AddMinutes(5)));
+        if (!issued.Succeeded || issued.Value is null)
+        {
+            throw new InvalidOperationException("Test session issuance failed.");
+        }
+
+        var resolved = sessions.Resolve(new ResolveRunSessionRequest(
+            "run-wp10",
+            issued.Value.Token.ExportOnceForAuthenticatedTransport(),
+            channel));
+        if (!resolved.Succeeded || resolved.Value is null)
+        {
+            throw new InvalidOperationException("Test session resolve failed.");
+        }
+
+        return resolved.Value;
     }
 
     private static SandboxExecutionRequest Request(Capability capability) =>
@@ -182,13 +285,76 @@ internal static class Wp10SandboxApplicationTests
 
     private sealed class CountingPathGuard : ISandboxPathGuard
     {
+        public int Reads { get; private set; }
+
         public SandboxError? TryOpenRead(string projectRoot, string runId, string logicalRelativePath, out byte[] bytes)
         {
+            Reads++;
             bytes = "ok"u8.ToArray();
             return null;
         }
 
         public SandboxError? TryOpenWrite(string projectRoot, string runId, string logicalRelativePath, ReadOnlySpan<byte> contents) => null;
+    }
+
+    private sealed class FixedClock(DateTimeOffset utcNow) : ISecurityClock
+    {
+        public DateTimeOffset UtcNow { get; set; } = utcNow;
+    }
+
+    private sealed class FixedPermission(RuntimePermissionMode mode) : IRunSecurityPolicySource
+    {
+        public RuntimePermissionMode GetRuntimePermissionMode(string runId) => mode;
+    }
+
+    private sealed class MemoryRunSessionStore : IRunSessionStore
+    {
+        public Dictionary<string, DurableRunIdentity> Runs { get; } = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, StoredRunSession> byHandle = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, StoredRunSession> byHash = new(StringComparer.Ordinal);
+
+        public DurableRunIdentity? LoadRun(string runId) =>
+            Runs.TryGetValue(runId, out var run) ? run : null;
+
+        public StoredRunSession IssueReplacingActive(PersistRunSessionRequest request)
+        {
+            var stored = new StoredRunSession(
+                Guid.NewGuid().ToString("D"),
+                request.RunId,
+                request.WorkerInstanceId,
+                request.ChannelInstanceId,
+                request.ProjectScope,
+                request.TokenHash,
+                request.ExpiresAtMs,
+                null,
+                request.CreatedAtMs);
+            byHandle[stored.HandleId] = stored;
+            byHash[stored.TokenHash] = stored;
+            return stored;
+        }
+
+        public StoredRunSession? FindByTokenHash(string tokenHash) =>
+            byHash.TryGetValue(tokenHash, out var session) ? session : null;
+
+        public StoredRunSession? FindByHandleId(string handleId) =>
+            byHandle.TryGetValue(handleId, out var session) ? session : null;
+
+        public int RevokeHandle(string handleId, long revokedAtMs)
+        {
+            if (!byHandle.TryGetValue(handleId, out var session) || session.RevokedAtMs is not null)
+            {
+                return 0;
+            }
+
+            var revoked = session with { RevokedAtMs = revokedAtMs };
+            byHandle[handleId] = revoked;
+            byHash[revoked.TokenHash] = revoked;
+            return 1;
+        }
+
+        public int RevokeByRun(string runId, long revokedAtMs) => 0;
+
+        public int RevokeByChannelWorker(string channelInstanceId, string workerInstanceId, long revokedAtMs) => 0;
     }
 
     private sealed class StaticPolicy(bool projectTrusted) : ISecurityPolicySource

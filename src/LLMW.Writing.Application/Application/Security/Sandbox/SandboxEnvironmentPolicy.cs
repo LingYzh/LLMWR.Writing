@@ -2,7 +2,7 @@ namespace LLMW.Writing.Application.Security.Sandbox;
 
 public static class SandboxEnvironmentPolicy
 {
-    private static readonly HashSet<string> AllowedNames = new(StringComparer.OrdinalIgnoreCase)
+    private static readonly HashSet<string> ParentAllowedNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "SystemRoot",
         "windir",
@@ -17,6 +17,52 @@ public static class SandboxEnvironmentPolicy
         "TMP",
         "ComSpec"
     };
+
+    private static readonly HashSet<string> ExtraAllowedNames = new(StringComparer.OrdinalIgnoreCase);
+
+    private static readonly HashSet<string> ForbiddenOverrideNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "SystemRoot",
+        "windir",
+        "SystemDrive",
+        "PATH",
+        "PATHEXT",
+        "ComSpec",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA"
+    };
+
+    private static readonly string[] LoaderSensitiveNames =
+    [
+        "CORECLR_ENABLE_PROFILING",
+        "CORECLR_PROFILER",
+        "CORECLR_PROFILER_PATH",
+        "CORECLR_PROFILER_PATH_32",
+        "CORECLR_PROFILER_PATH_64",
+        "COR_ENABLE_PROFILING",
+        "COR_PROFILER",
+        "COR_PROFILER_PATH",
+        "COR_PROFILER_PATH_32",
+        "COR_PROFILER_PATH_64",
+        "DOTNET_STARTUP_HOOKS",
+        "DOTNET_ADDITIONAL_DEPS",
+        "DOTNET_SHARED_STORE",
+        "DOTNET_MULTILEVEL_LOOKUP",
+        "DOTNET_MODIFIABLE_ASSEMBLIES",
+        "DOTNET_EnableDiagnostics",
+        "COMPlus_EnableDiagnostics",
+        "COMPlus_Profiler",
+        "COMPlus_ProfAPI_ProfilerCompatibilitySetting",
+        "SSLKEYLOGFILE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "FTP_PROXY"
+    ];
 
     public static bool IsSecretBearingName(string name)
     {
@@ -36,7 +82,59 @@ public static class SandboxEnvironmentPolicy
     }
 
     public static bool IsAllowedName(string name) =>
-        !string.IsNullOrWhiteSpace(name) && AllowedNames.Contains(name) && !IsSecretBearingName(name);
+        !string.IsNullOrWhiteSpace(name) && ParentAllowedNames.Contains(name) && !IsSecretBearingName(name);
+
+    public static bool IsForbiddenExtraName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return true;
+        }
+
+        if (ForbiddenOverrideNames.Contains(name) || IsSecretBearingName(name))
+        {
+            return true;
+        }
+
+        if (name.StartsWith("DOTNET_", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("COMPlus_", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("COR_", StringComparison.OrdinalIgnoreCase) ||
+            name.StartsWith("CORECLR_", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        foreach (var sensitive in LoaderSensitiveNames)
+        {
+            if (name.Equals(sensitive, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static bool IsAllowedExtraName(string name) =>
+        !IsForbiddenExtraName(name) && ExtraAllowedNames.Contains(name);
+
+    public static SandboxError? ValidateExtraEnvironment(IReadOnlyDictionary<string, string>? extra)
+    {
+        if (extra is null || extra.Count == 0)
+        {
+            return null;
+        }
+
+        foreach (var pair in extra)
+        {
+            if (!IsAllowedExtraName(pair.Key))
+            {
+                return SandboxError.EnvironmentRejected;
+            }
+        }
+
+        return null;
+    }
 
     public static IReadOnlyDictionary<string, string> Sanitize(
         IReadOnlyDictionary<string, string?> parent,

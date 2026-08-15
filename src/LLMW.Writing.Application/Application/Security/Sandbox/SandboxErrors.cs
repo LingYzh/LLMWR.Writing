@@ -31,7 +31,11 @@ public enum SandboxError
     Timeout,
     ProcessLimitExceeded,
     MemoryLimitExceeded,
-    BrokerUnavailable
+    BrokerUnavailable,
+    SessionBindingMismatch,
+    SessionRevoked,
+    SessionExpired,
+    EnvironmentRejected
 }
 
 public enum SandboxFaultPoint
@@ -46,7 +50,12 @@ public enum SandboxFaultPoint
     JobConfiguration,
     JobAssignment,
     SelfTest,
-    BrokerUnavailable
+    BrokerUnavailable,
+    RunSessionRevalidation,
+    NetworkIsolationQuery,
+    NetworkIsolationSet,
+    PrivilegeScopedEnable,
+    CpuJobConfiguration
 }
 
 public enum SandboxPathClass

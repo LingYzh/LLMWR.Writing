@@ -24,6 +24,42 @@ public static class SandboxPathPolicy
     public static string RunWorkDirectory(string projectRoot, string runId) =>
         Path.GetFullPath(Path.Combine(SandboxRoot(projectRoot), "runs", RequireRunId(runId), "work"));
 
+    public static string ToolStagingDirectory(string projectRoot, string executableIdentity) =>
+        Path.GetFullPath(Path.Combine(
+            SandboxRoot(projectRoot),
+            "tools",
+            Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+                System.Text.Encoding.UTF8.GetBytes(Path.GetFullPath(executableIdentity)))).ToLowerInvariant()[..16]));
+
+    public static string RunCapabilityName(Guid projectId, string runId)
+    {
+        if (projectId == Guid.Empty)
+        {
+            throw new ArgumentException("Run capability identity requires a non-empty Project UUID.", nameof(projectId));
+        }
+
+        return "llmw.w.run." + projectId.ToString("N") + "." + RequireRunId(runId);
+    }
+
+    public static bool PathsEqual(string left, string right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return false;
+        }
+
+        try
+        {
+            var a = Path.TrimEndingDirectorySeparator(Path.GetFullPath(left));
+            var b = Path.TrimEndingDirectorySeparator(Path.GetFullPath(right));
+            return a.Equals(b, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     public static bool IsAuthorityTree(string relativePath) =>
         StartsWithSegment(relativePath, AuthorityDirectoryName);
 

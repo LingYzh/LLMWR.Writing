@@ -15,42 +15,11 @@ internal sealed class AppContainerAclManager
     {
     }
 
-    public static void GrantMinimumRecursive(
-        string path,
+    public static void GrantUserObject(
+        IntPtr handle,
         string appContainerSid,
         uint accessMask,
         ISandboxFaultInjector faultInjector)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(path);
-        var full = Path.GetFullPath(path);
-        GrantMinimum(full, appContainerSid, accessMask, inherit: true, faultInjector);
-        if (!Directory.Exists(full))
-        {
-            return;
-        }
-
-        foreach (var file in Directory.EnumerateFiles(full))
-        {
-            if (IsReparse(file))
-            {
-                continue;
-            }
-
-            GrantMinimum(file, appContainerSid, accessMask, inherit: false, faultInjector);
-        }
-
-        foreach (var directory in Directory.EnumerateDirectories(full))
-        {
-            if (IsReparse(directory))
-            {
-                continue;
-            }
-
-            GrantMinimumRecursive(directory, appContainerSid, accessMask, faultInjector);
-        }
-    }
-
-    public static void GrantInteractiveDesktop(string appContainerSid, ISandboxFaultInjector faultInjector)
     {
         if (faultInjector.Fault == SandboxFaultPoint.AppContainerAcl)
         {
@@ -58,28 +27,11 @@ internal sealed class AppContainerAclManager
         }
 
         ArgumentException.ThrowIfNullOrWhiteSpace(appContainerSid);
-        var cacheKey = "winsta-desktop|" + appContainerSid;
-        if (Granted.ContainsKey(cacheKey))
+        if (handle == IntPtr.Zero)
         {
-            return;
+            throw new SandboxLayerException(SandboxError.AppContainerAclFailed, "User object handle is invalid.");
         }
 
-        var windowStation = NativeMethods.GetProcessWindowStation();
-        var desktop = NativeMethods.GetThreadDesktop(NativeMethods.GetCurrentThreadId());
-        if (windowStation == IntPtr.Zero || desktop == IntPtr.Zero)
-        {
-            throw new SandboxLayerException(
-                SandboxError.AppContainerAclFailed,
-                $"Window station/desktop handles are unavailable: {Marshal.GetLastWin32Error()}.");
-        }
-
-        GrantUserObject(windowStation, appContainerSid, NativeConstants.SandboxWindowStationAccess);
-        GrantUserObject(desktop, appContainerSid, NativeConstants.SandboxDesktopAccess);
-        Granted.TryAdd(cacheKey, 0);
-    }
-
-    private static void GrantUserObject(IntPtr handle, string appContainerSid, uint accessMask)
-    {
         if (!NativeMethods.ConvertStringSidToSidW(appContainerSid, out var sid) || sid == IntPtr.Zero)
         {
             throw new SandboxLayerException(SandboxError.AppContainerAclFailed, "AppContainer SID is not convertible.");
@@ -160,19 +112,68 @@ internal sealed class AppContainerAclManager
         }
     }
 
-    private static bool IsReparse(string path)
+    public static AclSnapshot ReadUserObject(IntPtr handle)
     {
+        if (handle == IntPtr.Zero)
+        {
+            throw new SandboxLayerException(SandboxError.AppContainerAclFailed, "User object handle is invalid.");
+        }
+
+        uint securityInfo = NativeConstants.DACL_SECURITY_INFORMATION;
+        NativeMethods.GetUserObjectSecurity(handle, ref securityInfo, IntPtr.Zero, 0, out var needed);
+        if (needed == 0)
+        {
+            throw new SandboxLayerException(
+                SandboxError.AppContainerAclFailed,
+                $"GetUserObjectSecurity size failed: {Marshal.GetLastWin32Error()}.");
+        }
+
+        var descriptor = Marshal.AllocHGlobal((int)needed);
         try
         {
-            return (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+            if (!NativeMethods.GetUserObjectSecurity(handle, ref securityInfo, descriptor, needed, out _))
+            {
+                throw new SandboxLayerException(
+                    SandboxError.AppContainerAclFailed,
+                    $"GetUserObjectSecurity failed: {Marshal.GetLastWin32Error()}.");
+            }
+
+            if (!NativeMethods.GetSecurityDescriptorDacl(descriptor, out _, out var dacl, out _) || dacl == IntPtr.Zero)
+            {
+                throw new SandboxLayerException(
+                    SandboxError.AppContainerAclFailed,
+                    $"GetSecurityDescriptorDacl failed: {Marshal.GetLastWin32Error()}.");
+            }
+
+            return ReadAcl(dacl);
         }
-        catch (IOException)
+        finally
         {
-            return true;
+            Marshal.FreeHGlobal(descriptor);
         }
-        catch (UnauthorizedAccessException)
+    }
+
+    public static string UserObjectName(IntPtr handle)
+    {
+        NativeMethods.GetUserObjectInformationW(handle, NativeConstants.UOI_NAME, IntPtr.Zero, 0, out var needed);
+        if (needed == 0)
         {
-            return true;
+            return "";
+        }
+
+        var buffer = Marshal.AllocHGlobal((int)needed);
+        try
+        {
+            if (!NativeMethods.GetUserObjectInformationW(handle, NativeConstants.UOI_NAME, buffer, needed, out _))
+            {
+                return "";
+            }
+
+            return Marshal.PtrToStringUni(buffer) ?? "";
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
         }
     }
 
@@ -299,36 +300,41 @@ internal sealed class AppContainerAclManager
 
         try
         {
-            if (!NativeMethods.GetAclInformation(dacl, out var info, Marshal.SizeOf<ACL_SIZE_INFORMATION>(), 2))
-            {
-                throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"GetAclInformation failed: {Marshal.GetLastWin32Error()}.");
-            }
-
-            List<AclAce> aces = [];
-            for (uint i = 0; i < info.AceCount; i++)
-            {
-                if (!NativeMethods.GetAce(dacl, i, out var ace) || ace == IntPtr.Zero)
-                {
-                    continue;
-                }
-
-                var header = Marshal.PtrToStructure<ACE_HEADER>(ace);
-                if (header.AceType != NativeConstants.ACCESS_ALLOWED_ACE_TYPE)
-                {
-                    continue;
-                }
-
-                var mask = (uint)Marshal.ReadInt32(ace, Marshal.SizeOf<ACE_HEADER>());
-                var sid = ace + Marshal.SizeOf<ACE_HEADER>() + 4;
-                aces.Add(new AclAce(NativeSid.ToStringSid(sid), mask, header.AceFlags));
-            }
-
-            return new AclSnapshot(aces);
+            return ReadAcl(dacl);
         }
         finally
         {
             NativeMethods.LocalFree(descriptor);
         }
+    }
+
+    private static AclSnapshot ReadAcl(IntPtr dacl)
+    {
+        if (!NativeMethods.GetAclInformation(dacl, out var info, Marshal.SizeOf<ACL_SIZE_INFORMATION>(), 2))
+        {
+            throw new SandboxLayerException(SandboxError.AppContainerAclFailed, $"GetAclInformation failed: {Marshal.GetLastWin32Error()}.");
+        }
+
+        List<AclAce> aces = [];
+        for (uint i = 0; i < info.AceCount; i++)
+        {
+            if (!NativeMethods.GetAce(dacl, i, out var ace) || ace == IntPtr.Zero)
+            {
+                continue;
+            }
+
+            var header = Marshal.PtrToStructure<ACE_HEADER>(ace);
+            if (header.AceType != NativeConstants.ACCESS_ALLOWED_ACE_TYPE)
+            {
+                continue;
+            }
+
+            var mask = (uint)Marshal.ReadInt32(ace, Marshal.SizeOf<ACE_HEADER>());
+            var sid = ace + Marshal.SizeOf<ACE_HEADER>() + 4;
+            aces.Add(new AclAce(NativeSid.ToStringSid(sid), mask, header.AceFlags));
+        }
+
+        return new AclSnapshot(aces);
     }
 }
 

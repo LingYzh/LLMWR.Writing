@@ -147,6 +147,45 @@ internal static class NativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern IntPtr GetThreadDesktop(uint threadId);
 
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true)]
+    internal static extern IntPtr CreateWindowStationW(
+        [MarshalAs(UnmanagedType.LPWStr)] string? name,
+        uint flags,
+        uint desiredAccess,
+        IntPtr securityAttributes);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true)]
+    internal static extern IntPtr OpenWindowStationW(string name, bool inherit, uint desiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool CloseWindowStation(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool SetProcessWindowStation(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode, ExactSpelling = true)]
+    internal static extern IntPtr CreateDesktopW(
+        string desktop,
+        IntPtr device,
+        IntPtr deviceMode,
+        uint flags,
+        uint desiredAccess,
+        IntPtr securityAttributes);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern IntPtr OpenDesktopW(string desktop, uint flags, bool inherit, uint desiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    internal static extern bool CloseDesktop(IntPtr handle);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool GetUserObjectInformationW(
+        IntPtr handle,
+        int index,
+        IntPtr information,
+        uint length,
+        out uint lengthNeeded);
+
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool GetUserObjectSecurity(
         IntPtr handle,
@@ -246,6 +285,18 @@ internal static class NativeMethods
         int bufferLength,
         IntPtr previousState,
         IntPtr returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    internal static extern bool AdjustTokenPrivileges(
+        SafeAccessTokenHandle token,
+        bool disableAll,
+        ref TOKEN_PRIVILEGES newState,
+        int bufferLength,
+        IntPtr previousState,
+        out int returnLength);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool LookupPrivilegeNameW(string? systemName, ref LUID luid, char[] name, ref int nameLength);
 
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     internal static extern bool CreateProcessAsUserW(

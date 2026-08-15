@@ -108,6 +108,22 @@ public sealed class SqliteRunSessionStore : IRunSessionStore
         return reader.Read() ? ReadSession(reader) : null;
     }
 
+    public StoredRunSession? FindByHandleId(string handleId)
+    {
+        using var connection = connectionFactory.OpenConfigured(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT handle_id, run_id, worker_instance_id, channel_instance_id, project_scope,
+                   token_hash, expires_at_ms, revoked_at_ms, created_at_ms
+            FROM run_session_handles
+            WHERE handle_id=$handle_id;
+            """;
+        Add(command, "$handle_id", handleId);
+        using var reader = command.ExecuteReader();
+        return reader.Read() ? ReadSession(reader) : null;
+    }
+
     public int RevokeHandle(string handleId, long revokedAtMs) =>
         Revoke(
             "UPDATE run_session_handles SET revoked_at_ms=$revoked_at_ms WHERE handle_id=$value AND revoked_at_ms IS NULL;",

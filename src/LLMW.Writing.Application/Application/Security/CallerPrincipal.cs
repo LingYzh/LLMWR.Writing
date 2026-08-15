@@ -110,6 +110,36 @@ public sealed record ProjectScope
     public string WorkspaceInstanceId { get; }
 
     public string ToCanonicalValue() => $"v1:{ProjectId:D}:{WorkspaceInstanceId}".ToLowerInvariant();
+
+    public static bool TryParseCanonical(string value, out ProjectScope scope)
+    {
+        scope = null!;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var parts = value.Split(':');
+        if (parts.Length != 3 || !parts[0].Equals("v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (!Guid.TryParse(parts[1], out var projectId) || projectId == Guid.Empty)
+        {
+            return false;
+        }
+
+        try
+        {
+            scope = new ProjectScope(projectId, parts[2]);
+            return true;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
 }
 
 public enum AuthenticatedClientKind

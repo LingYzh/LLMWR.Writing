@@ -6,7 +6,9 @@ using System.Text.Json;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Domain.Security;
+using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
+using LLMW.Writing.Infrastructure.Sandbox.Native;
 
 namespace LLMW.Writing.IntegrationTests;
 
@@ -34,7 +36,21 @@ internal static partial class Program
         JobActiveProcessLimitIsEnforced();
         JobMemoryLimitKillsOversizedChild();
         PowerShellCompatibilityIsProbedWithoutDisablingSandbox();
-        Console.WriteLine("WP10 sandbox integration tests passed (14).");
+        ForgedProjectRootIsDenied();
+        ForgedProjectScopeIsDenied();
+        ForgedRunIdIsDenied();
+        ForgedWorkerInstanceIdIsDenied();
+        RevokedSessionAfterResolutionIsDenied();
+        ExpiredSessionAfterResolutionIsDenied();
+        DurableRoleChangeDoesNotKeepStaleMaximum();
+        ChildIsNotOnInteractiveDefaultDesktop();
+        DefaultDesktopDaclUnchangedAfterSandbox();
+        NonSystemExecutableSiblingFilesAreDenied();
+        SiblingRunWorkIsDeniedAtOs();
+        CorePrivilegesUnchangedAfterSuccessfulAndFaultedLaunch();
+        ExtraEnvironmentOverridesAreDenied();
+        RequestedCpuPolicyFailureFailsClosed();
+        Console.WriteLine("WP10 sandbox integration tests passed (34).");
     }
 
     private static void SandboxChildHasRestrictedAppContainerToken()
@@ -201,7 +217,12 @@ internal static partial class Program
                      SandboxFaultPoint.JobConfiguration,
                      SandboxFaultPoint.JobAssignment,
                      SandboxFaultPoint.SelfTest,
-                     SandboxFaultPoint.BrokerUnavailable
+                     SandboxFaultPoint.BrokerUnavailable,
+                     SandboxFaultPoint.RunSessionRevalidation,
+                     SandboxFaultPoint.NetworkIsolationQuery,
+                     SandboxFaultPoint.NetworkIsolationSet,
+                     SandboxFaultPoint.PrivilegeScopedEnable,
+                     SandboxFaultPoint.CpuJobConfiguration
                  })
         {
             var injector = new MutableSandboxFaultInjector { Fault = fault };
@@ -219,7 +240,8 @@ internal static partial class Program
         var untrusted = new TrustedSandboxBroker(
             new CoreAuthorizationService(new Wp10Policy(projectTrusted: false)),
             fixture.Host,
-            new WindowsSandboxPathGuard());
+            new WindowsSandboxPathGuard(),
+            fixture.Context);
         var denied = untrusted.ExecuteShell(fixture.Request(["whoami-token"], TimeSpan.FromSeconds(5)));
         Wp10Equal(SandboxError.TrustRequired, denied.Error, "Missing Project Trust did not deny Shell.");
 
@@ -230,7 +252,8 @@ internal static partial class Program
         var flipping = new TrustedSandboxBroker(
             new CoreAuthorizationService(flip),
             fixture.Host,
-            new WindowsSandboxPathGuard());
+            new WindowsSandboxPathGuard(),
+            fixture.Context);
         var recheck = flipping.ExecuteShell(fixture.Request(["whoami-token"], TimeSpan.FromSeconds(5)));
         Wp10True(!recheck.Succeeded, "Final recheck allowed a flipped policy to launch.");
         Wp10Equal(2, flip.Calls, "Entry + final authorization were not both executed.");
@@ -242,7 +265,8 @@ internal static partial class Program
         var bypassBroker = new TrustedSandboxBroker(
             new CoreAuthorizationService(new Wp10Policy(projectTrusted: true)),
             fixture.Host,
-            new WindowsSandboxPathGuard());
+            new WindowsSandboxPathGuard(),
+            fixture.Context);
         var result = bypassBroker.ExecuteShell(fixture.Request(["whoami-token"], TimeSpan.FromSeconds(15)));
         Wp10True(result.Succeeded, $"BYPASS sandbox launch failed: {result.Error} {result.Stderr}");
         Wp10True(result.Stdout.Contains("\"isAppContainer\":true", StringComparison.OrdinalIgnoreCase) ||
@@ -312,6 +336,266 @@ internal static partial class Program
             "PowerShell incompatibility caused an unsandboxed fallback.");
     }
 
+    private static void ForgedProjectRootIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        var stolenDir = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP10.stolen", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stolenDir);
+        var secretPath = Path.Combine(stolenDir, "secret.txt");
+        File.WriteAllText(secretPath, "TOP-SECRET-BYTES");
+        try
+        {
+            var result = agent.Broker.ReadFile(new SandboxFileReadRequest(
+                agent.Principal,
+                agent.Scope,
+                stolenDir,
+                "secret.txt",
+                agent.RunId));
+            Wp10True(!result.Succeeded, "Forged ProjectRoot read succeeded.");
+            Wp10True(result.Bytes is null || result.Bytes.Length == 0, "Core returned stolen secret bytes.");
+            Wp10True(result.Error is SandboxError.PathOutOfScope or SandboxError.SessionBindingMismatch,
+                $"Forged ProjectRoot returned {result.Error}.");
+        }
+        finally
+        {
+            try { Directory.Delete(stolenDir, true); } catch (IOException) { }
+        }
+    }
+
+    private static void ForgedProjectScopeIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        var other = new ProjectScope(Guid.Parse("018f3e78-9999-7abc-8def-0123456789ab"), "other-ws");
+        var result = agent.Broker.ReadFile(new SandboxFileReadRequest(
+            agent.Principal,
+            other,
+            agent.ProjectRoot,
+            ".llmw.sandbox/runs/" + agent.RunId + "/work/ok.txt",
+            agent.RunId));
+        Wp10True(!result.Succeeded, "Forged ProjectScope was allowed.");
+        Wp10Equal(SandboxError.SessionBindingMismatch, result.Error, "Forged ProjectScope did not return SessionBindingMismatch.");
+    }
+
+    private static void ForgedRunIdIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        var request = agent.ShellRequest(["whoami-token"]) with
+        {
+            Binding = SandboxLaunchBinding.Create("run-forged", agent.WorkerId, agent.Scope)
+        };
+        var result = agent.Broker.ExecuteShell(request);
+        Wp10True(!result.Succeeded, "Forged RunId launched a child.");
+        Wp10Equal(SandboxError.SessionBindingMismatch, result.Error, "Forged RunId did not return SessionBindingMismatch.");
+        Wp10True(result.ProcessId is null, "Forged RunId produced a process id.");
+    }
+
+    private static void ForgedWorkerInstanceIdIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        var request = agent.ShellRequest(["whoami-token"]) with
+        {
+            Binding = SandboxLaunchBinding.Create(agent.RunId, "worker-forged", agent.Scope)
+        };
+        var result = agent.Broker.ExecuteShell(request);
+        Wp10True(!result.Succeeded, "Forged WorkerInstanceId launched a child.");
+        Wp10Equal(SandboxError.SessionBindingMismatch, result.Error, "Forged WorkerInstanceId did not return SessionBindingMismatch.");
+    }
+
+    private static void RevokedSessionAfterResolutionIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create();
+        agent.Sessions.Revoke(agent.Principal.SessionHandleId!);
+        var result = agent.Broker.ExecuteShell(agent.ShellRequest(["whoami-token"]));
+        Wp10True(!result.Succeeded, "Revoked session launched a child.");
+        Wp10Equal(SandboxError.SessionRevoked, result.Error, "Revoked session did not return SessionRevoked.");
+        Wp10True(result.ProcessId is null, "Revoked session produced a process id.");
+    }
+
+    private static void ExpiredSessionAfterResolutionIsDenied()
+    {
+        using var agent = Wp10AgentHarness.Create(expiresIn: TimeSpan.FromMilliseconds(1));
+        Thread.Sleep(20);
+        agent.Clock.UtcNow = agent.Clock.UtcNow.AddMinutes(5);
+        var result = agent.Broker.ExecuteShell(agent.ShellRequest(["whoami-token"]));
+        Wp10True(!result.Succeeded, "Expired session launched a child.");
+        Wp10Equal(SandboxError.SessionExpired, result.Error, "Expired session did not return SessionExpired.");
+        Wp10True(result.ProcessId is null, "Expired session produced a process id.");
+    }
+
+    private static void DurableRoleChangeDoesNotKeepStaleMaximum()
+    {
+        using var agent = Wp10AgentHarness.Create(role: "pm");
+        agent.SetDurableRole("reviewer");
+        var write = agent.Broker.WriteSandboxWorkFile(new SandboxFileWriteRequest(
+            agent.Principal,
+            agent.Scope,
+            agent.ProjectRoot,
+            ".llmw.sandbox/runs/" + agent.RunId + "/work/stale.txt",
+            agent.RunId,
+            "stale-pm"u8.ToArray()));
+        Wp10True(!write.Succeeded, "Stale PM RawWrite was kept after durable role downgrade.");
+        Wp10True(write.Error is SandboxError.CapabilityDenied or SandboxError.SessionBindingMismatch,
+            $"Role downgrade returned {write.Error}.");
+    }
+
+    private static void ChildIsNotOnInteractiveDefaultDesktop()
+    {
+        using var fixture = Wp10Fixture.Create();
+        var result = fixture.RunProbe("whoami-desktop");
+        Wp10True(result.Succeeded, $"whoami-desktop failed: {result.Error} {result.Stderr} {result.Stdout}");
+        Wp10True(!result.Stdout.Contains("winsta0\\default", StringComparison.OrdinalIgnoreCase) &&
+                 !result.Stdout.Contains("WinSta0\\Default", StringComparison.OrdinalIgnoreCase),
+            "Sandbox child reported winsta0\\default. stdout=" + result.Stdout);
+        Wp10True(result.Stdout.Contains("llmw.sbx", StringComparison.OrdinalIgnoreCase) ||
+                 result.Stdout.Contains("llmw.desk", StringComparison.OrdinalIgnoreCase),
+            "Sandbox child did not report the dedicated sandbox window station/desktop. stdout=" + result.Stdout);
+    }
+
+    private static void DefaultDesktopDaclUnchangedAfterSandbox()
+    {
+        var winsta = NativeMethods.GetProcessWindowStation();
+        var desktop = NativeMethods.GetThreadDesktop(NativeMethods.GetCurrentThreadId());
+        var beforeStation = AppContainerAclManager.ReadUserObject(winsta);
+        var beforeDesktop = AppContainerAclManager.ReadUserObject(desktop);
+        using var fixture = Wp10Fixture.Create();
+        var whoami = fixture.RunProbe("whoami-token");
+        Wp10True(whoami.Succeeded, "Sandbox whoami failed while checking default desktop DACL.");
+        var sid = fixture.Host.Identity!.AppContainerSid;
+        var afterStation = AppContainerAclManager.ReadUserObject(winsta);
+        var afterDesktop = AppContainerAclManager.ReadUserObject(desktop);
+        Wp10Equal(beforeStation.ContainsSid(sid), afterStation.ContainsSid(sid),
+            "Sandbox added the AppContainer SID to the interactive window station DACL.");
+        Wp10Equal(beforeDesktop.ContainsSid(sid), afterDesktop.ContainsSid(sid),
+            "Sandbox added the AppContainer SID to the interactive default desktop DACL.");
+    }
+
+    private static void NonSystemExecutableSiblingFilesAreDenied()
+    {
+        using var fixture = Wp10Fixture.Create();
+        var toolDir = Path.Combine(fixture.Directory, "tool-dir");
+        Directory.CreateDirectory(Path.Combine(toolDir, "nested"));
+        var probeDir = Path.GetDirectoryName(fixture.Probe)!;
+        foreach (var file in Directory.EnumerateFiles(probeDir))
+        {
+            var ext = Path.GetExtension(file);
+            if (ext.Equals(".exe", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".dll", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".json", StringComparison.OrdinalIgnoreCase) ||
+                ext.Equals(".config", StringComparison.OrdinalIgnoreCase))
+            {
+                File.Copy(file, Path.Combine(toolDir, Path.GetFileName(file)), overwrite: true);
+            }
+        }
+
+        var probeName = Path.GetFileName(fixture.Probe);
+        var toolProbe = Path.Combine(toolDir, probeName);
+        File.WriteAllText(Path.Combine(toolDir, "sibling-secret.txt"), "SIBLING-SECRET");
+        File.WriteAllText(Path.Combine(toolDir, "nested", "private.txt"), "NESTED-SECRET");
+        var sibling = fixture.Broker.ExecuteShell(fixture.Request(["read-file", Path.Combine(toolDir, "sibling-secret.txt")], TimeSpan.FromSeconds(15)) with
+        {
+            ExecutablePath = toolProbe
+        });
+        Wp10True(sibling.Stdout.Contains("READ_DENIED", StringComparison.Ordinal),
+            "Worker read sibling-secret.txt next to the executable. stdout=" + sibling.Stdout);
+        var nested = fixture.Broker.ExecuteShell(fixture.Request(["read-file", Path.Combine(toolDir, "nested", "private.txt")], TimeSpan.FromSeconds(15)) with
+        {
+            ExecutablePath = toolProbe
+        });
+        Wp10True(nested.Stdout.Contains("READ_DENIED", StringComparison.Ordinal),
+            "Worker read nested/private.txt. stdout=" + nested.Stdout);
+        var snapshot = AppContainerAclManager.Read(toolDir);
+        Wp10True(!snapshot.ContainsSid(fixture.Host.Identity!.AppContainerSid) ||
+                 !snapshot.Grants(fixture.Host.Identity.AppContainerSid, NativeConstants.FILE_READ_DATA),
+            "AppContainer SID has recursive read access to the original tool directory.");
+    }
+
+    private static void SiblingRunWorkIsDeniedAtOs()
+    {
+        using var fixture = Wp10Fixture.Create();
+        var runB = SandboxPathPolicy.RunWorkDirectory(fixture.ProjectRoot, "run-b");
+        Directory.CreateDirectory(runB);
+        var secretB = Path.Combine(runB, "secret-B.txt");
+        File.WriteAllText(secretB, "SECRET-B");
+        var requestB = fixture.Request(["write-file", Path.Combine(runB, "touch-b.txt"), "b"], TimeSpan.FromSeconds(15)) with
+        {
+            Binding = SandboxLaunchBinding.Create("run-b", "worker-wp10", fixture.Scope)
+        };
+        _ = fixture.Broker.ExecuteShell(requestB);
+        var requestA = fixture.Request(["read-file", secretB], TimeSpan.FromSeconds(15));
+        var result = fixture.Broker.ExecuteShell(requestA);
+        Wp10True(result.Stdout.Contains("READ_DENIED", StringComparison.Ordinal),
+            "Run A read Run B work. stdout=" + result.Stdout + " error=" + result.Error);
+    }
+
+    private static void CorePrivilegesUnchangedAfterSuccessfulAndFaultedLaunch()
+    {
+        var before = CoreProcessPrivilegeSnapshot.Capture();
+        using (var fixture = Wp10Fixture.Create())
+        {
+            for (var i = 0; i < 100; i++)
+            {
+                var result = fixture.RunProbe("whoami-token");
+                Wp10True(result.Succeeded, $"Privilege drift launch {i} failed: {result.Error}");
+            }
+        }
+
+        var afterSuccess = CoreProcessPrivilegeSnapshot.Capture();
+        Wp10Equal(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeIncreaseQuotaPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(afterSuccess, "SeIncreaseQuotaPrivilege"),
+            "SeIncreaseQuotaPrivilege drifted after 100 launches.");
+        Wp10Equal(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeAssignPrimaryTokenPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(afterSuccess, "SeAssignPrimaryTokenPrivilege"),
+            "SeAssignPrimaryTokenPrivilege drifted after 100 launches.");
+
+        using (var failed = Wp10Fixture.Create(new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.CreateProcess }))
+        {
+            var result = failed.Broker.ExecuteShell(failed.Request(["whoami-token"], TimeSpan.FromSeconds(5)));
+            Wp10True(!result.Succeeded, "Faulted launch succeeded.");
+        }
+
+        var afterFault = CoreProcessPrivilegeSnapshot.Capture();
+        Wp10Equal(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeIncreaseQuotaPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(afterFault, "SeIncreaseQuotaPrivilege"),
+            "SeIncreaseQuotaPrivilege drifted after a faulted launch.");
+        Wp10Equal(
+            CoreProcessPrivilegeSnapshot.Attribute(before, "SeAssignPrimaryTokenPrivilege"),
+            CoreProcessPrivilegeSnapshot.Attribute(afterFault, "SeAssignPrimaryTokenPrivilege"),
+            "SeAssignPrimaryTokenPrivilege drifted after a faulted launch.");
+    }
+
+    private static void ExtraEnvironmentOverridesAreDenied()
+    {
+        using var fixture = Wp10Fixture.Create();
+        foreach (var name in new[] { "PATH", "USERPROFILE", "DOTNET_STARTUP_HOOKS" })
+        {
+            var request = fixture.Request(["print-env-has", name], TimeSpan.FromSeconds(10)) with
+            {
+                ExtraEnvironment = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [name] = "attacker" }
+            };
+            var result = fixture.Broker.ExecuteShell(request);
+            Wp10True(!result.Succeeded, name + " ExtraEnvironment override launched a child.");
+            Wp10Equal(SandboxError.EnvironmentRejected, result.Error, name + " ExtraEnvironment was not rejected.");
+            Wp10True(result.ProcessId is null, name + " ExtraEnvironment produced a process id.");
+        }
+    }
+
+    private static void RequestedCpuPolicyFailureFailsClosed()
+    {
+        using var fixture = Wp10Fixture.Create(new MutableSandboxFaultInjector { Fault = SandboxFaultPoint.CpuJobConfiguration });
+        var request = fixture.Request(["whoami-token"], TimeSpan.FromSeconds(5)) with
+        {
+            Limits = new SandboxResourceLimits(32L * 1024 * 1024, 4, CpuRateHundredthsPercent: 1000)
+        };
+        var result = fixture.Broker.ExecuteShell(request);
+        Wp10True(!result.Succeeded, "CPU job configuration failure launched a child.");
+        Wp10True(result.Error is SandboxError.JobConfigurationFailed or SandboxError.SandboxUnavailable or SandboxError.SandboxSelfTestFailed,
+            $"CPU failure returned {result.Error}.");
+        Wp10True(result.ProcessId is null, "CPU failure produced a process id.");
+    }
+
     private static bool ProcessHasExited(int pid)
     {
         try
@@ -341,6 +625,200 @@ internal static partial class Program
         }
     }
 
+    private sealed class Wp10MutableClock(DateTimeOffset utcNow) : ISecurityClock
+    {
+        public DateTimeOffset UtcNow { get; set; } = utcNow;
+    }
+
+    private sealed class Wp10FixedPermission(RuntimePermissionMode mode) : IRunSecurityPolicySource
+    {
+        public RuntimePermissionMode GetRuntimePermissionMode(string runId) => mode;
+    }
+
+    private sealed class Wp10AgentHarness : IDisposable
+    {
+        private Wp10AgentHarness(
+            string directory,
+            string databasePath,
+            WindowsSandboxHost host,
+            TrustedSandboxBroker broker,
+            CallerPrincipal principal,
+            ProjectScope scope,
+            RunSessionService sessions,
+            SqliteRunSessionStore store,
+            Wp10MutableClock clock,
+            string runId,
+            string workerId,
+            string probe)
+        {
+            Directory = directory;
+            DatabasePath = databasePath;
+            Host = host;
+            Broker = broker;
+            Principal = principal;
+            Scope = scope;
+            Sessions = sessions;
+            Store = store;
+            Clock = clock;
+            RunId = runId;
+            WorkerId = workerId;
+            Probe = probe;
+        }
+
+        public string Directory { get; }
+        public string DatabasePath { get; }
+        public WindowsSandboxHost Host { get; }
+        public TrustedSandboxBroker Broker { get; }
+        public CallerPrincipal Principal { get; }
+        public ProjectScope Scope { get; }
+        public RunSessionService Sessions { get; }
+        public SqliteRunSessionStore Store { get; }
+        public Wp10MutableClock Clock { get; }
+        public string RunId { get; }
+        public string WorkerId { get; }
+        public string Probe { get; }
+        public string ProjectRoot => Path.Combine(Directory, "project");
+
+        public static Wp10AgentHarness Create(string role = "pm", TimeSpan? expiresIn = null)
+        {
+            var directory = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP10.A", Guid.NewGuid().ToString("N"));
+            var project = Path.Combine(directory, "project");
+            System.IO.Directory.CreateDirectory(Path.Combine(project, ".llmw"));
+            var databasePath = Path.Combine(project, ".llmw", "project.db");
+            new SqliteMigrationRunner().Migrate(databasePath, "wp10-agent");
+            SeedRun(databasePath, "run-agent", role);
+            var scope = new ProjectScope(Guid.Parse("018f3e78-cc10-7abc-8def-0123456789ab"), "wp10-agent");
+            var context = new SandboxProjectContext(project, scope);
+            var probe = Wp10FixtureFindProbe();
+            var host = new WindowsSandboxHost(project, scope, probe);
+            var clock = new Wp10MutableClock(DateTimeOffset.UtcNow);
+            var store = new SqliteRunSessionStore(databasePath);
+            var sessions = new RunSessionService(store, clock, new Wp10FixedPermission(RuntimePermissionMode.AutoApproveScoped));
+            var channel = new AuthenticatedChannelContext(
+                "channel-agent",
+                AuthenticatedClientKind.AgentRuntime,
+                "worker-agent",
+                scope);
+            var issued = sessions.Create(new CreateRunSessionRequest(
+                "run-agent",
+                channel,
+                clock.UtcNow.Add(expiresIn ?? TimeSpan.FromMinutes(5))));
+            if (!issued.Succeeded || issued.Value is null)
+            {
+                throw new InvalidOperationException("Agent harness session issuance failed: " + issued.Failure?.Code);
+            }
+
+            var resolved = sessions.Resolve(new ResolveRunSessionRequest(
+                "run-agent",
+                issued.Value.Token.ExportOnceForAuthenticatedTransport(),
+                channel));
+            if (!resolved.Succeeded || resolved.Value is null)
+            {
+                throw new InvalidOperationException("Agent harness session resolve failed: " + resolved.Failure?.Code);
+            }
+
+            var revalidator = new RunSessionRevalidator(store, clock, new Wp10FixedPermission(RuntimePermissionMode.AutoApproveScoped));
+            var broker = new TrustedSandboxBroker(
+                new CoreAuthorizationService(new Wp10Policy(projectTrusted: true)),
+                host,
+                new WindowsSandboxPathGuard(),
+                context,
+                sessionRevalidator: revalidator);
+            System.IO.Directory.CreateDirectory(SandboxPathPolicy.RunWorkDirectory(project, "run-agent"));
+            File.WriteAllText(Path.Combine(SandboxPathPolicy.RunWorkDirectory(project, "run-agent"), "ok.txt"), "ok");
+            return new Wp10AgentHarness(
+                directory,
+                databasePath,
+                host,
+                broker,
+                resolved.Value,
+                scope,
+                sessions,
+                store,
+                clock,
+                "run-agent",
+                "worker-agent",
+                probe);
+        }
+
+        public SandboxExecutionRequest ShellRequest(IReadOnlyList<string> arguments) =>
+            new(
+                SandboxLaunchBinding.Create(RunId, WorkerId, Scope),
+                Principal,
+                Capability.ShellExecute,
+                Probe,
+                arguments,
+                ProjectRoot,
+                TimeSpan.FromSeconds(15));
+
+        public void SetDurableRole(string role)
+        {
+            using var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(DatabasePath);
+            using var command = connection.CreateCommand();
+            command.CommandText = "UPDATE runs SET role=$role WHERE run_id=$run_id;";
+            var roleParam = command.CreateParameter();
+            roleParam.ParameterName = "$role";
+            roleParam.Value = role;
+            command.Parameters.Add(roleParam);
+            var runParam = command.CreateParameter();
+            runParam.ParameterName = "$run_id";
+            runParam.Value = RunId;
+            command.Parameters.Add(runParam);
+            command.ExecuteNonQuery();
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                if (System.IO.Directory.Exists(Directory))
+                {
+                    System.IO.Directory.Delete(Directory, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+
+        private static void SeedRun(string databasePath, string runId, string role)
+        {
+            using var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(databasePath);
+            using var command = connection.CreateCommand();
+            command.CommandText =
+                """
+                INSERT OR IGNORE INTO workflow_runs(workflow_run_id,status,created_at_ms,updated_at_ms)
+                VALUES ('wp10-workflow','running',1,1);
+                INSERT INTO runs(run_id,workflow_run_id,role,status,depth,created_at_ms,updated_at_ms)
+                VALUES ($run_id,'wp10-workflow',$role,'running',0,1,1);
+                """;
+            var runParam = command.CreateParameter();
+            runParam.ParameterName = "$run_id";
+            runParam.Value = runId;
+            command.Parameters.Add(runParam);
+            var roleParam = command.CreateParameter();
+            roleParam.ParameterName = "$role";
+            roleParam.Value = role;
+            command.Parameters.Add(roleParam);
+            command.ExecuteNonQuery();
+        }
+
+        private static string Wp10FixtureFindProbe()
+        {
+            var names = new[]
+            {
+                Path.Combine(AppContext.BaseDirectory, "sandbox-probe", "LLMW.Writing.SandboxProbe.exe"),
+                Path.Combine(AppContext.BaseDirectory, "LLMW.Writing.SandboxProbe.exe"),
+                Path.Combine(Environment.CurrentDirectory, "tests", "LLMW.Writing.SandboxProbe", "bin", "Release", "net8.0", "win-x64", "LLMW.Writing.SandboxProbe.exe")
+            };
+            return names.FirstOrDefault(File.Exists)
+                ?? throw new FileNotFoundException("Build LLMW.Writing.SandboxProbe before running WP10 tests.");
+        }
+    }
+
     private sealed class Wp10Policy(bool projectTrusted) : ISecurityPolicySource
     {
         public SecurityPolicySnapshot? Resolve(CallerPrincipal principal, Capability capability) =>
@@ -366,6 +844,7 @@ internal static partial class Program
             TrustedSandboxBroker broker,
             CallerPrincipal principal,
             ProjectScope scope,
+            SandboxProjectContext context,
             string probe)
         {
             Directory = directory;
@@ -373,6 +852,7 @@ internal static partial class Program
             Broker = broker;
             Principal = principal;
             Scope = scope;
+            Context = context;
             Probe = probe;
         }
 
@@ -381,6 +861,7 @@ internal static partial class Program
         public TrustedSandboxBroker Broker { get; }
         public CallerPrincipal Principal { get; }
         public ProjectScope Scope { get; }
+        public SandboxProjectContext Context { get; }
         public string Probe { get; }
         public string ProjectRoot => Path.Combine(Directory, "project");
         public string WorkDirectory => SandboxPathPolicy.RunWorkDirectory(ProjectRoot, "run-wp10");
@@ -396,6 +877,7 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(project, ".llmw", "project.db"), "authority");
             File.WriteAllText(Path.Combine(directory, "outside", "file.txt"), "outside-original");
             var scope = new ProjectScope(Guid.Parse("018f3e78-cc10-7abc-8def-0123456789ab"), "wp10-tests");
+            var context = new SandboxProjectContext(project, scope);
             var probe = FindProbe();
             var host = new WindowsSandboxHost(project, scope, probe, injector ?? NoSandboxFaultInjector.Instance);
             var principal = new TrustedNativePrincipalSource("wp10-integration").ResolveUserInteractive();
@@ -403,8 +885,9 @@ internal static partial class Program
                 new CoreAuthorizationService(new Wp10Policy(projectTrusted: true)),
                 host,
                 new WindowsSandboxPathGuard(),
+                context,
                 faultInjector: injector);
-            var fixture = new Wp10Fixture(directory, host, broker, principal, scope, probe);
+            var fixture = new Wp10Fixture(directory, host, broker, principal, scope, context, probe);
             System.IO.Directory.CreateDirectory(fixture.WorkDirectory);
             return fixture;
         }

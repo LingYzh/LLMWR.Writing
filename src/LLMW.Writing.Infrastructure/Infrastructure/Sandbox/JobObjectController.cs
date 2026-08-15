@@ -18,6 +18,11 @@ internal sealed class JobObjectController
             throw new SandboxLayerException(SandboxError.JobCreationFailed, "Injected job creation failure.");
         }
 
+        if (faultInjector.Fault == SandboxFaultPoint.CpuJobConfiguration)
+        {
+            throw new SandboxLayerException(SandboxError.JobConfigurationFailed, "Injected CPU job configuration failure.");
+        }
+
         var job = NativeMethods.CreateJobObjectW(IntPtr.Zero, null);
         if (job.IsInvalid)
         {
@@ -29,6 +34,11 @@ internal sealed class JobObjectController
             if (faultInjector.Fault == SandboxFaultPoint.JobConfiguration)
             {
                 throw new SandboxLayerException(SandboxError.JobConfigurationFailed, "Injected job configuration failure.");
+            }
+
+            if (faultInjector.Fault == SandboxFaultPoint.CpuJobConfiguration)
+            {
+                throw new SandboxLayerException(SandboxError.JobConfigurationFailed, "Injected CPU job configuration failure.");
             }
 
             var info = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION
@@ -62,11 +72,16 @@ internal sealed class JobObjectController
                                    NativeConstants.JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP,
                     CpuRate = (uint)Math.Clamp(cpuRate, 1, 10000)
                 };
-                NativeMethods.SetInformationJobObject(
-                    job,
-                    NativeConstants.JobObjectCpuRateControlInformation,
-                    in cpu,
-                    Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>());
+                if (!NativeMethods.SetInformationJobObject(
+                        job,
+                        NativeConstants.JobObjectCpuRateControlInformation,
+                        in cpu,
+                        Marshal.SizeOf<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>()))
+                {
+                    throw new SandboxLayerException(
+                        SandboxError.JobConfigurationFailed,
+                        $"SetInformationJobObject(cpu rate) failed: {Marshal.GetLastWin32Error()}.");
+                }
             }
 
             return job;

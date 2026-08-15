@@ -96,6 +96,8 @@ public interface IRunSessionStore
 
     StoredRunSession? FindByTokenHash(string tokenHash);
 
+    StoredRunSession? FindByHandleId(string handleId);
+
     int RevokeHandle(string handleId, long revokedAtMs);
 
     int RevokeByRun(string runId, long revokedAtMs);
