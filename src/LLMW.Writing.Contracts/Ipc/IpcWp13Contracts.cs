@@ -33,10 +33,20 @@ public sealed record GetResultArtifactResponse(
 
 public sealed record GetTaskHandoffRequest(string ConsumerTaskId, bool IncludeEvidence);
 
+public sealed record TaskHandoffEdgeDto(
+    string ResultArtifactId,
+    string DependencyKind,
+    string DependencyStatus,
+    string FreshnessState,
+    bool BlocksDispatch,
+    bool BlocksCompletion,
+    bool HasWarning);
+
 public sealed record GetTaskHandoffResponse(
     string ConsumerTaskId,
     string[] ResultArtifactIds,
     string[] EvidenceIds,
+    TaskHandoffEdgeDto[] Edges,
     string[] Warnings,
     bool IncludeTranscript);
 
@@ -47,7 +57,7 @@ public sealed record CreateResultDependencyRequest(
 
 public sealed record CreateResultDependencyResponse(string DependencyId, string Status);
 
-public sealed record UpdateResultDependencyRequest(string DependencyId, string DependencyKind, string Status);
+public sealed record UpdateResultDependencyRequest(string DependencyId, string DependencyKind);
 
 public sealed record UpdateResultDependencyResponse(string DependencyId, string DependencyKind, string Status);
 

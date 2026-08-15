@@ -123,6 +123,35 @@ public sealed partial class SqliteRuntimeStore
         }
     }
 
+    public EvidenceRecord? GetEvidence(string evidenceId)
+    {
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, """
+                SELECT evidence_id, run_id, task_id, source_kind, source_id, source_digest, locator_json, stale, created_at_ms
+                FROM evidence WHERE evidence_id=$id;
+                """);
+            Add(command, "$id", evidenceId);
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return new EvidenceRecord(
+                reader.GetString(0),
+                reader.IsDBNull(1) ? null : reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5),
+                reader.GetString(6),
+                reader.GetInt32(7) == 1,
+                reader.GetInt64(8));
+        }
+    }
+
     public void MarkEvidenceStale(string evidenceId, bool stale) =>
         Execute("UPDATE evidence SET stale=$stale WHERE evidence_id=$id;", ("$stale", stale ? 1 : 0), ("$id", evidenceId));
 
@@ -243,21 +272,41 @@ public sealed partial class SqliteRuntimeStore
         }
     }
 
-    public void BindPendingOversightOverrides(string checkpointId, long checkpointCreatedAtMs)
+    public void BindPendingOversightOverrides(string checkpointId, string runId, string? taskId, long checkpointCreatedAtMs)
     {
         _ = checkpointCreatedAtMs;
+        _ = runId;
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            return;
+        }
+
         Execute(
             """
             UPDATE oversight_overrides
             SET effective_after_checkpoint_id=$checkpoint
-            WHERE effective_after_checkpoint_id LIKE 'pending:%';
+            WHERE effective_after_checkpoint_id LIKE 'pending:%'
+              AND scope_kind='task'
+              AND scope_id=$task_id;
             """,
-            ("$checkpoint", checkpointId));
+            ("$checkpoint", checkpointId),
+            ("$task_id", taskId));
     }
 
     public void InsertDelegatedDecision(DelegatedDecisionRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
+        var existing = GetDelegatedDecision(record.DelegatedDecisionId);
+        if (existing is not null)
+        {
+            if (!DelegatedDecisionEquality.Equivalent(existing, record))
+            {
+                throw new InvalidOperationException("delegated-decision-conflict:" + record.DelegatedDecisionId);
+            }
+
+            return;
+        }
+
         Execute(
             """
             INSERT INTO delegated_decisions(
@@ -280,6 +329,22 @@ public sealed partial class SqliteRuntimeStore
             ("$decided_at_ms", record.DecidedAtMs));
     }
 
+    public DelegatedDecisionRecord? GetDelegatedDecision(string delegatedDecisionId)
+    {
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, """
+                SELECT delegated_decision_id, transaction_id, scope_kind, scope_id, proposed_by, confirmed_by,
+                       decided_by, authority_kind, oversight_mode, payload_digest, decided_at_ms
+                FROM delegated_decisions WHERE delegated_decision_id=$id;
+                """);
+            Add(command, "$id", delegatedDecisionId);
+            using var reader = command.ExecuteReader();
+            return reader.Read() ? ReadDelegated(reader) : null;
+        }
+    }
+
     public IReadOnlyList<DelegatedDecisionRecord> ListDelegatedDecisions()
     {
         lock (gate)
@@ -294,25 +359,7 @@ public sealed partial class SqliteRuntimeStore
             var list = new List<DelegatedDecisionRecord>();
             while (reader.Read())
             {
-                if (!OversightScopeKindCodec.TryParse(reader.GetString(2), out var scope))
-                {
-                    throw new InvalidOperationException("Corrupt delegated_decisions row.");
-                }
-                var authority = StringComparer.Ordinal.Equals(reader.GetString(7), "AGENT_DELEGATED")
-                    ? LLMW.Writing.Domain.Authority.DecisionAuthorityKind.AgentDelegated
-                    : LLMW.Writing.Domain.Authority.DecisionAuthorityKind.AuthorConfirmed;
-                list.Add(new DelegatedDecisionRecord(
-                    reader.GetString(0),
-                    reader.IsDBNull(1) ? null : reader.GetString(1),
-                    scope,
-                    reader.GetString(3),
-                    reader.IsDBNull(4) ? null : reader.GetString(4),
-                    reader.IsDBNull(5) ? null : reader.GetString(5),
-                    reader.GetString(6),
-                    authority,
-                    reader.GetString(8),
-                    reader.IsDBNull(9) ? null : reader.GetString(9),
-                    reader.GetInt64(10)));
+                list.Add(ReadDelegated(reader));
             }
 
             return list;
@@ -368,6 +415,27 @@ public sealed partial class SqliteRuntimeStore
             ("$decided_at_ms", (object?)record.DecidedAtMs ?? DBNull.Value),
             ("$digest", (object?)record.PayloadDigest ?? DBNull.Value),
             ("$id", record.ApprovalId));
+    }
+
+    public bool TryCompareAndSetApproval(string approvalId, string expectedStatus, DurableApprovalRecord replacement)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, """
+                UPDATE approvals
+                SET status=$status, decided_by=$decided_by, decided_at_ms=$decided_at_ms, payload_digest=$digest
+                WHERE approval_id=$id AND status=$expected;
+                """);
+            Add(command, "$status", replacement.Status);
+            Add(command, "$decided_by", (object?)replacement.DecidedBy ?? DBNull.Value);
+            Add(command, "$decided_at_ms", (object?)replacement.DecidedAtMs ?? DBNull.Value);
+            Add(command, "$digest", (object?)replacement.PayloadDigest ?? DBNull.Value);
+            Add(command, "$id", approvalId);
+            Add(command, "$expected", expectedStatus);
+            return command.ExecuteNonQuery() == 1;
+        }
     }
 
     public IReadOnlyList<DurableApprovalRecord> ListApprovals(string? runId)
@@ -550,6 +618,87 @@ public sealed partial class SqliteRuntimeStore
             using var reader = command.ExecuteReader();
             return reader.Read() ? ReadAttempt(reader) : null;
         }
+    }
+
+    public bool StorylineExists(string storylineId)
+    {
+        if (string.IsNullOrWhiteSpace(storylineId))
+        {
+            return false;
+        }
+
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, "SELECT 1 FROM storylines WHERE storyline_id=$id LIMIT 1;");
+            Add(command, "$id", storylineId);
+            using var reader = command.ExecuteReader();
+            return reader.Read();
+        }
+    }
+
+    public DurableToolCallRecord? GetToolCall(string toolCallId)
+    {
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, """
+                SELECT tool_call_id, run_id, task_id, tool_name, status, side_effect_state
+                FROM tool_calls WHERE tool_call_id=$id;
+                """);
+            Add(command, "$id", toolCallId);
+            using var reader = command.ExecuteReader();
+            if (!reader.Read())
+            {
+                return null;
+            }
+
+            return new DurableToolCallRecord(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                reader.GetString(3),
+                reader.GetString(4),
+                reader.GetString(5));
+        }
+    }
+
+    public bool TryCancelToolCall(string toolCallId)
+    {
+        lock (gate)
+        {
+            using var lease = Open();
+            using var command = Create(lease, """
+                UPDATE tool_calls SET status='cancelled'
+                WHERE tool_call_id=$id;
+                """);
+            Add(command, "$id", toolCallId);
+            return command.ExecuteNonQuery() == 1;
+        }
+    }
+
+    private static DelegatedDecisionRecord ReadDelegated(DbDataReader reader)
+    {
+        if (!OversightScopeKindCodec.TryParse(reader.GetString(2), out var scope))
+        {
+            throw new InvalidOperationException("Corrupt delegated_decisions row.");
+        }
+
+        var authority = StringComparer.Ordinal.Equals(reader.GetString(7), "AGENT_DELEGATED")
+            ? LLMW.Writing.Domain.Authority.DecisionAuthorityKind.AgentDelegated
+            : LLMW.Writing.Domain.Authority.DecisionAuthorityKind.AuthorConfirmed;
+        return new DelegatedDecisionRecord(
+            reader.GetString(0),
+            reader.IsDBNull(1) ? null : reader.GetString(1),
+            scope,
+            reader.GetString(3),
+            reader.IsDBNull(4) ? null : reader.GetString(4),
+            reader.IsDBNull(5) ? null : reader.GetString(5),
+            reader.GetString(6),
+            authority,
+            reader.GetString(8),
+            reader.IsDBNull(9) ? null : reader.GetString(9),
+            reader.GetInt64(10));
     }
 
     private static DurableResultArtifactRecord ReadArtifact(DbDataReader reader) =>

@@ -2,9 +2,12 @@ using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.ChapterAuthority;
 using LLMW.Writing.Application.Ipc;
+using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
+using LLMW.Writing.Domain.Authority;
+using LLMW.Writing.Domain.Narrative;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Domain.Security;
 using RuntimeTaskStatus = LLMW.Writing.Domain.Runtime.TaskStatus;
@@ -41,15 +44,36 @@ internal static class Wp13ApplicationTests
         DelegatedAuthorityRequiresExplicitOversightAndDoesNotTrustBypass();
         DelegatedAcceptStillEnforcesRoleTrustAndUnknownGrill();
         BackgroundRecoveryDoesNotFailQueuedOrUnknown();
-        Console.WriteLine("Application WP13 tests passed (23).");
-        return 23;
+        AgentCannotMutateForeignTask();
+        ReadyAndMissingAttemptCannotJumpToCompleted();
+        IncompleteAndFailedResultCannotComplete();
+        CompletedHandoffResultIsFrozen();
+        FreshnessSpoofIsNotAcceptedAsCurrent();
+        DependencyStatusIsCoreDerivedAndOptionalStaleDoesNotBlock();
+        OversightTaskAndStorylineWinOverProject();
+        WorkflowStorylineLinkPersistsInMemory();
+        ForwardOnlyTaskOverrideIgnoresUnrelatedCheckpoint();
+        CallerCheckpointCannotForceImmediateActivation();
+        ManualToAutoReevaluatesPendingApprovals();
+        PlanInvalidContinueStaysPlanBlocked();
+        GrillCrossRunOwnershipIsDenied();
+        GrillCompareAndSetHasOneWinner();
+        DelegatedIdentityIgnoresCallerPayload();
+        PostCommitProvenanceRetryIsIdempotent();
+        ToolCallStopDoesNotCancelOwnerRun();
+        ForgedBackgroundExecutionCannotBeStopped();
+        SpecialistUpdateIdentityMustMatch();
+        SecretMaterialInFreshnessRejectsArtifact();
+        IpcRunACannotSubmitResultForTaskB();
+        Console.WriteLine("Application WP13 tests passed (44).");
+        return 44;
     }
 
     private static void DeterministicCompletionPassesAndIsIdempotent()
     {
         var harness = Harness();
         var agent = Agent(harness, "run-complete", "writer");
-        SeedRunningTask(harness, "run-complete", "task-complete");
+        SeedDispatchedTask(harness, "run-complete", "task-complete");
         SubmitComplete(harness, agent, "task-complete");
         var first = Success(harness.Wp13.RequestTaskCompletion("task-complete", agent));
         AssertEqual("pass", first.Outcome, "Deterministic completion must pass.");
@@ -63,10 +87,10 @@ internal static class Wp13ApplicationTests
     {
         var harness = Harness();
         var agent = Agent(harness, "run-missing", "writer");
-        SeedRunningTask(harness, "run-missing", "task-missing");
+        SeedDispatchedTask(harness, "run-missing", "task-missing");
         AssertEqual(RuntimeError.CompletionFailed, harness.Wp13.RequestTaskCompletion("task-missing", agent).Failure?.Code,
             "Missing Result Artifact must fail completion.");
-        SeedRunningTask(harness, "run-missing", "task-blocking");
+        SeedDispatchedTask(harness, "run-missing", "task-blocking");
         var artifact = Artifact("task-blocking", ResultArtifactStatus.Complete, blocking: true);
         harness.Store.InsertResultArtifact(ResultArtifactCanonicalJson.ToDurable(artifact));
         AssertEqual(RuntimeError.CompletionFailed, harness.Wp13.RequestTaskCompletion("task-blocking", agent).Failure?.Code,
@@ -77,7 +101,7 @@ internal static class Wp13ApplicationTests
     {
         var harness = Harness();
         var agent = Agent(harness, "run-semantic", "writer");
-        SeedRunningTask(harness, "run-semantic", "task-semantic");
+        SeedDispatchedTask(harness, "run-semantic", "task-semantic");
         harness.Wp13.SetTaskCompletionContract("task-semantic", new TaskCompletionContractV1(
             1, [], [], [], [], true, [new SemanticCompletionCriterion("coverage", "required coverage")]));
         SubmitComplete(harness, agent, "task-semantic");
@@ -89,7 +113,7 @@ internal static class Wp13ApplicationTests
     {
         var harness = Harness(new PassSemanticEvaluator());
         var agent = Agent(harness, "run-semantic-pass", "writer");
-        SeedRunningTask(harness, "run-semantic-pass", "task-semantic-pass");
+        SeedDispatchedTask(harness, "run-semantic-pass", "task-semantic-pass");
         harness.Wp13.SetTaskCompletionContract("task-semantic-pass", new TaskCompletionContractV1(
             1, [], [], [], [], true, [new SemanticCompletionCriterion("coverage", "required coverage")]));
         SubmitComplete(harness, agent, "task-semantic-pass");
@@ -101,7 +125,7 @@ internal static class Wp13ApplicationTests
     {
         var harness = Harness();
         var agent = Agent(harness, "run-stale", "writer");
-        SeedRunningTask(harness, "run-stale", "producer");
+        SeedDispatchedTask(harness, "run-stale", "producer");
         Success(harness.Scheduler.CreateTask("run-stale", "consume", 1, null, "consumer"));
         SubmitComplete(harness, agent, "producer");
         Success(harness.Wp13.RequestTaskCompletion("producer", agent));
@@ -119,6 +143,13 @@ internal static class Wp13ApplicationTests
         var dispatch = harness.Scheduler.DispatchReadyTask("consumer");
         AssertEqual("blocked", dispatch.Value?.Outcome, "REQUIRED stale must not dispatch as READY.");
         harness.Store.UpdateTaskStatus("consumer", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 2_000);
+        harness.Store.InsertAttempt(new DurableAttemptRecord(
+            "attempt-consumer",
+            "consumer",
+            1,
+            AttemptStatusCodec.ToDurableValue(AttemptStatus.Running),
+            2_000,
+            null));
         SubmitComplete(harness, agent, "consumer");
         AssertEqual(RuntimeError.CompletionFailed, harness.Wp13.RequestTaskCompletion("consumer", agent).Failure?.Code,
             "Completion must fail while a REQUIRED Result is stale.");
@@ -144,6 +175,12 @@ internal static class Wp13ApplicationTests
         var handoff = Success(harness.Wp13.GetTaskHandoff("consumer-a", false));
         AssertTrue(handoff.Warnings.Length > 0, "ADVISORY stale must warn.");
         AssertEqual(false, handoff.IncludeTranscript, "Default handoff must omit transcript.");
+        AssertTrue(handoff.Edges.Any(item =>
+                StringComparer.Ordinal.Equals(item.DependencyKind, "optional") &&
+                StringComparer.Ordinal.Equals(item.DependencyStatus, "stale") &&
+                !item.BlocksDispatch &&
+                !item.BlocksCompletion),
+            "OPTIONAL stale must remain stale without a hard block.");
     }
 
     private static void ProposedDowngradeDoesNotMutateEffectiveEdge()
@@ -260,11 +297,11 @@ internal static class Wp13ApplicationTests
                 new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null),
                 agent).Failure?.Code,
             "Author-required Grill must not be Agent-resolved.");
-        AssertEqual(RuntimeError.GrillAuthorRequired,
+        AssertEqual(RuntimeError.GrillOptionRejected,
             harness.Wp13.ResolveRuntimeGrill(
                 new ResolveRuntimeGrillRequest(paused.ApprovalId, "expand", "expand-scope", null),
                 agent).Failure?.Code,
-            "Scope expansion must not be Agent-resolved via Grill.");
+            "Unknown Grill option must be rejected.");
     }
 
     private static void RuntimeGrillDuplicateAndRace()
@@ -285,9 +322,9 @@ internal static class Wp13ApplicationTests
             new RuntimeGrillQuestionV1("choice", ["a"], "Choose"),
             "baseline-3"));
         AssertEqual(first.ApprovalId, second.ApprovalId, "Duplicate Grill requests must share identity.");
-        Success(harness.Wp13.ResolveRuntimeGrill(new ResolveRuntimeGrillRequest(first.ApprovalId, "continue", "continue", null), User()));
+        Success(harness.Wp13.ResolveRuntimeGrill(new ResolveRuntimeGrillRequest(first.ApprovalId, "a", "a", null), User()));
         AssertEqual(RuntimeError.GrillAlreadyResolved,
-            harness.Wp13.ResolveRuntimeGrill(new ResolveRuntimeGrillRequest(first.ApprovalId, "replan", "replan", null), User()).Failure?.Code,
+            harness.Wp13.ResolveRuntimeGrill(new ResolveRuntimeGrillRequest(first.ApprovalId, "a", "a", null), User()).Failure?.Code,
             "Competing resolution must return already-resolved.");
     }
 
@@ -556,6 +593,590 @@ internal static class Wp13ApplicationTests
             "UNKNOWN classification must survive recovery.");
     }
 
+    private static void AgentCannotMutateForeignTask()
+    {
+        var harness = Harness();
+        var runA = Agent(harness, "run-own-a", "writer");
+        SeedDispatchedTask(harness, "run-own-b", "task-own-b");
+        SeedDispatchedTask(harness, "run-own-a", "task-own-a");
+        AssertEqual(RuntimeError.TaskOwnershipDenied,
+            harness.Wp13.SubmitResultArtifact(
+                new SubmitResultArtifactRequest(
+                    "task-own-b",
+                    "complete",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    null),
+                runA).Failure?.Code,
+            "Run A must not submit a Result for Task B.");
+        AssertEqual(RuntimeError.TaskOwnershipDenied,
+            harness.Wp13.RequestTaskCompletion("task-own-b", runA).Failure?.Code,
+            "Run A must not complete Task B.");
+        Success(harness.Wp13.CreateResultDependency("task-own-b", "task-own-a", "required"));
+        var dependency = harness.Store.LoadSnapshot().Dependencies.Single(item =>
+            StringComparer.Ordinal.Equals(item.ConsumerTaskId, "task-own-b"));
+        AssertEqual(RuntimeError.TaskOwnershipDenied,
+            harness.Wp13.ProposeResultDependencyChange(dependency.DependencyId, "optional", "stolen", runA).Failure?.Code,
+            "Run A must not propose a dependency change for Task B.");
+    }
+
+    private static void ReadyAndMissingAttemptCannotJumpToCompleted()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-ready", "writer");
+        SeedRunningTask(harness, "run-ready", "task-ready");
+        AssertEqual(RuntimeError.IllegalCompletionLifecycle,
+            harness.Wp13.RequestTaskCompletion("task-ready", agent).Failure?.Code,
+            "READY must not jump to COMPLETED.");
+        harness.Store.UpdateTaskStatus("task-ready", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 2_000);
+        AssertEqual(RuntimeError.IllegalCompletionLifecycle,
+            harness.Wp13.RequestTaskCompletion("task-ready", agent).Failure?.Code,
+            "Running without an active Attempt must not complete.");
+    }
+
+    private static void IncompleteAndFailedResultCannotComplete()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-incomplete", "writer");
+        SeedDispatchedTask(harness, "run-incomplete", "task-incomplete");
+        var incomplete = Artifact("task-incomplete", ResultArtifactStatus.Incomplete);
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "task-incomplete",
+                "incomplete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", incomplete),
+                ResultArtifactCanonicalJson.WriteColumn("findings", incomplete),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", incomplete),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", incomplete),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", incomplete),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", incomplete),
+                null),
+            agent));
+        AssertEqual(RuntimeError.CompletionFailed,
+            harness.Wp13.RequestTaskCompletion("task-incomplete", agent).Failure?.Code,
+            "Incomplete Result must not complete a Task.");
+        SeedDispatchedTask(harness, "run-incomplete", "task-failed-result");
+        var failed = Artifact("task-failed-result", ResultArtifactStatus.Failed);
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "task-failed-result",
+                "failed",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", failed),
+                ResultArtifactCanonicalJson.WriteColumn("findings", failed),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", failed),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", failed),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", failed),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", failed),
+                null),
+            agent));
+        AssertEqual(RuntimeError.CompletionFailed,
+            harness.Wp13.RequestTaskCompletion("task-failed-result", agent).Failure?.Code,
+            "Failed Result must not complete a Task.");
+    }
+
+    private static void CompletedHandoffResultIsFrozen()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-freeze", "writer");
+        SeedDispatchedTask(harness, "run-freeze", "task-freeze");
+        Success(harness.Scheduler.CreateTask("run-freeze", "consume", 1, null, "task-freeze-consumer"));
+        SubmitComplete(harness, agent, "task-freeze");
+        var completed = Success(harness.Wp13.RequestTaskCompletion("task-freeze", agent));
+        Success(harness.Wp13.CreateResultDependency("task-freeze-consumer", "task-freeze", "required"));
+        var before = Success(harness.Wp13.GetTaskHandoff("task-freeze-consumer", false));
+        AssertEqual(RuntimeError.ResultFrozen,
+            harness.Wp13.SubmitResultArtifact(
+                new SubmitResultArtifactRequest(
+                    "task-freeze",
+                    "complete",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    "{}",
+                    null),
+                agent).Failure?.Code,
+            "Completed Task must reject a later Result submission.");
+        var after = Success(harness.Wp13.GetTaskHandoff("task-freeze-consumer", false));
+        AssertEqual(completed.ResultArtifactId, after.ResultArtifactIds.Single(), "Handoff Result identity must stay frozen.");
+        AssertEqual(before.ResultArtifactIds.Single(), after.ResultArtifactIds.Single(), "Downstream handoff must not silently change.");
+    }
+
+    private static void FreshnessSpoofIsNotAcceptedAsCurrent()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-fresh", "writer");
+        SeedDispatchedTask(harness, "run-fresh", "task-fresh");
+        harness.Store.InsertEvidence(new EvidenceRecord(
+            "ev-stale",
+            "run-fresh",
+            "task-fresh",
+            "narrative",
+            "obj-1",
+            "old-digest",
+            "{}",
+            true,
+            1_000));
+        var spoofed = Artifact("task-fresh", ResultArtifactStatus.Complete) with
+        {
+            EvidenceIds = ["ev-stale"],
+            Freshness = new ResultFreshnessV1(
+                1,
+                ResultFreshnessState.Current,
+                new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, []),
+                new ResultProvenanceV1("stolen-run", "stolen-task", "stolen-attempt", null, null, null, null, null))
+        };
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "task-fresh",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", spoofed),
+                ResultArtifactCanonicalJson.WriteColumn("findings", spoofed),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", spoofed),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", spoofed),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", spoofed),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", spoofed),
+                null),
+            agent));
+        var stored = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-fresh")!);
+        AssertTrue(stored.Freshness.State != ResultFreshnessState.Current,
+            "Caller freshness=current against stale evidence must not become Core CURRENT.");
+        AssertEqual("run-fresh", stored.Freshness.Provenance.ProducedByRunId, "Core must stamp ProducedByRunId.");
+        AssertEqual("task-fresh", stored.Freshness.Provenance.ProducedByTaskId, "Core must stamp ProducedByTaskId.");
+        AssertTrue(!StringComparer.Ordinal.Equals(stored.Freshness.Provenance.AttemptId, "stolen-attempt"),
+            "Caller AttemptId must not become provenance truth.");
+    }
+
+    private static void DependencyStatusIsCoreDerivedAndOptionalStaleDoesNotBlock()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-dep", "writer");
+        SeedDispatchedTask(harness, "run-dep", "prod-dep");
+        Success(harness.Scheduler.CreateTask("run-dep", "consume", 1, null, "cons-dep"));
+        SubmitComplete(harness, agent, "prod-dep");
+        Success(harness.Wp13.RequestTaskCompletion("prod-dep", agent));
+        var required = Success(harness.Wp13.CreateResultDependency("cons-dep", "prod-dep", "required"));
+        var current = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("prod-dep")!);
+        harness.Store.InsertResultArtifact(ResultArtifactCanonicalJson.ToDurable(current with
+        {
+            ResultArtifactId = Guid.NewGuid().ToString("D"),
+            ProducedAtMs = current.ProducedAtMs + 1,
+            Freshness = current.Freshness with { State = ResultFreshnessState.Stale }
+        }));
+        var updated = Success(harness.Wp13.UpdateResultDependency(required.DependencyId, "required"));
+        AssertEqual("stale", updated.Status, "Core must recompute REQUIRED stale instead of trusting caller status.");
+        AssertEqual("blocked", harness.Store.GetTask("cons-dep")?.Status, "REQUIRED stale must hard-block.");
+        Success(harness.Scheduler.CreateTask("run-dep", "consume", 1, null, "cons-opt"));
+        Success(harness.Wp13.CreateResultDependency("cons-opt", "prod-dep", "optional"));
+        Success(harness.Wp13.RefreshResultDependencyStatus("prod-dep", "cons-opt"));
+        AssertEqual("ready", harness.Store.GetTask("cons-opt")?.Status, "OPTIONAL stale must not hard-block.");
+        var optional = harness.Store.DependenciesForConsumer("cons-opt").Single();
+        AssertEqual("stale", optional.Status, "OPTIONAL stale must remain stale.");
+        AssertTrue(!ResultDependencyPolicy.Evaluate(optional).BlocksDispatch, "OPTIONAL stale BlocksDispatch must be false.");
+    }
+
+    private static void OversightTaskAndStorylineWinOverProject()
+    {
+        var harness = Harness();
+        var user = User();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), user));
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-manual", "author_confirmed_required", "ask", null), user));
+        var projectAutoTaskManual = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-manual"));
+        AssertEqual("author_confirmed_required", projectAutoTaskManual.NarrativeAuthority, "Project AUTO + Task MANUAL must remain Author-required.");
+        AssertEqual("task", projectAutoTaskManual.WinningScope, "Task must win over Project AUTO.");
+
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "author_confirmed_required", "ask", null), user));
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-auto", "agent_delegated", "auto_approve_scoped", null), user));
+        var projectManualTaskAuto = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-auto"));
+        AssertEqual("agent_delegated", projectManualTaskAuto.NarrativeAuthority, "Project MANUAL + Task AUTO must use Task delegation.");
+
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), user));
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "storyline", "story-manual", "author_confirmed_required", "ask", null), user));
+        var storylineManual = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), "story-manual", null));
+        AssertEqual("author_confirmed_required", storylineManual.NarrativeAuthority, "Project AUTO + Storyline MANUAL must remain Manual.");
+
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "storyline", "story-auto", "agent_delegated", "auto_approve_scoped", null), user));
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-beats-story", "author_confirmed_required", "ask", null), user));
+        var taskWins = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), "story-auto", "task-beats-story"));
+        AssertEqual("author_confirmed_required", taskWins.NarrativeAuthority, "Storyline AUTO + Task MANUAL must let Task win.");
+        AssertEqual("task", taskWins.WinningScope, "Winning scope must be task.");
+    }
+
+    private static void WorkflowStorylineLinkPersistsInMemory()
+    {
+        var harness = Harness();
+        var created = Success(harness.Scheduler.CreateWorkflowRun("wf-story-link", "story-line-1"));
+        AssertEqual("story-line-1", created.StorylineId, "CreateWorkflowRun must persist the supplied StorylineId.");
+        AssertEqual("story-line-1", harness.Store.GetWorkflowRun(created.WorkflowRunId)?.StorylineId,
+            "Reloaded workflow record must keep the Storyline link.");
+    }
+
+    private static void ForwardOnlyTaskOverrideIgnoresUnrelatedCheckpoint()
+    {
+        var harness = Harness();
+        SeedDispatchedTask(harness, "run-scoped", "task-b");
+        SeedRunningTask(harness, "run-scoped", "task-a");
+        var created = Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-b", "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual(false, created.Active, "In-flight Task B override must wait for B's checkpoint.");
+        var checkpoint = CheckpointV1.Create("plan", "digest-a", "{}", "{}", "a", [], [], [], [], [], [], null, null, null, null);
+        Success(harness.Scheduler.PersistCheckpoint("run-scoped", "task-a", 1, CanonicalJson.WriteCheckpoint(checkpoint), "{}"));
+        var afterA = Success(harness.Wp13.GetEffectiveOversight(null, null, "task-b"));
+        AssertEqual("author_confirmed_required", afterA.NarrativeAuthority, "Task A checkpoint must not activate Task B override.");
+        Success(harness.Scheduler.PersistCheckpoint("run-scoped", "task-b", 1, CanonicalJson.WriteCheckpoint(checkpoint), "{}"));
+        var afterB = Success(harness.Wp13.GetEffectiveOversight(null, null, "task-b"));
+        AssertEqual("agent_delegated", afterB.NarrativeAuthority, "Task B checkpoint must activate the Task B override.");
+    }
+
+    private static void CallerCheckpointCannotForceImmediateActivation()
+    {
+        var harness = Harness();
+        SeedDispatchedTask(harness, "run-spoof-cp", "task-spoof-cp");
+        var existing = CheckpointV1.Create("plan", "digest", "{}", "{}", "summary", [], [], [], [], [], [], null, null, null, null);
+        var checkpointId = Success(harness.Scheduler.PersistCheckpoint(
+            "run-spoof-cp",
+            "task-spoof-cp",
+            1,
+            CanonicalJson.WriteCheckpoint(existing),
+            "{}"));
+        var created = Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task",
+            "task-spoof-cp",
+            "agent_delegated",
+            "auto_approve_scoped",
+            checkpointId), User()));
+        AssertEqual(false, created.Active, "Existing checkpoint id must not make an in-flight override immediate.");
+        var before = Success(harness.Wp13.GetEffectiveOversight(null, null, "task-spoof-cp"));
+        AssertEqual("author_confirmed_required", before.NarrativeAuthority, "Caller checkpoint spoof must remain inactive.");
+        Success(harness.Scheduler.PersistCheckpoint(
+            "run-spoof-cp",
+            "task-spoof-cp",
+            1,
+            CanonicalJson.WriteCheckpoint(existing),
+            "{}"));
+        var after = Success(harness.Wp13.GetEffectiveOversight(null, null, "task-spoof-cp"));
+        AssertEqual("agent_delegated", after.NarrativeAuthority, "The next Core-chosen checkpoint must activate the override.");
+    }
+
+    private static void ManualToAutoReevaluatesPendingApprovals()
+    {
+        var harness = Harness();
+        harness.Store.InsertApproval(new DurableApprovalRecord(
+            "pending-reeval",
+            "run-reeval",
+            "task-reeval",
+            ApprovalKindCodec.RuntimeGrill,
+            ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending),
+            "digest",
+            null,
+            null,
+            1_000));
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project",
+            ProjectId.ToString("D"),
+            "agent_delegated",
+            "auto_approve_scoped",
+            null), User()));
+        AssertEqual(
+            ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Denied),
+            harness.Store.GetApproval("pending-reeval")?.Status,
+            "AUTO activation must re-evaluate pending rows, not blindly approve, when Project Trust is missing.");
+    }
+
+    private static void PlanInvalidContinueStaysPlanBlocked()
+    {
+        var harness = Harness();
+        SeedDispatchedTask(harness, "run-plan-invalid", "task-plan-invalid");
+        var paused = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-plan-invalid",
+            "task-plan-invalid",
+            RuntimeGrillPauseReason.PlanAssumptionsInvalid,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Continue anyway?"),
+            "plan-invalid-base"));
+        var resolved = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null),
+            User()));
+        AssertEqual("PlanBlocked", resolved.ResumeDecision, "Persisted PlanInvalid plus caller continue must stay PLAN BLOCKED.");
+    }
+
+    private static void GrillCrossRunOwnershipIsDenied()
+    {
+        var harness = Harness();
+        var runA = Agent(harness, "run-grill-a", "writer");
+        SeedDispatchedTask(harness, "run-grill-b", "task-grill-b");
+        var paused = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-b",
+            "task-grill-b",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "What next?"),
+            "cross-run-base"));
+        AssertEqual(RuntimeError.GrillOwnershipDenied,
+            harness.Wp13.ResolveRuntimeGrill(
+                new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null),
+                runA).Failure?.Code,
+            "Run A must not resolve Run B's Grill.");
+    }
+
+    private static void GrillCompareAndSetHasOneWinner()
+    {
+        var harness = Harness();
+        SeedDispatchedTask(harness, "run-cas", "task-cas");
+        var paused = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-cas",
+            "task-cas",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "What next?"),
+            "cas-base"));
+        var request = new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null);
+        RuntimeResult<RuntimeGrillResolveOutcome> first = null!;
+        RuntimeResult<RuntimeGrillResolveOutcome> second = null!;
+        Parallel.Invoke(
+            () => first = harness.Wp13.ResolveRuntimeGrill(request, User()),
+            () => second = harness.Wp13.ResolveRuntimeGrill(request, User()));
+        var wins = new[] { first, second }.Count(item => item.Succeeded);
+        var stale = new[] { first, second }.Count(item => item.Failure?.Code == RuntimeError.GrillAlreadyResolved);
+        AssertEqual(1, wins, "Exactly one concurrent Grill resolver must win.");
+        AssertEqual(1, stale, "The loser must observe already-resolved.");
+    }
+
+    private static void DelegatedIdentityIgnoresCallerPayload()
+    {
+        var harness = Harness();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project",
+            ProjectId.ToString("D"),
+            "agent_delegated",
+            "auto_approve_scoped",
+            null), User()));
+        var agent = Agent(harness, "run-delegated-id", "pm");
+        var store = new RecordingNarrativeStore();
+        var sink = new RecordingDelegatedSink();
+        var service = new NarrativeChangeService(
+            new UnusedBlobStore(),
+            store,
+            new UnusedSemanticAssessor(),
+            new UnusedImpactAnalyzer(),
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            harness.Auth,
+            harness.Wp13,
+            sink);
+        var applied = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-delegated",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(applied.Succeeded, "AGENT_DELEGATED apply must reach COMMIT with injected trusted policy.");
+        AssertEqual(agent.ToString(), store.LastDeciderId, "Caller DeciderId must not become audit identity.");
+        AssertEqual(agent.ToString(), sink.Last?.DecidedBy, "Delegated provenance must be Core-stamped.");
+        AssertEqual(OversightScopeKind.Project, sink.Last?.ScopeKind, "Winning Project scope must be persisted when Project authorized the decision.");
+    }
+
+    private static void PostCommitProvenanceRetryIsIdempotent()
+    {
+        var harness = Harness();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project",
+            ProjectId.ToString("D"),
+            "agent_delegated",
+            "auto_approve_scoped",
+            null), User()));
+        var agent = Agent(harness, "run-prov-retry", "pm");
+        var store = new RecordingNarrativeStore();
+        var sink = new OneShotThrowingDelegatedSink(harness.Wp13);
+        var service = new NarrativeChangeService(
+            new UnusedBlobStore(),
+            store,
+            new UnusedSemanticAssessor(),
+            new UnusedImpactAnalyzer(),
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            harness.Auth,
+            harness.Wp13,
+            sink);
+        var first = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-retry",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(first.Succeeded, "Authority COMMIT must succeed even if delegated provenance insert fails.");
+        AssertEqual(0, harness.Store.ListDelegatedDecisions().Count, "Failed provenance insert must not roll back COMMIT.");
+        store.MarkApplied();
+        var retry = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-retry",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(retry.Succeeded, "Retry after COMMIT must repair provenance.");
+        AssertEqual(1, harness.Store.ListDelegatedDecisions().Count, "Retry must persist exactly one delegated decision.");
+        var secondRetry = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-retry",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(secondRetry.Succeeded, "Duplicate provenance insert must be idempotent.");
+        AssertEqual(1, harness.Store.ListDelegatedDecisions().Count, "Duplicate insert must not create a second row.");
+    }
+
+    private static void ToolCallStopDoesNotCancelOwnerRun()
+    {
+        var harness = Harness();
+        SeedDispatchedTask(harness, "owner-tool", "owner-tool-t");
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-stop",
+            "owner-tool",
+            "owner-tool-t",
+            "Shell.Execute",
+            "running",
+            "none"));
+        harness.Store.InsertBackgroundTask(new DurableBackgroundTaskRecord(
+            "bg-tool-stop",
+            "owner-tool",
+            "owner-tool-t",
+            BackgroundExecutionRefCodec.WriteKindColumn(new BackgroundExecutionRef(
+                BackgroundTaskKind.ToolCall,
+                "owner-tool",
+                "tool-stop",
+                null,
+                "owner-tool-t")),
+            "running",
+            null,
+            1_000,
+            null));
+        Success(harness.Wp13.StopBackgroundTask("bg-tool-stop"));
+        AssertEqual("cancelled", harness.Store.GetToolCall("tool-stop")?.Status, "ToolCall stop must cancel the tool.");
+        AssertTrue(!StringComparer.Ordinal.Equals(harness.Store.GetRun("owner-tool")?.Status, "cancelled"),
+            "ToolCall stop must not cancel the owner Run.");
+    }
+
+    private static void ForgedBackgroundExecutionCannotBeStopped()
+    {
+        var harness = Harness();
+        SeedRunningTask(harness, "owner-a-forge", "owner-a-forge-t");
+        SeedDispatchedTask(harness, "owner-b-forge", "owner-b-forge-t");
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-b",
+            "owner-b-forge",
+            "owner-b-forge-t",
+            "Shell.Execute",
+            "running",
+            "none"));
+        harness.Store.InsertBackgroundTask(new DurableBackgroundTaskRecord(
+            "bg-forged",
+            "owner-a-forge",
+            "owner-a-forge-t",
+            BackgroundExecutionRefCodec.WriteKindColumn(new BackgroundExecutionRef(
+                BackgroundTaskKind.ToolCall,
+                "owner-b-forge",
+                "tool-b",
+                null,
+                "owner-b-forge-t")),
+            "running",
+            null,
+            1_000,
+            null));
+        AssertEqual(RuntimeError.TaskOwnershipDenied,
+            harness.Wp13.StopBackgroundTask("bg-forged").Failure?.Code,
+            "Forged execution ref must not stop unrelated work.");
+        AssertEqual("running", harness.Store.GetToolCall("tool-b")?.Status, "Unrelated ToolCall must survive.");
+        AssertTrue(!StringComparer.Ordinal.Equals(harness.Store.GetRun("owner-b-forge")?.Status, "cancelled"),
+            "Forged stop must not cancel the foreign owner Run.");
+    }
+
+    private static void SpecialistUpdateIdentityMustMatch()
+    {
+        var harness = Harness();
+        var listed = Success(harness.Wp13.ListSpecialists("builtin"));
+        var duplicate = Success(harness.Wp13.DuplicateSpecialist(listed.Items[0].ProfileId, "builtin", "user", User()));
+        var got = Success(harness.Wp13.GetSpecialist(duplicate.ProfileId, "user"));
+        var parsed = SpecialistProfileCanonicalJson.Parse(got.DefinitionJson);
+        var mismatched = SpecialistProfileCanonicalJson.Write(parsed with { ProfileId = "stolen.profile" });
+        AssertEqual(RuntimeError.SpecialistIdentityMismatch,
+            harness.Wp13.UpdateSpecialist(duplicate.ProfileId, "user", mismatched, User()).Failure?.Code,
+            "Update target/body ProfileId mismatch must be rejected.");
+    }
+
+    private static void SecretMaterialInFreshnessRejectsArtifact()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-secret", "writer");
+        SeedDispatchedTask(harness, "run-secret", "task-secret");
+        var secret = Artifact("task-secret", ResultArtifactStatus.Complete) with
+        {
+            Freshness = new ResultFreshnessV1(
+                1,
+                ResultFreshnessState.Current,
+                new ResultProducedAgainstV1("password-leak", [], null, null, null, null, [], null, null, []),
+                new ResultProvenanceV1(null, "task-secret", null, null, null, null, null, null))
+        };
+        var submitted = harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "task-secret",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", secret),
+                ResultArtifactCanonicalJson.WriteColumn("findings", secret),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", secret),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", secret),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", secret),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", secret),
+                null),
+            agent);
+        if (submitted.Succeeded)
+        {
+            var stored = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-secret")!);
+            AssertTrue(
+                !SecretRedaction.ContainsSecretMaterial(ResultArtifactCanonicalJson.Write(stored)),
+                "Accepted Result Artifact must not retain secret material after sanitization.");
+        }
+        else
+        {
+            AssertEqual(RuntimeError.CompletionFailed, submitted.Failure?.Code,
+                "Secret material remaining after sanitization must reject the Artifact.");
+        }
+    }
+
+    private static void IpcRunACannotSubmitResultForTaskB()
+    {
+        var harness = Harness();
+        var agentA = Agent(harness, "run-ipc-own-a", "writer");
+        SeedDispatchedTask(harness, "run-ipc-own-b", "task-ipc-own-b");
+        var handler = new Wp13IpcCommandHandler(harness.Wp13, "workspace-13");
+        var payload = JsonSerializer.SerializeToElement(
+            new SubmitResultArtifactRequest("task-ipc-own-b", "complete", "{}", "{}", "{}", "{}", "{}", "{}", null),
+            IpcJsonContext.Default.SubmitResultArtifactRequest);
+        var result = handler.HandleAsync(new IpcApplicationCommandContext(
+            IpcClientKind.Worker,
+            "c-own",
+            null,
+            agentA,
+            Guid.NewGuid(),
+            Guid.NewGuid(),
+            null,
+            null,
+            IpcSemanticTypes.SubmitResultArtifact,
+            payload,
+            CancellationToken.None)).GetAwaiter().GetResult();
+        AssertTrue(result is not null, "IPC submit must respond.");
+        var error = IpcJson.Deserialize(result!.ResponseUtf8, IpcJsonContext.Default.ErrorEnvelope);
+        AssertEqual(IpcErrorCodes.TaskOwnershipDenied, error.Payload.Code,
+            "Envelope Run A plus payload Task B must be denied at IPC.");
+    }
+
     private static HarnessState Harness(ISemanticCompletionEvaluator? semantic = null)
     {
         var store = new MemoryRuntimeStore();
@@ -592,6 +1213,7 @@ internal static class Wp13ApplicationTests
             SyntheticBuiltInSpecialistCatalog.Instance,
             semantic,
             new MutableSchedulerFaultInjector());
+        scheduler.OversightActivationListener = wp13;
         return new HarnessState(store, scheduler, wp13, auth, userStore);
     }
 
@@ -607,6 +1229,13 @@ internal static class Wp13ApplicationTests
         {
             Success(harness.Scheduler.CreateTask(runId, "write", 1, null, taskId));
         }
+    }
+
+    private static void SeedDispatchedTask(HarnessState harness, string runId, string taskId)
+    {
+        SeedRunningTask(harness, runId, taskId);
+        var dispatched = Success(harness.Scheduler.DispatchReadyTask(taskId));
+        AssertEqual("dispatched", dispatched.Outcome, "Seeded task must enter the Attempt lifecycle.");
     }
 
     private static void SubmitComplete(HarnessState harness, CallerPrincipal agent, string taskId)
@@ -856,6 +1485,131 @@ internal static class Wp13ApplicationTests
         public IReadOnlyList<AuthorityRecoveryResult> RecoverIncomplete(CancellationToken cancellationToken = default) => [];
 
         public AuthorityRecoveryResult Inspect(string transactionId) => throw new InvalidOperationException("unused");
+    }
+
+    private sealed class UnusedSemanticAssessor : ISemanticDependencyAssessor
+    {
+        public SemanticDependencyAssessment Assess(
+            NarrativeChangeSetSnapshot changeSet,
+            CancellationToken cancellationToken = default)
+        {
+            _ = changeSet;
+            _ = cancellationToken;
+            throw new InvalidOperationException("unused");
+        }
+    }
+
+    private sealed class UnusedImpactAnalyzer : INarrativeImpactAnalyzer
+    {
+        public NarrativeImpactAnalysisResult Analyze(
+            NarrativeChangeSetSnapshot changeSet,
+            StructuralDependencyAssessment structuralAssessment,
+            SemanticDependencyAssessment semanticAssessment,
+            CancellationToken cancellationToken = default)
+        {
+            _ = changeSet;
+            _ = structuralAssessment;
+            _ = semanticAssessment;
+            _ = cancellationToken;
+            throw new InvalidOperationException("unused");
+        }
+    }
+
+    private sealed class RecordingDelegatedSink : IDelegatedDecisionSink
+    {
+        public DelegatedDecisionRecord? Last { get; private set; }
+
+        public void Record(DelegatedDecisionRecord record) => Last = record;
+    }
+
+    private sealed class OneShotThrowingDelegatedSink(IDelegatedDecisionSink inner) : IDelegatedDecisionSink
+    {
+        private int calls;
+
+        public void Record(DelegatedDecisionRecord record)
+        {
+            calls++;
+            if (calls == 1)
+            {
+                throw new InvalidOperationException("provenance-fault");
+            }
+
+            inner.Record(record);
+        }
+    }
+
+    private sealed class RecordingNarrativeStore : INarrativeChangeStore
+    {
+        public const string ChangeSetId = "018f3e78-1234-7abc-8def-0123456789c1";
+        private const string ImpactId = "018f3e78-1234-7abc-8def-0123456789c2";
+        private const string TransactionId = "018f3e78-1234-7abc-8def-0123456789c3";
+        private string status = "applied";
+
+        public string? LastDeciderId { get; private set; }
+
+        public void MarkApplied() => status = "applied";
+
+        public NarrativeStoreResult<NarrativeChangeSetSnapshot> CreateWorkingChangeSet(PersistWorkingChangeSetRequest request)
+        {
+            _ = request;
+            throw new InvalidOperationException("unused");
+        }
+
+        public NarrativeChangeSetSnapshot? LoadChangeSet(string changeSetId)
+        {
+            _ = changeSetId;
+            return new(
+                ChangeSetId,
+                "storyline",
+                "storyline-1",
+                status,
+                "agent",
+                "agent-1",
+                null,
+                null,
+                TransactionId,
+                ImpactId,
+                []);
+        }
+
+        public NarrativeChangeFailure? ValidateApplyPreconditions(
+            NarrativeChangeSetSnapshot changeSet,
+            CancellationToken cancellationToken = default)
+        {
+            _ = changeSet;
+            _ = cancellationToken;
+            return null;
+        }
+
+        public StructuralDependencyAssessment AssessStructuralDependencies(NarrativeChangeSetSnapshot changeSet)
+        {
+            _ = changeSet;
+            return new([]);
+        }
+
+        public NarrativeStoreResult<NarrativeImpactAnalysisRecord> PersistImpactAnalysis(PersistImpactAnalysisRequest request) =>
+            NarrativeStoreResults.Success(new NarrativeImpactAnalysisRecord(
+                ImpactId,
+                request.Status,
+                request.AffectedSetJson,
+                request.EvidenceJson,
+                request.WarningsJson,
+                request.Warnings));
+
+        public NarrativeStoreResult<NarrativeApplyStoreResult> Apply(
+            NarrativeApplyStoreRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            _ = cancellationToken;
+            LastDeciderId = request.DeciderId;
+            status = "applied";
+            return NarrativeStoreResults.Success(new NarrativeApplyStoreResult(
+                request.ChangeSetId,
+                TransactionId,
+                request.ImpactAnalysisId ?? ImpactId,
+                AuthorityTransactionState.Complete,
+                Existing: false));
+        }
     }
 
     private sealed class UnusedReviewer : IChapterReviewer

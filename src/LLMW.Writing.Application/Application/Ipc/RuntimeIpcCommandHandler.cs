@@ -80,8 +80,7 @@ public sealed class RuntimeIpcCommandHandler : IIpcApplicationCommandHandler
     private IpcApplicationCommandResult CreateWorkflow(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.CreateWorkflowRunRequest);
-        _ = request;
-        var result = scheduler.CreateWorkflowRun(null);
+        var result = scheduler.CreateWorkflowRun(workflowRunId: null, storylineId: request.StorylineId);
         return result.Succeeded && result.Value is not null
             ? Respond(context, new CreateWorkflowRunResponse(result.Value.WorkflowRunId, result.Value.Status), IpcJsonContext.Default.CreateWorkflowRunResponseEnvelope)
             : Fail(context, result.Failure);

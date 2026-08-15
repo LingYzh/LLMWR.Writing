@@ -234,6 +234,7 @@ public static class IpcJson
 [JsonSerializable(typeof(SubmitResultArtifactRequest))]
 [JsonSerializable(typeof(GetResultArtifactRequest))]
 [JsonSerializable(typeof(GetTaskHandoffRequest))]
+[JsonSerializable(typeof(TaskHandoffEdgeDto))]
 [JsonSerializable(typeof(CreateResultDependencyRequest))]
 [JsonSerializable(typeof(UpdateResultDependencyRequest))]
 [JsonSerializable(typeof(ProposeResultDependencyChangeRequest))]

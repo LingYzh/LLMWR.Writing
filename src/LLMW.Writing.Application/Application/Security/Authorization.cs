@@ -60,7 +60,7 @@ public sealed class CoreAuthorizationService : IAuthorizationService
             return InvalidPrincipal(request.Capability);
         }
 
-        var oversight = oversightSource?.Resolve(principal.ProjectScope?.ProjectId.ToString("D"), null, null);
+        var oversight = oversightSource?.ResolveForPrincipal(principal);
         var permission = oversight is { Active: true }
             ? oversight.RuntimePermission
             : principal.RuntimePermissionMode;

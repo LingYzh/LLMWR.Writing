@@ -6,7 +6,7 @@ using RuntimeTaskStatus = LLMW.Writing.Domain.Runtime.TaskStatus;
 
 namespace LLMW.Writing.Application.Runtime;
 
-public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDecisionSink
+public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDecisionSink, IOversightCheckpointListener
 {
     public const string DependencyProposalKind = "result_dependency_proposal";
 
@@ -41,34 +41,92 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
 
     public EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId)
     {
-        var checkpoints = new HashSet<string>(
-            store.LoadSnapshot().Checkpoints.Select(item => item.CheckpointId),
-            StringComparer.Ordinal);
+        var context = BuildActivationContext(projectId, storylineId, taskId, runId: null);
         return OversightResolver.Resolve(
             applicationDefaults.Current,
             store.ListOversightOverrides(),
-            checkpoints,
-            projectId,
-            storylineId,
-            taskId);
+            context);
     }
 
-    public void Record(DelegatedDecisionRecord record) => store.InsertDelegatedDecision(record);
+    public EffectiveOversightPolicy ResolveForPrincipal(CallerPrincipal? principal, string? taskId = null, string? storylineId = null)
+    {
+        string? runId = null;
+        string? projectId = principal?.ProjectScope?.ProjectId.ToString("D");
+        if (principal is { Kind: PrincipalKind.AgentRun, RunId: { Length: > 0 } ownedRun })
+        {
+            runId = ownedRun;
+            var run = store.GetRun(ownedRun);
+            if (run is not null)
+            {
+                var workflow = store.GetWorkflowRun(run.WorkflowRunId);
+                storylineId = workflow?.StorylineId ?? storylineId;
+            }
+
+            if (!string.IsNullOrWhiteSpace(taskId))
+            {
+                var owned = store.GetTask(taskId);
+                if (owned is null || !StringComparer.Ordinal.Equals(owned.RunId, ownedRun))
+                {
+                    taskId = null;
+                }
+            }
+            else
+            {
+                var running = store.LoadSnapshot().Tasks.FirstOrDefault(item =>
+                    StringComparer.Ordinal.Equals(item.RunId, ownedRun) &&
+                    TaskStatusCodec.TryParse(item.Status, out var status) &&
+                    status is RuntimeTaskStatus.Running or RuntimeTaskStatus.Paused);
+                taskId = running?.TaskId;
+            }
+        }
+
+        return OversightResolver.Resolve(
+            applicationDefaults.Current,
+            store.ListOversightOverrides(),
+            BuildActivationContext(projectId, storylineId, taskId, runId));
+    }
+
+    public void Record(DelegatedDecisionRecord record)
+    {
+        try
+        {
+            store.InsertDelegatedDecision(record);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _ = exception;
+        }
+    }
+
+    public void OnSafeCheckpoint(string checkpointId, string runId, string? taskId, long createdAtMs)
+    {
+        _ = checkpointId;
+        _ = createdAtMs;
+        ReevaluatePendingApprovals(runId, taskId);
+    }
 
     public RuntimeResult<SubmitResultArtifactResponse> SubmitResultArtifact(
         SubmitResultArtifactRequest request,
         CallerPrincipal? principal)
     {
         ArgumentNullException.ThrowIfNull(request);
-        if (principal is { Kind: not PrincipalKind.AgentRun })
+        var owned = AgentTaskOwnership.RequireOwnedAgentTask(store, principal, request.TaskId);
+        if (!owned.Succeeded || owned.Value is null)
         {
-            return RuntimeResults.Fail<SubmitResultArtifactResponse>(RuntimeError.OversightDenied, "agent-session-required");
+            return RuntimeResults.Fail<SubmitResultArtifactResponse>(
+                owned.Failure?.Code ?? RuntimeError.TaskOwnershipDenied,
+                owned.Failure?.Detail);
         }
 
-        var task = store.GetTask(request.TaskId);
-        if (task is null)
+        var task = owned.Value;
+        if (TaskStatusCodec.TryParse(task.Status, out var taskStatus) && taskStatus == RuntimeTaskStatus.Completed)
         {
-            return RuntimeResults.Fail<SubmitResultArtifactResponse>(RuntimeError.NotFound, "task");
+            return RuntimeResults.Fail<SubmitResultArtifactResponse>(RuntimeError.ResultFrozen, "completed-task");
+        }
+
+        if (taskStatus is RuntimeTaskStatus.Ready or RuntimeTaskStatus.Blocked or RuntimeTaskStatus.Pending)
+        {
+            return RuntimeResults.Fail<SubmitResultArtifactResponse>(RuntimeError.IllegalCompletionLifecycle, "not-executing");
         }
 
         if (!ResultArtifactStatusCodec.TryParse(request.Status, out _))
@@ -76,125 +134,168 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<SubmitResultArtifactResponse>(RuntimeError.CompletionFailed, "invalid-status");
         }
 
-        var artifact = ResultArtifactCanonicalJson.ParseColumns(
-            Guid.NewGuid().ToString("D"),
-            request.TaskId,
-            request.Status,
-            request.ConclusionJson,
-            request.FindingsJson,
-            request.EvidenceJson,
-            request.UncertaintyJson,
-            request.DiagnosticsJson,
-            request.FreshnessJson,
-            clock.UtcNow.ToUnixTimeMilliseconds());
-        if (ResultArtifactCanonicalJson.ContainsTranscript(artifact) ||
-            SecretRedaction.ContainsSecretMaterial(ResultArtifactCanonicalJson.Write(artifact)))
+        DurableResultArtifactRecord? durable = null;
+        RuntimeFailure? failure = null;
+        store.InTransaction(() =>
         {
-            artifact = ResultArtifactCanonicalJson.ParseColumns(
-                artifact.ResultArtifactId,
-                artifact.TaskId,
+            var current = store.GetTask(request.TaskId);
+            if (current is null)
+            {
+                failure = new RuntimeFailure(RuntimeError.NotFound, "task");
+                return;
+            }
+
+            if (TaskStatusCodec.TryParse(current.Status, out var live) && live == RuntimeTaskStatus.Completed)
+            {
+                failure = new RuntimeFailure(RuntimeError.ResultFrozen, "completed-task");
+                return;
+            }
+
+            var attempt = store.FindActiveAttempt(request.TaskId);
+            var parsed = ResultArtifactCanonicalJson.ParseColumns(
+                Guid.NewGuid().ToString("D"),
+                request.TaskId,
                 request.Status,
                 SecretRedaction.RedactObjectJson(request.ConclusionJson),
                 SecretRedaction.RedactObjectJson(request.FindingsJson),
-                request.EvidenceJson,
+                SecretRedaction.RedactObjectJson(request.EvidenceJson),
                 SecretRedaction.RedactObjectJson(request.UncertaintyJson),
                 SecretRedaction.RedactObjectJson(request.DiagnosticsJson),
-                request.FreshnessJson,
-                artifact.ProducedAtMs);
+                SecretRedaction.RedactObjectJson(request.FreshnessJson),
+                clock.UtcNow.ToUnixTimeMilliseconds());
+            var stamped = StampFreshness(parsed, current, attempt, principal!);
+            if (ResultArtifactCanonicalJson.ContainsTranscript(stamped) ||
+                SecretRedaction.ContainsSecretMaterial(ResultArtifactCanonicalJson.Write(stamped)))
+            {
+                failure = new RuntimeFailure(RuntimeError.CompletionFailed, "secret-or-transcript");
+                return;
+            }
+
+            durable = ResultArtifactCanonicalJson.ToDurable(stamped);
+            store.InsertResultArtifact(durable);
+        });
+
+        if (failure is not null)
+        {
+            return RuntimeResults.Fail<SubmitResultArtifactResponse>(failure.Code, failure.Detail);
         }
 
-        var durable = ResultArtifactCanonicalJson.ToDurable(artifact);
-        store.InsertResultArtifact(durable);
-        RecomputeConsumersOf(request.TaskId, durable.ResultArtifactId);
+        RecomputeConsumersOf(request.TaskId, durable!.ResultArtifactId);
         return RuntimeResults.Success(new SubmitResultArtifactResponse(durable.ResultArtifactId, durable.Status));
     }
 
     public RuntimeResult<TaskCompletionOutcome> RequestTaskCompletion(string taskId, CallerPrincipal? principal)
     {
-        if (principal is { Kind: not PrincipalKind.AgentRun })
-        {
-            return RuntimeResults.Fail<TaskCompletionOutcome>(RuntimeError.OversightDenied, "agent-session-required");
-        }
-
-        var task = store.GetTask(taskId);
-        if (task is null)
-        {
-            return RuntimeResults.Fail<TaskCompletionOutcome>(RuntimeError.NotFound, "task");
-        }
-
-        if (TaskStatusCodec.TryParse(task.Status, out var existingStatus) &&
-            existingStatus == RuntimeTaskStatus.Completed)
-        {
-            var existing = store.GetLatestResultArtifact(taskId);
-            if (existing is null)
-            {
-                return RuntimeResults.Fail<TaskCompletionOutcome>(RuntimeError.CompletionFailed, "completed-without-result");
-            }
-
-            return RuntimeResults.Success(new TaskCompletionOutcome("pass", existing.ResultArtifactId, []));
-        }
-
-        var artifactRecord = store.GetLatestResultArtifact(taskId);
-        var artifact = artifactRecord is null ? null : ResultArtifactCanonicalJson.FromDurable(artifactRecord);
-        var contract = TaskCompletionContractCanonicalJson.Parse(task.CompletionContractJson);
-        var semantic = contract.HasSemanticCriteria && artifact is not null
-            ? semanticEvaluator.Evaluate(contract, artifact)
-            : SemanticCompletionOutcome.Pass;
-        var check = TaskCompletionContractChecker.Check(
-            contract,
-            new CompletionCheckInputs(
-                artifact?.OutputKeys ?? new HashSet<string>(StringComparer.Ordinal),
-                CompletedTaskIds(),
-                CurrentInputRefs(artifact),
-                artifact?.OutputKeys ?? new HashSet<string>(StringComparer.Ordinal),
-                artifact?.BlockingDiagnosticCount ?? 0,
-                store.DependenciesForConsumer(taskId),
-                artifactRecord is not null,
-                semantic));
-        if (check.Outcome == CompletionCheckOutcome.SemanticReviewRequired)
-        {
-            return RuntimeResults.Fail<TaskCompletionOutcome>(RuntimeError.SemanticReviewRequired, "semantic-review-required");
-        }
-
-        if (check.Outcome is not CompletionCheckOutcome.Pass)
+        var owned = AgentTaskOwnership.RequireOwnedAgentTask(store, principal, taskId);
+        if (!owned.Succeeded || owned.Value is null)
         {
             return RuntimeResults.Fail<TaskCompletionOutcome>(
-                RuntimeError.CompletionFailed,
-                string.Join(',', check.Failures));
+                owned.Failure?.Code ?? RuntimeError.TaskOwnershipDenied,
+                owned.Failure?.Detail);
         }
 
-        var now = clock.UtcNow.ToUnixTimeMilliseconds();
-        try
+        TaskCompletionOutcome? outcome = null;
+        RuntimeFailure? failure = null;
+        store.InTransaction(() =>
         {
-            store.InTransaction(() =>
+            var task = store.GetTask(taskId);
+            if (task is null)
             {
-                if (faults.Fault == SchedulerFaultPoint.AfterTaskBeforeResultPersist)
+                failure = new RuntimeFailure(RuntimeError.NotFound, "task");
+                return;
+            }
+
+            if (TaskStatusCodec.TryParse(task.Status, out var existingStatus) &&
+                existingStatus == RuntimeTaskStatus.Completed)
+            {
+                var existing = store.GetLatestResultArtifact(taskId);
+                if (existing is null)
                 {
-                    store.UpdateTaskStatus(taskId, TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Completed), now);
-                    throw new SchedulerFaultInjectedException(SchedulerFaultPoint.AfterTaskBeforeResultPersist);
+                    failure = new RuntimeFailure(RuntimeError.CompletionFailed, "completed-without-result");
+                    return;
                 }
 
-                if (artifactRecord is null)
-                {
-                    throw new InvalidOperationException("required-result-artifact-missing");
-                }
+                outcome = new TaskCompletionOutcome("pass", existing.ResultArtifactId, []);
+                return;
+            }
 
-                if (faults.Fault == SchedulerFaultPoint.AfterResultBeforeTaskComplete)
-                {
-                    throw new SchedulerFaultInjectedException(SchedulerFaultPoint.AfterResultBeforeTaskComplete);
-                }
+            if (!TaskStatusCodec.TryParse(task.Status, out var currentStatus) ||
+                !RuntimeLifecycle.IsLegal(currentStatus, RuntimeTaskStatus.Completed))
+            {
+                failure = new RuntimeFailure(RuntimeError.IllegalCompletionLifecycle, currentStatus.ToString());
+                return;
+            }
 
-                CompleteAttempt(taskId, now);
+            var attempt = store.FindActiveAttempt(taskId);
+            if (attempt is null ||
+                !AttemptStatusCodec.TryParse(attempt.Status, out var attemptStatus) ||
+                attemptStatus is not (AttemptStatus.Starting or AttemptStatus.Running) ||
+                !StringComparer.Ordinal.Equals(attempt.TaskId, taskId))
+            {
+                failure = new RuntimeFailure(RuntimeError.IllegalCompletionLifecycle, "no-active-attempt");
+                return;
+            }
+
+            var artifactRecord = store.GetLatestResultArtifact(taskId);
+            var artifact = artifactRecord is null ? null : ResultArtifactCanonicalJson.FromDurable(artifactRecord);
+            if (artifactRecord is null || artifact is null || artifact.Status != ResultArtifactStatus.Complete)
+            {
+                failure = new RuntimeFailure(RuntimeError.CompletionFailed, "result-not-complete");
+                return;
+            }
+
+            var contract = TaskCompletionContractCanonicalJson.Parse(task.CompletionContractJson);
+            var semantic = contract.HasSemanticCriteria
+                ? semanticEvaluator.Evaluate(contract, artifact)
+                : SemanticCompletionOutcome.Pass;
+            var check = TaskCompletionContractChecker.Check(
+                contract,
+                new CompletionCheckInputs(
+                    artifact.OutputKeys,
+                    CompletedTaskIds(),
+                    CurrentInputRefs(artifact),
+                    artifact.OutputKeys,
+                    artifact.BlockingDiagnosticCount,
+                    store.DependenciesForConsumer(taskId),
+                    true,
+                    semantic));
+            if (check.Outcome == CompletionCheckOutcome.SemanticReviewRequired)
+            {
+                failure = new RuntimeFailure(RuntimeError.SemanticReviewRequired, "semantic-review-required");
+                return;
+            }
+
+            if (check.Outcome is not CompletionCheckOutcome.Pass)
+            {
+                failure = new RuntimeFailure(RuntimeError.CompletionFailed, string.Join(',', check.Failures));
+                return;
+            }
+
+            var now = clock.UtcNow.ToUnixTimeMilliseconds();
+            if (faults.Fault == SchedulerFaultPoint.AfterTaskBeforeResultPersist)
+            {
                 store.UpdateTaskStatus(taskId, TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Completed), now);
-                RecomputeConsumersOf(taskId, artifactRecord.ResultArtifactId);
-            });
-        }
-        catch (SchedulerFaultInjectedException)
+                throw new SchedulerFaultInjectedException(SchedulerFaultPoint.AfterTaskBeforeResultPersist);
+            }
+
+            if (faults.Fault == SchedulerFaultPoint.AfterResultBeforeTaskComplete)
+            {
+                throw new SchedulerFaultInjectedException(SchedulerFaultPoint.AfterResultBeforeTaskComplete);
+            }
+
+            var frozenResultId = artifactRecord.ResultArtifactId;
+            CompleteAttempt(taskId, now);
+            store.UpdateTaskStatus(taskId, TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Completed), now);
+            RecomputeConsumersOf(taskId, frozenResultId);
+            outcome = new TaskCompletionOutcome("pass", frozenResultId, []);
+        });
+
+        if (failure is not null)
         {
-            throw;
+            return RuntimeResults.Fail<TaskCompletionOutcome>(failure.Code, failure.Detail);
         }
 
-        return RuntimeResults.Success(new TaskCompletionOutcome("pass", artifactRecord!.ResultArtifactId, []));
+        return RuntimeResults.Success(outcome!);
     }
 
     public RuntimeResult<GetResultArtifactResponse> GetResultArtifact(string taskId, string? resultArtifactId)
@@ -226,6 +327,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         var resultIds = new List<string>();
         var evidenceIds = new List<string>();
         var warnings = new List<string>();
+        var edges = new List<TaskHandoffEdgeDto>();
         foreach (var dependency in deps)
         {
             var evaluation = ResultDependencyPolicy.Evaluate(dependency);
@@ -234,17 +336,29 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 warnings.Add(dependency.DependencyId + ":" + ResultDependencyStatusCodec.ToDurableValue(evaluation.EffectiveStatus));
             }
 
+            var freshnessState = "missing";
             if (!string.IsNullOrWhiteSpace(dependency.ResultArtifactId))
             {
                 resultIds.Add(dependency.ResultArtifactId);
-                if (includeEvidence)
+                var artifact = store.GetResultArtifact(dependency.ResultArtifactId);
+                if (artifact is not null)
                 {
-                    var artifact = store.GetResultArtifact(dependency.ResultArtifactId);
-                    if (artifact is not null)
+                    freshnessState = ResultFreshnessStateCodec.ToDurableValue(
+                        ResultArtifactCanonicalJson.FromDurable(artifact).Freshness.State);
+                    if (includeEvidence)
                     {
                         evidenceIds.AddRange(ResultArtifactCanonicalJson.FromDurable(artifact).EvidenceIds);
                     }
                 }
+
+                edges.Add(new TaskHandoffEdgeDto(
+                    dependency.ResultArtifactId,
+                    dependency.DependencyKind,
+                    ResultDependencyStatusCodec.ToDurableValue(evaluation.EffectiveStatus),
+                    freshnessState,
+                    evaluation.BlocksDispatch,
+                    evaluation.BlocksCompletion,
+                    evaluation.HasWarning));
             }
         }
 
@@ -252,6 +366,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             consumerTaskId,
             resultIds.Distinct(StringComparer.Ordinal).ToArray(),
             evidenceIds.Distinct(StringComparer.Ordinal).ToArray(),
+            edges.ToArray(),
             warnings.ToArray(),
             IncludeTranscript: false));
     }
@@ -289,7 +404,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         return RuntimeResults.Success(new CreateResultDependencyResponse(id, ResultDependencyStatusCodec.ToDurableValue(status)));
     }
 
-    public RuntimeResult<UpdateResultDependencyResponse> UpdateResultDependency(string dependencyId, string kind, string status)
+    public RuntimeResult<UpdateResultDependencyResponse> UpdateResultDependency(string dependencyId, string kind)
     {
         var current = store.GetDependency(dependencyId);
         if (current is null)
@@ -297,14 +412,19 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<UpdateResultDependencyResponse>(RuntimeError.NotFound, "dependency");
         }
 
-        if (!ResultDependencyKindCodec.TryParse(kind, out _) || !ResultDependencyStatusCodec.TryParse(status, out _))
+        if (!ResultDependencyKindCodec.TryParse(kind, out _))
         {
-            return RuntimeResults.Fail<UpdateResultDependencyResponse>(RuntimeError.IllegalTransition, "invalid-edge");
+            return RuntimeResults.Fail<UpdateResultDependencyResponse>(RuntimeError.IllegalTransition, "invalid-kind");
         }
 
-        store.UpdateDependencyRecord(dependencyId, kind, status, current.ResultArtifactId);
+        store.UpdateDependencyRecord(dependencyId, kind, current.Status, current.ResultArtifactId);
+        RecomputeOne(store.GetDependency(dependencyId)!);
         RefreshConsumerReadiness(current.ConsumerTaskId);
-        return RuntimeResults.Success(new UpdateResultDependencyResponse(dependencyId, kind, status));
+        var updated = store.GetDependency(dependencyId)!;
+        return RuntimeResults.Success(new UpdateResultDependencyResponse(
+            dependencyId,
+            updated.DependencyKind,
+            updated.Status));
     }
 
     public RuntimeResult<ProposeResultDependencyChangeResponse> ProposeResultDependencyChange(
@@ -314,15 +434,18 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         CallerPrincipal? principal)
     {
         _ = reason;
-        if (principal is { Kind: not PrincipalKind.AgentRun })
-        {
-            return RuntimeResults.Fail<ProposeResultDependencyChangeResponse>(RuntimeError.OversightDenied, "agent-session-required");
-        }
-
         var current = store.GetDependency(dependencyId);
         if (current is null)
         {
             return RuntimeResults.Fail<ProposeResultDependencyChangeResponse>(RuntimeError.NotFound, "dependency");
+        }
+
+        var owned = AgentTaskOwnership.RequireOwnedAgentTask(store, principal, current.ConsumerTaskId);
+        if (!owned.Succeeded)
+        {
+            return RuntimeResults.Fail<ProposeResultDependencyChangeResponse>(
+                owned.Failure?.Code ?? RuntimeError.TaskOwnershipDenied,
+                owned.Failure?.Detail);
         }
 
         if (!ResultDependencyKindCodec.TryParse(proposedKind, out _))
@@ -405,8 +528,9 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         var id = Guid.NewGuid().ToString("D");
-        var checkpoint = request.EffectiveAfterCheckpointId;
-        if (string.IsNullOrWhiteSpace(checkpoint) && HasInFlightExecution())
+        _ = request.EffectiveAfterCheckpointId;
+        string? checkpoint = null;
+        if (HasInFlightExecution(scope, request.ScopeId))
         {
             checkpoint = OversightActivation.PendingBindToken(id);
         }
@@ -421,12 +545,19 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             principal.TrustedInstanceId,
             now);
         store.InsertOversightOverride(record);
-        var checkpoints = new HashSet<string>(
-            store.LoadSnapshot().Checkpoints.Select(item => item.CheckpointId),
-            StringComparer.Ordinal);
-        return RuntimeResults.Success(new SetOversightOverrideResponse(
-            id,
-            OversightActivation.IsActive(record, checkpoints)));
+        var active = OversightActivation.IsActiveForExecution(
+            record,
+            BuildActivationContext(
+                scope == OversightScopeKind.Project ? request.ScopeId : principal.ProjectScope?.ProjectId.ToString("D"),
+                scope == OversightScopeKind.Storyline ? request.ScopeId : null,
+                scope == OversightScopeKind.Task ? request.ScopeId : null,
+                runId: null));
+        if (active)
+        {
+            ReevaluatePendingApprovals(null, scope == OversightScopeKind.Task ? request.ScopeId : null);
+        }
+
+        return RuntimeResults.Success(new SetOversightOverrideResponse(id, active));
     }
 
     public RuntimeResult<ListPendingApprovalsResponse> ListPendingApprovals(string? runId)
@@ -451,7 +582,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         RuntimeGrillQuestionV1 question,
         string baselineDigest)
     {
-        var approvalId = RuntimeGrillPolicy.StableApprovalId(runId, taskId, baselineDigest);
+        var approvalId = RuntimeGrillPolicy.StableApprovalId(runId, taskId, baselineDigest, reason, question);
         var existing = store.GetApproval(approvalId);
         if (existing is not null)
         {
@@ -459,7 +590,12 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
-        var oversight = Resolve(null, null, taskId);
+        var runRecord = store.GetRun(runId);
+        var workflow = runRecord is null ? null : store.GetWorkflowRun(runRecord.WorkflowRunId);
+        var oversight = OversightResolver.Resolve(
+            applicationDefaults.Current,
+            store.ListOversightOverrides(),
+            BuildActivationContext(null, workflow?.StorylineId, taskId, runId));
         var request = new RuntimeGrillDecisionRequestV1(
             RuntimeGrillDecisionRequestV1.CurrentSchemaVersion,
             approvalId,
@@ -549,68 +685,82 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAlreadyResolved, "stale_already_resolved");
         }
 
-        if (faults.Fault == SchedulerFaultPoint.GrillResolutionRace &&
-            store.GetApproval(request.ApprovalId) is { } raced &&
-            ApprovalStatusCodec.TryParse(raced.Status, out var racedStatus) &&
-            racedStatus is ApprovalStatus.Resolved or ApprovalStatus.Denied)
+        var persisted = LoadPersistedGrillRequest(approval);
+        if (persisted is null)
         {
-            return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAlreadyResolved, "stale_already_resolved");
+            return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.CheckpointCorrupt, "grill-request-missing");
         }
 
-        var oversight = Resolve(principal?.ProjectScope?.ProjectId.ToString("D"), null, approval.TaskId);
-        var reason = ParseGrillReason(request.Option) ?? RuntimeGrillPauseReason.NewCreativeDecisionRequired;
-        var agent = principal is { Kind: PrincipalKind.AgentRun };
-        if (agent && !RuntimeGrillPolicy.AgentMayResolve(
-                oversight,
-                reason,
-                insideApprovedPlan: !StringComparer.Ordinal.Equals(request.Option, "expand-scope"),
-                taskScopeUnchanged: !StringComparer.Ordinal.Equals(request.Option, "expand-scope"),
-                capabilityAllowed: true,
-                inputsFresh: true))
+        if (principal is { Kind: PrincipalKind.AgentRun })
+        {
+            if (string.IsNullOrWhiteSpace(principal.RunId) ||
+                !StringComparer.Ordinal.Equals(principal.RunId, persisted.RunId))
+            {
+                return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillOwnershipDenied, "cross-run");
+            }
+        }
+        else if (principal is not { Kind: PrincipalKind.UserInteractive })
         {
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAuthorRequired, "author-required");
         }
 
-        if (!agent && principal is not { Kind: PrincipalKind.UserInteractive })
+        var option = request.Option ?? request.Resolution;
+        if (string.IsNullOrWhiteSpace(option) ||
+            !persisted.Question.Options.Contains(option, StringComparer.Ordinal))
+        {
+            return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillOptionRejected, "unknown-option");
+        }
+
+        var oversight = ResolveForPrincipal(principal, persisted.TaskId);
+        var capability = scheduler.ProbeCapability(principal, Capability.AgentSpawn);
+        var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(
+            store.ToolCallsFor(persisted.RunId, persisted.TaskId),
+            persisted.TaskId);
+        var inputsFresh = !unknown;
+        if (principal is { Kind: PrincipalKind.AgentRun } &&
+            !RuntimeGrillPolicy.AgentMayResolve(
+                oversight,
+                persisted.Reason,
+                insideApprovedPlan: persisted.Reason is not RuntimeGrillPauseReason.TaskScopeExpansion,
+                taskScopeUnchanged: persisted.Reason is not RuntimeGrillPauseReason.TaskScopeExpansion,
+                capabilityAllowed: capability,
+                inputsFresh: inputsFresh))
         {
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAuthorRequired, "author-required");
         }
 
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
-        var winner = RuntimeGrillPolicy.Compete(currentStatus, ApprovalStatus.Resolved);
-        if (winner == ApprovalStatus.StaleAlreadyResolved)
+        var next = approval with
+        {
+            Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Resolved),
+            DecidedBy = principal?.Kind == PrincipalKind.AgentRun
+                ? principal.ToString()
+                : principal?.TrustedInstanceId,
+            DecidedAtMs = now
+        };
+        if (!store.TryCompareAndSetApproval(
+                approval.ApprovalId,
+                ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending),
+                next))
         {
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAlreadyResolved, "stale_already_resolved");
         }
 
-        store.UpdateApproval(approval with
-        {
-            Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Resolved),
-            DecidedBy = principal?.ToString(),
-            DecidedAtMs = now
-        });
+        var checkpoint = store.CheckpointsForRun(persisted.RunId)
+            .OrderByDescending(item => item.CreatedAtMs)
+            .FirstOrDefault(item =>
+                StringComparer.Ordinal.Equals(item.CheckpointId, persisted.CheckpointId) ||
+                item.PayloadJson.Contains(persisted.ApprovalId, StringComparison.Ordinal));
+        var run = store.GetRun(persisted.RunId);
         var freshness = scheduler.ClassifyResume(
-            approval.RunId,
-            new FreshnessInputs(
-                null,
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                null,
-                null,
-                null,
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                null,
-                null,
-                new Dictionary<string, string>(StringComparer.Ordinal),
-                false,
-                reason == RuntimeGrillPauseReason.PlanAssumptionsInvalid,
-                false,
-                false));
+            persisted.RunId,
+            BuildResumeInputs(checkpoint, run, unknown, persisted.Reason));
         var mapped = freshness.Succeeded && freshness.Value is not null
-            ? RuntimeGrillPolicy.MapResume(reason, freshness.Value.Kind)
+            ? RuntimeGrillPolicy.MapResume(persisted.Reason, freshness.Value.Kind)
             : RuntimeGrillResolutionKind.PlanBlocked;
         if (mapped == RuntimeGrillResolutionKind.Continue &&
-            store.GetRun(approval.RunId) is { } run &&
-            RunStatusCodec.TryParse(run.Status, out var paused) &&
+            store.GetRun(approval.RunId) is { } pausedRun &&
+            RunStatusCodec.TryParse(pausedRun.Status, out var paused) &&
             paused == RunStatus.Paused)
         {
             store.UpdateRunStatus(approval.RunId, RunStatusCodec.ToDurableValue(RunStatus.Running), now);
@@ -627,7 +777,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
 
         return RuntimeResults.Success(new RuntimeGrillResolveOutcome(
             "resolved",
-            request.Resolution,
+            option,
             mapped.ToString()));
     }
 
@@ -720,9 +870,39 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<SpecialistMutationOutcome>(RuntimeError.SpecialistImmutable, "built-in");
         }
 
-        var result = CreateSpecialist(scopeKind, definitionJson, principal);
-        _ = profileId;
-        return result;
+        var existing = AllSpecialists().FirstOrDefault(item =>
+            StringComparer.Ordinal.Equals(item.SpecialistProfileId, profileId) &&
+            StringComparer.Ordinal.Equals(item.ScopeKind, scopeKind));
+        if (existing is null)
+        {
+            return RuntimeResults.Fail<SpecialistMutationOutcome>(RuntimeError.NotFound, "specialist");
+        }
+
+        SpecialistProfileDefinitionV1 profile;
+        try
+        {
+            profile = SpecialistProfileCanonicalJson.Parse(definitionJson);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            return RuntimeResults.Fail<SpecialistMutationOutcome>(RuntimeError.SpecialistInvalid, exception.Message);
+        }
+
+        if (!StringComparer.Ordinal.Equals(profile.ProfileId, profileId) || profile.ScopeKind != scope)
+        {
+            return RuntimeResults.Fail<SpecialistMutationOutcome>(RuntimeError.SpecialistIdentityMismatch, "target-body-mismatch");
+        }
+
+        var validation = SpecialistProfileValidator.Validate(profile);
+        if (!validation.IsValid)
+        {
+            return RuntimeResults.Success(new SpecialistMutationOutcome(
+                profile.ProfileId,
+                validation.Errors.Select(item => item.Code + ":" + item.Message).ToArray()));
+        }
+
+        PersistProfile(profile, scope, principal.ProjectScope?.ProjectId.ToString("D"), existing.BaseDefinitionDigest);
+        return RuntimeResults.Success(new SpecialistMutationOutcome(profile.ProfileId, []));
     }
 
     public RuntimeResult<DuplicateSpecialistResponse> DuplicateSpecialist(
@@ -916,13 +1096,24 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         var execution = BackgroundExecutionRefCodec.ParseKindColumn(record.KindJson);
-        if (!string.IsNullOrWhiteSpace(execution.RunId))
+        if (!ExecutionBelongsToOwner(execution, record))
         {
-            scheduler.CancelScope("run", execution.RunId);
+            return RuntimeResults.Fail<StopBackgroundTaskResponse>(RuntimeError.TaskOwnershipDenied, "forged-execution-ref");
         }
-        else
+
+        var stopped = execution.Kind switch
         {
-            scheduler.CancelScope("run", record.OwnerRunId);
+            BackgroundTaskKind.SubAgentRun => CancelOwnedChildRun(execution, record),
+            BackgroundTaskKind.ToolCall => CancelOwnedToolCall(execution, record),
+            BackgroundTaskKind.Worker => StopOwnedWorker(execution, record),
+            BackgroundTaskKind.RuntimeTask => CancelOwnedTask(execution, record),
+            _ => RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "unknown-kind")
+        };
+        if (!stopped.Succeeded)
+        {
+            return RuntimeResults.Fail<StopBackgroundTaskResponse>(
+                stopped.Failure?.Code ?? RuntimeError.BackgroundStopUnavailable,
+                stopped.Failure?.Detail);
         }
 
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
@@ -945,7 +1136,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         var snapshot = store.LoadSnapshot();
         var cancelledOwners = CancelledOwnerIds(snapshot);
         return store.ListBackgroundTasks(null)
-            .Select(item => ClassifyOne(item, snapshot, cancelledOwners))
+            .Select(item => ClassifyOne(item, snapshot, cancelledOwners, scheduler))
             .ToArray();
     }
 
@@ -963,7 +1154,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 continue;
             }
 
-            var classification = ClassifyOne(record, snapshot, cancelledOwners);
+            var classification = ClassifyOne(record, snapshot, cancelledOwners, scheduler);
             var next = classification switch
             {
                 BackgroundRecoveryClassification.OwnerCancelled => BackgroundTaskStatus.Cancelled,
@@ -999,17 +1190,37 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     private static BackgroundRecoveryClassification ClassifyOne(
         DurableBackgroundTaskRecord item,
         SchedulerSnapshot snapshot,
-        HashSet<string> cancelledOwners)
+        HashSet<string> cancelledOwners,
+        RuntimeSchedulerService scheduler)
     {
         var execution = BackgroundExecutionRefCodec.ParseKindColumn(item.KindJson);
         var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(
             snapshot.ToolCalls,
             execution.TaskId ?? item.OwnerTaskId);
-        var alive = execution.RunId is null ||
-                    snapshot.Runs.Any(run =>
-                        StringComparer.Ordinal.Equals(run.RunId, execution.RunId) &&
-                        RunStatusCodec.TryParse(run.Status, out var status) &&
-                        RuntimeLifecycle.IsActive(status));
+        var alive = execution.Kind switch
+        {
+            BackgroundTaskKind.SubAgentRun =>
+                execution.RunId is not null &&
+                snapshot.Runs.Any(run =>
+                    StringComparer.Ordinal.Equals(run.RunId, execution.RunId) &&
+                    RunStatusCodec.TryParse(run.Status, out var status) &&
+                    RuntimeLifecycle.IsActive(status)),
+            BackgroundTaskKind.ToolCall =>
+                execution.ToolCallId is not null &&
+                snapshot.ToolCalls.Any(call =>
+                    StringComparer.Ordinal.Equals(call.ToolCallId, execution.ToolCallId) &&
+                    StringComparer.Ordinal.Equals(call.Status, "running")),
+            BackgroundTaskKind.Worker =>
+                !string.IsNullOrWhiteSpace(execution.WorkerInstanceId) &&
+                scheduler.WorkerIsAlive(execution.WorkerInstanceId),
+            BackgroundTaskKind.RuntimeTask =>
+                execution.TaskId is not null &&
+                snapshot.Tasks.Any(task =>
+                    StringComparer.Ordinal.Equals(task.TaskId, execution.TaskId) &&
+                    TaskStatusCodec.TryParse(task.Status, out var status) &&
+                    status is RuntimeTaskStatus.Running or RuntimeTaskStatus.Paused or RuntimeTaskStatus.Ready),
+            _ => false
+        };
         return BackgroundTaskLifecycle.ClassifyRestart(
             item,
             cancelledOwners.Contains(item.OwnerRunId),
@@ -1167,23 +1378,270 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         return set;
     }
 
-    private bool HasInFlightExecution()
+    private bool HasInFlightExecution(OversightScopeKind scope, string? scopeId)
     {
         var snapshot = store.LoadSnapshot();
-        return snapshot.Runs.Any(item =>
-                   RunStatusCodec.TryParse(item.Status, out var status) && RuntimeLifecycle.IsActive(status)) ||
-               snapshot.Tasks.Any(item =>
-                   TaskStatusCodec.TryParse(item.Status, out var status) &&
-                   status is RuntimeTaskStatus.Running or RuntimeTaskStatus.Paused);
+        return scope switch
+        {
+            OversightScopeKind.Task => snapshot.Tasks.Any(item =>
+                StringComparer.Ordinal.Equals(item.TaskId, scopeId) &&
+                TaskStatusCodec.TryParse(item.Status, out var status) &&
+                status is RuntimeTaskStatus.Running or RuntimeTaskStatus.Paused),
+            OversightScopeKind.Storyline => snapshot.Runs.Any(run =>
+            {
+                var workflow = snapshot.WorkflowRuns.FirstOrDefault(item =>
+                    StringComparer.Ordinal.Equals(item.WorkflowRunId, run.WorkflowRunId));
+                return StringComparer.Ordinal.Equals(workflow?.StorylineId, scopeId) &&
+                       RunStatusCodec.TryParse(run.Status, out var status) &&
+                       RuntimeLifecycle.IsActive(status);
+            }),
+            _ => snapshot.Runs.Any(item =>
+                     RunStatusCodec.TryParse(item.Status, out var status) && RuntimeLifecycle.IsActive(status)) ||
+                 snapshot.Tasks.Any(item =>
+                     TaskStatusCodec.TryParse(item.Status, out var status) &&
+                     status is RuntimeTaskStatus.Running or RuntimeTaskStatus.Paused)
+        };
     }
 
-    private static RuntimeGrillPauseReason? ParseGrillReason(string? option) => option switch
+    private OversightActivationContext BuildActivationContext(
+        string? projectId,
+        string? storylineId,
+        string? taskId,
+        string? runId)
     {
-        "expand-scope" => RuntimeGrillPauseReason.TaskScopeExpansion,
-        "invalid-plan" => RuntimeGrillPauseReason.PlanAssumptionsInvalid,
-        "ambiguous" => RuntimeGrillPauseReason.PlanAuthorityAmbiguous,
-        _ => null
-    };
+        DurableTaskRecord? task = null;
+        if (!string.IsNullOrWhiteSpace(taskId))
+        {
+            task = store.GetTask(taskId);
+            runId ??= task?.RunId;
+        }
+
+        DurableRunRecord? run = null;
+        if (!string.IsNullOrWhiteSpace(runId))
+        {
+            run = store.GetRun(runId);
+        }
+
+        var workflow = run is null ? null : store.GetWorkflowRun(run.WorkflowRunId);
+        var checkpoints = run is null ? Array.Empty<DurableCheckpointRecord>() : store.CheckpointsForRun(run.RunId);
+        return new OversightActivationContext(
+            projectId,
+            workflow?.StorylineId ?? storylineId,
+            task?.TaskId ?? taskId,
+            run?.RunId ?? runId,
+            checkpoints);
+    }
+
+    private TaskResultArtifactV1 StampFreshness(
+        TaskResultArtifactV1 artifact,
+        DurableTaskRecord task,
+        DurableAttemptRecord? attempt,
+        CallerPrincipal principal)
+    {
+        var evidence = new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal);
+        foreach (var id in artifact.EvidenceIds)
+        {
+            var row = store.GetEvidence(id);
+            if (row is not null)
+            {
+                evidence[id] = row;
+            }
+        }
+
+        var upstream = new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal);
+        foreach (var reference in artifact.Freshness.ProducedAgainst.UpstreamRequiredResultRefs)
+        {
+            var row = store.GetResultArtifact(reference) ??
+                      store.GetLatestResultArtifact(reference);
+            if (row is not null)
+            {
+                upstream[reference] = row;
+            }
+        }
+
+        var stamped = ResultFreshnessAuthority.Stamp(
+            artifact.Freshness,
+            new ResultFreshnessAuthorityInputs(
+                principal.RunId ?? task.RunId,
+                task.TaskId,
+                attempt?.AttemptId,
+                upstream,
+                evidence,
+                null,
+                new HashSet<string>(StringComparer.Ordinal)),
+            artifact.EvidenceIds);
+        return artifact with { Freshness = stamped };
+    }
+
+    private RuntimeGrillDecisionRequestV1? LoadPersistedGrillRequest(DurableApprovalRecord approval)
+    {
+        foreach (var checkpoint in store.CheckpointsForRun(approval.RunId).OrderByDescending(item => item.CreatedAtMs))
+        {
+            try
+            {
+                var parsed = CanonicalJson.Parse(checkpoint.PayloadJson, checkpoint.SchemaVersion);
+                var request = RuntimeGrillPolicy.TryParse(parsed.DagTaskStateJson);
+                if (request is not null && StringComparer.Ordinal.Equals(request.ApprovalId, approval.ApprovalId))
+                {
+                    return request with { CheckpointId = checkpoint.CheckpointId };
+                }
+            }
+            catch (CheckpointSchemaException)
+            {
+            }
+        }
+
+        return null;
+    }
+
+    private static FreshnessInputs BuildResumeInputs(
+        DurableCheckpointRecord? checkpoint,
+        DurableRunRecord? run,
+        bool unknown,
+        RuntimeGrillPauseReason reason)
+    {
+        _ = reason;
+        _ = checkpoint;
+        return new FreshnessInputs(
+            null,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            run?.PromptConfigId,
+            run?.EffectivePromptDigest,
+            null,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            run?.ProviderId,
+            run?.ModelId,
+            new Dictionary<string, string>(StringComparer.Ordinal),
+            false,
+            false,
+            false,
+            unknown);
+    }
+
+    private void ReevaluatePendingApprovals(string? runId, string? taskId)
+    {
+        foreach (var approval in store.ListApprovals(runId))
+        {
+            if (!ApprovalStatusCodec.TryParse(approval.Status, out var status) || status != ApprovalStatus.Pending)
+            {
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(taskId) &&
+                !string.IsNullOrWhiteSpace(approval.TaskId) &&
+                !StringComparer.Ordinal.Equals(approval.TaskId, taskId))
+            {
+                continue;
+            }
+
+            var oversight = OversightResolver.Resolve(
+                applicationDefaults.Current,
+                store.ListOversightOverrides(),
+                BuildActivationContext(null, null, approval.TaskId, approval.RunId));
+            var snapshot = new PendingApprovalSnapshot(
+                approval.ApprovalId,
+                approval.ApprovalKind,
+                StringComparer.Ordinal.Equals(approval.ApprovalKind, ApprovalKindCodec.RuntimeGrill),
+                CapabilityAllowed: false,
+                GateValid: true,
+                InputsFresh: true,
+                PlanValid: true,
+                ProjectTrusted: false,
+                HardDenied: false,
+                oversight);
+            var classification = PendingApprovalReevaluator.Reevaluate(snapshot);
+            if (classification == PendingApprovalReevaluation.Denied)
+            {
+                store.TryCompareAndSetApproval(
+                    approval.ApprovalId,
+                    ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending),
+                    approval with
+                    {
+                        Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Denied),
+                        DecidedAtMs = clock.UtcNow.ToUnixTimeMilliseconds()
+                    });
+            }
+        }
+    }
+
+    private bool ExecutionBelongsToOwner(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        var snapshot = store.LoadSnapshot();
+        return execution.Kind switch
+        {
+            BackgroundTaskKind.SubAgentRun =>
+                execution.RunId is not null &&
+                snapshot.Runs.Any(run =>
+                    StringComparer.Ordinal.Equals(run.RunId, execution.RunId) &&
+                    StringComparer.Ordinal.Equals(run.ParentRunId, record.OwnerRunId)),
+            BackgroundTaskKind.ToolCall =>
+                execution.ToolCallId is not null &&
+                store.GetToolCall(execution.ToolCallId) is { } tool &&
+                StringComparer.Ordinal.Equals(tool.RunId, record.OwnerRunId),
+            BackgroundTaskKind.Worker =>
+                execution.WorkerInstanceId is not null &&
+                scheduler.WorkerSnapshot().Any(item =>
+                    StringComparer.Ordinal.Equals(item.WorkerInstanceId, execution.WorkerInstanceId) &&
+                    StringComparer.Ordinal.Equals(item.RunId, record.OwnerRunId)),
+            BackgroundTaskKind.RuntimeTask =>
+                execution.TaskId is not null &&
+                store.GetTask(execution.TaskId) is { } task &&
+                StringComparer.Ordinal.Equals(task.RunId, record.OwnerRunId),
+            _ => false
+        };
+    }
+
+    private RuntimeResult<bool> CancelOwnedChildRun(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        if (string.IsNullOrWhiteSpace(execution.RunId))
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "missing-child-run");
+        }
+
+        var result = scheduler.CancelScope("run", execution.RunId);
+        return result.Succeeded
+            ? RuntimeResults.Success(true)
+            : RuntimeResults.Fail<bool>(result.Failure?.Code ?? RuntimeError.BackgroundStopUnavailable, result.Failure?.Detail);
+    }
+
+    private RuntimeResult<bool> CancelOwnedToolCall(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        _ = record;
+        if (string.IsNullOrWhiteSpace(execution.ToolCallId) || !store.TryCancelToolCall(execution.ToolCallId))
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "tool-call");
+        }
+
+        return RuntimeResults.Success(true);
+    }
+
+    private RuntimeResult<bool> StopOwnedWorker(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        _ = record;
+        if (string.IsNullOrWhiteSpace(execution.WorkerInstanceId) || !scheduler.WorkerIsAlive(execution.WorkerInstanceId))
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "worker");
+        }
+
+        var released = scheduler.ReleaseRunWorker(execution.WorkerInstanceId);
+        return released.Succeeded
+            ? RuntimeResults.Success(true)
+            : RuntimeResults.Fail<bool>(released.Failure?.Code ?? RuntimeError.BackgroundStopUnavailable, released.Failure?.Detail);
+    }
+
+    private RuntimeResult<bool> CancelOwnedTask(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        _ = record;
+        if (string.IsNullOrWhiteSpace(execution.TaskId))
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "missing-task");
+        }
+
+        var result = scheduler.CancelScope("task", execution.TaskId);
+        return result.Succeeded
+            ? RuntimeResults.Success(true)
+            : RuntimeResults.Fail<bool>(result.Failure?.Code ?? RuntimeError.BackgroundStopUnavailable, result.Failure?.Detail);
+    }
 
     private static BackgroundTaskDto ToDto(DurableBackgroundTaskRecord record)
     {

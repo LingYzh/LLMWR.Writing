@@ -175,9 +175,79 @@ public static class OversightActivation
             return true;
         }
 
+        if (IsPendingBind(record.EffectiveAfterCheckpointId))
+        {
+            return false;
+        }
+
         return existingCheckpointIds.Contains(record.EffectiveAfterCheckpointId);
     }
+
+    public static bool IsActiveForExecution(OversightOverrideRecord record, OversightActivationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        ArgumentNullException.ThrowIfNull(context);
+        if (string.IsNullOrWhiteSpace(record.EffectiveAfterCheckpointId))
+        {
+            return true;
+        }
+
+        if (IsPendingBind(record.EffectiveAfterCheckpointId))
+        {
+            return HasMatchingSafeCheckpoint(record, context);
+        }
+
+        return context.ExecutionCheckpoints.Any(item =>
+            StringComparer.Ordinal.Equals(item.CheckpointId, record.EffectiveAfterCheckpointId) &&
+            CheckpointMatchesScope(record, item, context));
+    }
+
+    private static bool HasMatchingSafeCheckpoint(OversightOverrideRecord record, OversightActivationContext context)
+    {
+        var after = context.ExecutionCheckpoints.Where(item => item.CreatedAtMs > record.CreatedAtMs);
+        return record.ScopeKind switch
+        {
+            OversightScopeKind.Task => false,
+            OversightScopeKind.Storyline =>
+                StringComparer.Ordinal.Equals(record.ScopeId, context.StorylineId) &&
+                after.Any(item => StringComparer.Ordinal.Equals(item.RunId, context.RunId)),
+            OversightScopeKind.Project =>
+                StringComparer.Ordinal.Equals(record.ScopeId, context.ProjectId) &&
+                after.Any(item => StringComparer.Ordinal.Equals(item.RunId, context.RunId)),
+            _ => false
+        };
+    }
+
+    private static bool CheckpointMatchesScope(
+        OversightOverrideRecord record,
+        DurableCheckpointRecord checkpoint,
+        OversightActivationContext context) =>
+        record.ScopeKind switch
+        {
+            OversightScopeKind.Task => StringComparer.Ordinal.Equals(checkpoint.TaskId, record.ScopeId),
+            OversightScopeKind.Storyline =>
+                StringComparer.Ordinal.Equals(record.ScopeId, context.StorylineId) &&
+                StringComparer.Ordinal.Equals(checkpoint.RunId, context.RunId),
+            OversightScopeKind.Project =>
+                StringComparer.Ordinal.Equals(record.ScopeId, context.ProjectId) &&
+                StringComparer.Ordinal.Equals(checkpoint.RunId, context.RunId),
+            _ => false
+        };
 }
+
+public sealed record OversightExecutionContext(
+    string? ProjectId,
+    string? StorylineId,
+    string? TaskId,
+    string? RunId,
+    string? WorkflowRunId);
+
+public sealed record OversightActivationContext(
+    string? ProjectId,
+    string? StorylineId,
+    string? TaskId,
+    string? RunId,
+    IReadOnlyList<DurableCheckpointRecord> ExecutionCheckpoints);
 
 public static class OversightResolver
 {
@@ -213,6 +283,38 @@ public static class OversightResolver
         }
 
         var project = Match(active, OversightScopeKind.Project, projectId);
+        return project is null ? applicationDefault with { WinningScope = OversightScopeKind.Application } : ToPolicy(project);
+    }
+
+    public static EffectiveOversightPolicy Resolve(
+        EffectiveOversightPolicy applicationDefault,
+        IReadOnlyList<OversightOverrideRecord> durableOverrides,
+        OversightActivationContext context)
+    {
+        ArgumentNullException.ThrowIfNull(applicationDefault);
+        ArgumentNullException.ThrowIfNull(durableOverrides);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var active = durableOverrides
+            .Where(item => item.ScopeKind != OversightScopeKind.Application)
+            .Where(item => OversightActivation.IsActiveForExecution(item, context))
+            .OrderBy(item => item.CreatedAtMs)
+            .ThenBy(item => item.OverrideId, StringComparer.Ordinal)
+            .ToArray();
+
+        var task = Match(active, OversightScopeKind.Task, context.TaskId);
+        if (task is not null)
+        {
+            return ToPolicy(task);
+        }
+
+        var storyline = Match(active, OversightScopeKind.Storyline, context.StorylineId);
+        if (storyline is not null)
+        {
+            return ToPolicy(storyline);
+        }
+
+        var project = Match(active, OversightScopeKind.Project, context.ProjectId);
         return project is null ? applicationDefault with { WinningScope = OversightScopeKind.Application } : ToPolicy(project);
     }
 
@@ -307,6 +409,22 @@ public sealed record DelegatedDecisionRecord(
     string OversightMode,
     string? PayloadDigest,
     long DecidedAtMs);
+
+public static class DelegatedDecisionEquality
+{
+    public static bool Equivalent(DelegatedDecisionRecord left, DelegatedDecisionRecord right)
+    {
+        ArgumentNullException.ThrowIfNull(left);
+        ArgumentNullException.ThrowIfNull(right);
+        return StringComparer.Ordinal.Equals(left.DelegatedDecisionId, right.DelegatedDecisionId) &&
+               StringComparer.Ordinal.Equals(left.TransactionId, right.TransactionId) &&
+               left.ScopeKind == right.ScopeKind &&
+               StringComparer.Ordinal.Equals(left.ScopeId, right.ScopeId) &&
+               left.AuthorityKind == right.AuthorityKind &&
+               StringComparer.Ordinal.Equals(left.DecidedBy, right.DecidedBy) &&
+               StringComparer.Ordinal.Equals(left.OversightMode, right.OversightMode);
+    }
+}
 
 public static class NarrativeDecisionProvenance
 {

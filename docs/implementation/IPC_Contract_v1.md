@@ -236,20 +236,20 @@ Agent cannot set `AGENT_DELEGATED` on itself. Built-in Specialist mutation is re
 
 `background_tasks.kind` stores versioned canonical JSON `BackgroundExecutionKindV1` (kind + execution identity). Application Oversight defaults and User Library Specialists are not stored as the global Source of Truth inside a single `project.db`.
 
-Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL is immediately active when no Run is in-flight. During in-flight execution, Core stores a documented pending-bind token `pending:{overrideId}` (not a Checkpoint v1 id). The next `persistCheckpoint` replaces that token with the new checkpoint id; Domain activation then requires that checkpoint to exist.
+Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL is immediately active when no matching execution is in-flight. During in-flight execution, Core stores a documented pending-bind token `pending:{overrideId}` (not a Checkpoint v1 id). Activation is execution-scoped: a Task override becomes active only after that Task's own safe checkpoint; Storyline/Project pending tokens activate per Run that has crossed a safe checkpoint after the override was created. An unrelated Task A checkpoint must not activate a Task B override. `setOversightOverride.effectiveAfterCheckpointId` is non-authoritative wire compatibility; Core ignores caller-selected existing checkpoint ids and chooses the activation boundary.
 
 | semanticType | Request | Response |
 |---|---|---|
 | `requestTaskCompletion` | `taskId` + session | `outcome` pass/fail/semantic-review + failures |
 | `submitResultArtifact` | task + canonical JSON columns + session | `resultArtifactId` |
 | `getResultArtifact` | `taskId` | canonical Result Artifact columns |
-| `getTaskHandoff` | consumer task | Result refs, optional evidence, warnings; transcript omitted |
-| `createResultDependency` | consumer/producer/`required`\|`advisory`\|`optional` | dependency id + status |
-| `updateResultDependency` | orchestrator kind/status | effective edge |
+| `getTaskHandoff` | consumer task | Result refs, optional evidence, per-edge kind/status/freshness/block/warning; transcript omitted by default |
+| `createResultDependency` | consumer/producer/`required`\|`advisory`\|`optional` | dependency id + Core-derived status |
+| `updateResultDependency` | orchestrator `dependencyId` + `dependencyKind` | effective kind + Core-recomputed status (caller status is not trusted) |
 | `proposeResultDependencyChange` | proposed kind + reason | recorded; effective kind unchanged unless orchestrator applies |
 | `refreshResultDependencyStatus` | producer/consumer | updated count |
-| `getEffectiveOversight` | project/storyline/task | both axes + winning scope |
-| `setOversightOverride` | scope + both axes + optional checkpoint | override id; USER_INTERACTIVE only |
+| `getEffectiveOversight` | project/storyline/task | both axes + winning scope from Core-owned records |
+| `setOversightOverride` | scope + both axes; `effectiveAfterCheckpointId` ignored | override id; USER_INTERACTIVE only |
 | `listPendingApprovals` | optional run | pending tool + runtime_grill items |
 | `resolveRuntimeGrill` | approval + resolution | status; author or delegated per Oversight |
 | `listSpecialists` | optional scope | summaries (built-in/user/project) |
@@ -263,7 +263,9 @@ Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL
 | `getBackgroundTask` | id | status/identity/checkpoint/duration |
 | `stopBackgroundTask` | id | cancels owned execution only |
 
-WP13 error codes include: `OVERSIGHT_MUTATION_DENIED`, `COMPLETION_CONTRACT_FAILED`, `SEMANTIC_REVIEW_REQUIRED`, `RESULT_REQUIRED_STALE`, `RUNTIME_GRILL_AUTHOR_REQUIRED`, `RUNTIME_GRILL_ALREADY_RESOLVED`, `SPECIALIST_IMMUTABLE`, `SPECIALIST_VALIDATION_FAILED`, `SPECIALIST_TEST_UNAVAILABLE`, `BACKGROUND_ILLEGAL_TRANSITION`.
+WP13 error codes include: `OVERSIGHT_MUTATION_DENIED`, `COMPLETION_CONTRACT_FAILED`, `SEMANTIC_REVIEW_REQUIRED`, `RESULT_REQUIRED_STALE`, `RESULT_FROZEN`, `TASK_OWNERSHIP_DENIED`, `ILLEGAL_COMPLETION_LIFECYCLE`, `RUNTIME_GRILL_AUTHOR_REQUIRED`, `RUNTIME_GRILL_ALREADY_RESOLVED`, `RUNTIME_GRILL_OPTION_REJECTED`, `RUNTIME_GRILL_OWNERSHIP_DENIED`, `SPECIALIST_IMMUTABLE`, `SPECIALIST_VALIDATION_FAILED`, `SPECIALIST_IDENTITY_MISMATCH`, `SPECIALIST_TEST_UNAVAILABLE`, `BACKGROUND_ILLEGAL_TRANSITION`, `BACKGROUND_STOP_UNAVAILABLE`.
+
+Agent RunSession mutations (`submitResultArtifact`, `requestTaskCompletion`, `proposeResultDependencyChange`) require the durable Task to belong to `principal.RunId`. Envelope `runId` plus a payload TaskId from another Run is denied. `createWorkflowRun.storylineId` is persisted on `workflow_runs.storyline_id` when the Storyline exists. Runtime Grill resolution reloads the durable pause request from Checkpoint; the caller may select only a persisted option. Background stop maps by `BackgroundExecutionKind` and never falls back to cancelling the owner Run.
 
 ## BlobRef
 

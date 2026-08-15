@@ -15,6 +15,8 @@ internal static partial class Program
         Run(nameof(SqliteCompletionTransactionRollsBackSplitState), SqliteCompletionTransactionRollsBackSplitState);
         Run(nameof(SqliteGrillAndBackgroundSurviveReload), SqliteGrillAndBackgroundSurviveReload);
         Run(nameof(FileUserSpecialistStoreIsApplicationScopedNotProjectDb), FileUserSpecialistStoreIsApplicationScopedNotProjectDb);
+        Run(nameof(SqliteWorkflowStorylineSurvivesReload), SqliteWorkflowStorylineSurvivesReload);
+        Run(nameof(FileUserSpecialistIdsDoNotCollide), FileUserSpecialistIdsDoNotCollide);
     }
 
     private static void SqliteWp13RoundTripAndUserVersionRemainOne()
@@ -230,5 +232,56 @@ internal static partial class Program
             1));
         Wp09AssertEqual("user.spec", store.Find("user.spec")?.SpecialistProfileId, "User Library must persist outside project.db.");
         Wp09AssertEqual(1, store.List().Count, "User Library list must roundtrip.");
+    }
+
+    private static void SqliteWorkflowStorylineSurvivesReload()
+    {
+        using var database = MigratedDatabase.Create();
+        const string storylineId = "018f3e78-1234-7abc-8def-0123456789d1";
+        using (var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(database.Path))
+        {
+            InsertObject(connection, storylineId);
+            Execute(
+                connection,
+                $"INSERT INTO storylines(storyline_id, workflow_state, updated_at_ms) VALUES ('{storylineId}', 'active', 1);");
+        }
+
+        var store = new SqliteRuntimeStore(database.Path);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            new MutableSecurityClock(DateTimeOffset.FromUnixTimeMilliseconds(40_000)),
+            new FakeRunWorkerSupervisor(),
+            new AllowSpawnAuth { Allow = true });
+        var created = RuntimeSuccess(scheduler.CreateWorkflowRun(workflowRunId: null, storylineId: storylineId));
+        Wp09AssertEqual(storylineId, created.StorylineId, "CreateWorkflowRun must persist storyline_id.");
+        var reloaded = new SqliteRuntimeStore(database.Path);
+        Wp09AssertEqual(storylineId, reloaded.GetWorkflowRun(created.WorkflowRunId)?.StorylineId,
+            "Reloaded workflow_runs.storyline_id must match.");
+        using var version = new SqliteDatabaseConnectionFactory().OpenConfigured(database.Path);
+        Wp09AssertEqual(1L, Scalar<long>(version, "PRAGMA user_version;"), "Storyline persistence must keep schema v1.");
+        Wp09AssertEqual(1L, Scalar<long>(version, "SELECT COUNT(*) FROM schema_migrations;"), "Storyline persistence must not add a migration.");
+    }
+
+    private static void FileUserSpecialistIdsDoNotCollide()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        var store = new FileUserSpecialistProfileStore(root);
+        var first = SyntheticBuiltInSpecialistCatalog.Instance.List()[0] with
+        {
+            ProfileId = "a_b",
+            Name = "first",
+            ScopeKind = SpecialistScopeKind.UserLibrary
+        };
+        var second = first with { ProfileId = "a/b", Name = "second" };
+        store.Upsert(new DurableProjectSpecialistRecord(
+            first.ProfileId, "user", null, first.Name, first.Version, SpecialistProfileCanonicalJson.Write(first), null, true, 1, 1));
+        store.Upsert(new DurableProjectSpecialistRecord(
+            second.ProfileId, "user", null, second.Name, second.Version, SpecialistProfileCanonicalJson.Write(second), null, true, 1, 1));
+        Wp09AssertEqual("first", store.Find("a_b")?.Name, "Underscore id must keep its own file.");
+        Wp09AssertEqual("second", store.Find("a/b")?.Name, "Slash id must not overwrite the underscore id.");
+        Wp09AssertEqual(2, store.List().Count, "Distinct ProfileIds must not collapse to one file.");
+        Wp09AssertEqual(2, Directory.GetFiles(root, "*.json").Count(path => !path.EndsWith(".tmp.json", StringComparison.OrdinalIgnoreCase)),
+            "Injective filenames must produce two JSON files.");
     }
 }

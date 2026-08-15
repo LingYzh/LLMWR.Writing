@@ -86,9 +86,15 @@ internal static class Wp13ContractTests
             IpcJsonContext.Default.GetTaskHandoffRequestEnvelope,
             Payload("getTaskHandoff", "request", "{\"consumerTaskId\":\"task-2\",\"includeEvidence\":false}"));
         AssertGolden(
-            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.GetTaskHandoff, new GetTaskHandoffResponse("task-2", ["ra-1"], [], ["advisory-stale"], false)),
+            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.GetTaskHandoff, new GetTaskHandoffResponse(
+                "task-2",
+                ["ra-1"],
+                [],
+                [new TaskHandoffEdgeDto("ra-1", "advisory", "warning", "stale", false, false, true)],
+                ["advisory-stale"],
+                false)),
             IpcJsonContext.Default.GetTaskHandoffResponseEnvelope,
-            Payload("getTaskHandoff", "response", "{\"consumerTaskId\":\"task-2\",\"resultArtifactIds\":[\"ra-1\"],\"evidenceIds\":[],\"warnings\":[\"advisory-stale\"],\"includeTranscript\":false}"));
+            Payload("getTaskHandoff", "response", "{\"consumerTaskId\":\"task-2\",\"resultArtifactIds\":[\"ra-1\"],\"evidenceIds\":[],\"edges\":[{\"resultArtifactId\":\"ra-1\",\"dependencyKind\":\"advisory\",\"dependencyStatus\":\"warning\",\"freshnessState\":\"stale\",\"blocksDispatch\":false,\"blocksCompletion\":false,\"hasWarning\":true}],\"warnings\":[\"advisory-stale\"],\"includeTranscript\":false}"));
 
         AssertGolden(
             Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.CreateResultDependency, new CreateResultDependencyRequest("c", "p", "required")),
@@ -100,9 +106,9 @@ internal static class Wp13ContractTests
             Payload("createResultDependency", "response", "{\"dependencyId\":\"dep-1\",\"status\":\"missing\"}"));
 
         AssertGolden(
-            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.UpdateResultDependency, new UpdateResultDependencyRequest("dep-1", "required", "current")),
+            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.UpdateResultDependency, new UpdateResultDependencyRequest("dep-1", "required")),
             IpcJsonContext.Default.UpdateResultDependencyRequestEnvelope,
-            Payload("updateResultDependency", "request", "{\"dependencyId\":\"dep-1\",\"dependencyKind\":\"required\",\"status\":\"current\"}"));
+            Payload("updateResultDependency", "request", "{\"dependencyId\":\"dep-1\",\"dependencyKind\":\"required\"}"));
         AssertGolden(
             Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.UpdateResultDependency, new UpdateResultDependencyResponse("dep-1", "required", "current")),
             IpcJsonContext.Default.UpdateResultDependencyResponseEnvelope,

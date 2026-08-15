@@ -151,7 +151,7 @@ public static class ResultDependencyPolicy
             ResultFreshnessState.NeedsRevalidation when kind == ResultDependencyKind.Required => ResultDependencyStatus.Stale,
             ResultFreshnessState.Stale or ResultFreshnessState.NeedsRevalidation when kind == ResultDependencyKind.Advisory =>
                 ResultDependencyStatus.Warning,
-            ResultFreshnessState.Stale or ResultFreshnessState.NeedsRevalidation => ResultDependencyStatus.Current,
+            ResultFreshnessState.Stale or ResultFreshnessState.NeedsRevalidation => ResultDependencyStatus.Stale,
             _ => ResultDependencyStatus.Missing
         };
     }

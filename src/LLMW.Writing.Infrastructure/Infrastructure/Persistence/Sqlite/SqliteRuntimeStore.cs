@@ -36,20 +36,21 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
         }
     }
 
-    public DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs)
+    public DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs, string? storylineId = null)
     {
         lock (gate)
         {
             using var lease = Open();
             using var command = Create(lease, """
                 INSERT INTO workflow_runs(workflow_run_id, storyline_id, status, oversight_scope_json, created_at_ms, updated_at_ms)
-                VALUES ($id, NULL, $status, NULL, $now, $now);
+                VALUES ($id, $storyline, $status, NULL, $now, $now);
                 """);
             Add(command, "$id", workflowRunId);
+            Add(command, "$storyline", (object?)storylineId ?? DBNull.Value);
             Add(command, "$status", status);
             Add(command, "$now", nowMs);
             command.ExecuteNonQuery();
-            return new DurableWorkflowRunRecord(workflowRunId, status, nowMs, nowMs);
+            return new DurableWorkflowRunRecord(workflowRunId, status, nowMs, nowMs, storylineId);
         }
     }
 
@@ -468,12 +469,17 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText =
-            "SELECT workflow_run_id, status, created_at_ms, updated_at_ms FROM workflow_runs ORDER BY created_at_ms, workflow_run_id;";
+            "SELECT workflow_run_id, status, created_at_ms, updated_at_ms, storyline_id FROM workflow_runs ORDER BY created_at_ms, workflow_run_id;";
         using var reader = command.ExecuteReader();
         var list = new List<DurableWorkflowRunRecord>();
         while (reader.Read())
         {
-            list.Add(new DurableWorkflowRunRecord(reader.GetString(0), reader.GetString(1), reader.GetInt64(2), reader.GetInt64(3)));
+            list.Add(new DurableWorkflowRunRecord(
+                reader.GetString(0),
+                reader.GetString(1),
+                reader.GetInt64(2),
+                reader.GetInt64(3),
+                reader.IsDBNull(4) ? null : reader.GetString(4)));
         }
 
         return list;

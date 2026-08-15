@@ -28,6 +28,8 @@ internal static partial class Program
         Run(nameof(BackgroundLifecycleForbidsCompletedToRunning), BackgroundLifecycleForbidsCompletedToRunning);
         Run(nameof(BackgroundExecutionIdentityRoundtripsThroughKindColumn), BackgroundExecutionIdentityRoundtripsThroughKindColumn);
         Run(nameof(EvidenceStaleWhenSourceDigestChanges), EvidenceStaleWhenSourceDigestChanges);
+        Run(nameof(ResultFreshnessAuthorityIgnoresCallerCurrent), ResultFreshnessAuthorityIgnoresCallerCurrent);
+        Run(nameof(ForwardOnlyActivationIsExecutionScoped), ForwardOnlyActivationIsExecutionScoped);
     }
 
     private static void CompletionContractDeterministicPassAndMissingOutput()
@@ -125,7 +127,11 @@ internal static partial class Program
         AssertTrue(ResultDependencyPolicy.HardBlocks(requiredStale), "REQUIRED stale must block.");
         AssertTrue(!ResultDependencyPolicy.HardBlocks(advisory), "ADVISORY stale must not hard-block.");
         AssertTrue(ResultDependencyPolicy.Evaluate(advisory).HasWarning, "ADVISORY stale must warn.");
-        AssertTrue(!ResultDependencyPolicy.HardBlocks(optional), "OPTIONAL stale must not block.");
+        var optionalRecompute = ResultDependencyPolicy.Recompute(
+            ResultDependencyKind.Optional, "ra-1", ResultFreshnessState.Stale, true);
+        AssertEqual(ResultDependencyStatus.Stale, optionalRecompute, "OPTIONAL stale must remain stale.");
+        AssertTrue(!ResultDependencyPolicy.Evaluate(optional).BlocksDispatch,
+            "OPTIONAL stale must not hard-block.");
         AssertTrue(!ResultDependencyPolicy.HardBlocks(requiredCurrent), "REQUIRED current/satisfied must be ready.");
         AssertTrue(!ResultDependencyPolicy.ProposalMutatesEffectiveEdge, "A proposal must not mutate the effective edge.");
 
@@ -284,9 +290,19 @@ internal static partial class Program
         AssertEqual(RuntimeGrillPolicy.WriteCanonical(request), RuntimeGrillPolicy.WriteCanonical(request),
             "Grill payload must be deterministic.");
         AssertEqual(
-            RuntimeGrillPolicy.StableApprovalId("run-1", "task-1", "baseline"),
-            RuntimeGrillPolicy.StableApprovalId("run-1", "task-1", "baseline"),
+            RuntimeGrillPolicy.StableApprovalId("run-1", "task-1", "baseline", RuntimeGrillPauseReason.NewCreativeDecisionRequired, request.Question),
+            RuntimeGrillPolicy.StableApprovalId("run-1", "task-1", "baseline", RuntimeGrillPauseReason.NewCreativeDecisionRequired, request.Question),
             "Grill approval identity must be stable.");
+        AssertTrue(
+            !StringComparer.Ordinal.Equals(
+                RuntimeGrillPolicy.StableApprovalId("run-1", "task-1", "baseline", RuntimeGrillPauseReason.NewCreativeDecisionRequired, request.Question),
+                RuntimeGrillPolicy.StableApprovalId(
+                    "run-1",
+                    "task-1",
+                    "baseline",
+                    RuntimeGrillPauseReason.PlanAssumptionsInvalid,
+                    request.Question)),
+            "Different grill decisions under the same baseline must not collide.");
         AssertEqual(ApprovalKindCodec.RuntimeGrill, ApprovalKindCodec.ToDurableValue(ApprovalKind.RuntimeGrill),
             "Grill kind must stay distinct from tool approval.");
         AssertTrue(!StringComparer.Ordinal.Equals(ApprovalKindCodec.RuntimeGrill, ApprovalKindCodec.ToolApproval),
@@ -383,6 +399,75 @@ internal static partial class Program
     {
         AssertTrue(EvidenceFreshness.IsStale("aaa", "bbb"), "Evidence must stale when the source digest changes.");
         AssertTrue(!EvidenceFreshness.IsStale("aaa", "aaa"), "Matching digest must remain current.");
+    }
+
+    private static void ResultFreshnessAuthorityIgnoresCallerCurrent()
+    {
+        var submitted = new ResultFreshnessV1(
+            1,
+            ResultFreshnessState.Current,
+            new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, []),
+            new ResultProvenanceV1("stolen-run", "stolen-task", "stolen-attempt", null, null, null, null, null));
+        var evidence = new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal)
+        {
+            ["ev-1"] = new EvidenceRecord("ev-1", "run-1", "task-1", "narrative", "obj", "digest", "{}", true, 1)
+        };
+        var stamped = ResultFreshnessAuthority.Stamp(
+            submitted,
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "task-1",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                evidence,
+                null,
+                new HashSet<string>(StringComparer.Ordinal)),
+            ["ev-1"]);
+        AssertEqual("run-1", stamped.Provenance.ProducedByRunId, "Core must stamp run identity.");
+        AssertEqual(ResultFreshnessState.Stale, stamped.State, "Stale evidence must not remain CURRENT.");
+        var unknown = ResultFreshnessAuthority.Stamp(
+            submitted with
+            {
+                ProducedAgainst = submitted.ProducedAgainst with { PromptConfigId = "prompt-1" },
+                Provenance = new ResultProvenanceV1("run-1", "task-1", "att-1", null, null, null, null, null)
+            },
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "task-1",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal),
+                null,
+                new HashSet<string>(StringComparer.Ordinal)),
+            []);
+        AssertEqual(ResultFreshnessState.NeedsRevalidation, unknown.State, "Unvalidatable WP14 claims must not silently be CURRENT.");
+    }
+
+    private static void ForwardOnlyActivationIsExecutionScoped()
+    {
+        var pendingB = new OversightOverrideRecord(
+            "o-b",
+            OversightScopeKind.Task,
+            "task-b",
+            NarrativeDecisionAuthority.AgentDelegated,
+            RuntimePermissionMode.AutoApproveScoped,
+            OversightActivation.PendingBindToken("o-b"),
+            "user",
+            10);
+        var checkpointA = new DurableCheckpointRecord("cp-a", "run-1", "task-a", 1, "{}", "{}", 20);
+        var contextB = new OversightActivationContext("proj", null, "task-b", "run-1", [checkpointA]);
+        AssertTrue(!OversightActivation.IsActiveForExecution(pendingB, contextB),
+            "Task A checkpoint must not activate a pending Task B override.");
+        var checkpointB = new DurableCheckpointRecord("cp-b", "run-1", "task-b", 1, "{}", "{}", 30);
+        AssertTrue(!OversightActivation.IsActiveForExecution(
+                pendingB,
+                contextB with { ExecutionCheckpoints = [checkpointA, checkpointB] }),
+            "A still-pending Task override must not activate from another Task's or pre-bind checkpoints.");
+        var boundB = pendingB with { EffectiveAfterCheckpointId = "cp-b" };
+        AssertTrue(OversightActivation.IsActiveForExecution(
+                boundB,
+                contextB with { ExecutionCheckpoints = [checkpointA, checkpointB] }),
+            "Binding the pending token to Task B's own checkpoint must activate it.");
     }
 
     private static CompletionCheckInputs Inputs(

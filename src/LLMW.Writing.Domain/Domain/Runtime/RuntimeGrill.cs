@@ -198,8 +198,88 @@ public static class RuntimeGrillPolicy
     public static string Digest(RuntimeGrillDecisionRequestV1 request) =>
         CanonicalJson.Sha256Hex(WriteCanonical(request));
 
-    public static string StableApprovalId(string runId, string? taskId, string baselineDigest) =>
-        "grill:" + CanonicalJson.Sha256Hex(runId + "\n" + (taskId ?? "") + "\n" + baselineDigest);
+    public static string StableApprovalId(
+        string runId,
+        string? taskId,
+        string baselineDigest,
+        RuntimeGrillPauseReason reason,
+        RuntimeGrillQuestionV1 question)
+    {
+        ArgumentNullException.ThrowIfNull(question);
+        var questionDigest = CanonicalJson.Sha256Hex(
+            question.DecisionKind + "\n" + question.Prompt + "\n" + string.Join('\n', question.Options.OrderBy(item => item, StringComparer.Ordinal)));
+        return "grill:" + CanonicalJson.Sha256Hex(
+            runId + "\n" + (taskId ?? "") + "\n" + baselineDigest + "\n" + ToReason(reason) + "\n" + questionDigest);
+    }
+
+    public static RuntimeGrillDecisionRequestV1? TryParse(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            if (root.ValueKind == JsonValueKind.String)
+            {
+                using var inner = JsonDocument.Parse(root.GetString() ?? "");
+                root = inner.RootElement.Clone();
+            }
+
+            if (root.ValueKind != JsonValueKind.Object ||
+                !TryParseReason(root.GetProperty("reason").GetString(), out var reason) ||
+                !NarrativeDecisionAuthorityCodec.TryParse(root.GetProperty("requiredAuthority").GetString(), out var authority))
+            {
+                return null;
+            }
+
+            var question = root.GetProperty("question");
+            var options = new List<string>();
+            foreach (var option in question.GetProperty("options").EnumerateArray())
+            {
+                var value = option.GetString();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    options.Add(value);
+                }
+            }
+
+            return new RuntimeGrillDecisionRequestV1(
+                root.TryGetProperty("schemaVersion", out var version) ? version.GetInt32() : 1,
+                root.GetProperty("approvalId").GetString() ?? "",
+                root.GetProperty("runId").GetString() ?? "",
+                root.TryGetProperty("taskId", out var task) ? task.GetString() : null,
+                reason,
+                new RuntimeGrillQuestionV1(
+                    question.GetProperty("decisionKind").GetString() ?? "",
+                    options,
+                    question.GetProperty("prompt").GetString() ?? ""),
+                authority,
+                root.GetProperty("baselineDigest").GetString() ?? "",
+                root.TryGetProperty("checkpointId", out var checkpoint) ? checkpoint.GetString() : null);
+        }
+        catch (Exception exception) when (exception is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
+        {
+            return null;
+        }
+    }
+
+    public static bool TryParseReason(string? value, out RuntimeGrillPauseReason reason)
+    {
+        reason = value switch
+        {
+            "plan_authority_ambiguous" => RuntimeGrillPauseReason.PlanAuthorityAmbiguous,
+            "new_creative_decision_required" => RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            "task_scope_expansion" => RuntimeGrillPauseReason.TaskScopeExpansion,
+            "plan_assumptions_invalid" => RuntimeGrillPauseReason.PlanAssumptionsInvalid,
+            _ => default
+        };
+        return value is "plan_authority_ambiguous" or "new_creative_decision_required"
+            or "task_scope_expansion" or "plan_assumptions_invalid";
+    }
 
     public static ApprovalStatus Compete(ApprovalStatus current, ApprovalStatus incoming)
     {

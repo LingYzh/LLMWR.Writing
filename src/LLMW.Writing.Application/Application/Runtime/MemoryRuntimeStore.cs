@@ -36,11 +36,11 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
-    public DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs)
+    public DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs, string? storylineId = null)
     {
         lock (gate)
         {
-            var record = new DurableWorkflowRunRecord(workflowRunId, status, nowMs, nowMs);
+            var record = new DurableWorkflowRunRecord(workflowRunId, status, nowMs, nowMs, storylineId);
             workflows[workflowRunId] = record;
             return record;
         }
@@ -365,6 +365,14 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
+    public EvidenceRecord? GetEvidence(string evidenceId)
+    {
+        lock (gate)
+        {
+            return evidence.TryGetValue(evidenceId, out var record) ? record : null;
+        }
+    }
+
     public void MarkEvidenceStale(string evidenceId, bool stale)
     {
         lock (gate)
@@ -429,14 +437,22 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
-    public void BindPendingOversightOverrides(string checkpointId, long checkpointCreatedAtMs)
+    public void BindPendingOversightOverrides(string checkpointId, string runId, string? taskId, long checkpointCreatedAtMs)
     {
         _ = checkpointCreatedAtMs;
+        _ = runId;
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            return;
+        }
+
         lock (gate)
         {
             foreach (var pair in oversight.ToArray())
             {
-                if (OversightActivation.IsPendingBind(pair.Value.EffectiveAfterCheckpointId))
+                if (pair.Value.ScopeKind == OversightScopeKind.Task &&
+                    StringComparer.Ordinal.Equals(pair.Value.ScopeId, taskId) &&
+                    OversightActivation.IsPendingBind(pair.Value.EffectiveAfterCheckpointId))
                 {
                     oversight[pair.Key] = pair.Value with { EffectiveAfterCheckpointId = checkpointId };
                 }
@@ -449,7 +465,25 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         ArgumentNullException.ThrowIfNull(record);
         lock (gate)
         {
+            if (delegated.TryGetValue(record.DelegatedDecisionId, out var existing))
+            {
+                if (!DelegatedDecisionEquality.Equivalent(existing, record))
+                {
+                    throw new InvalidOperationException("delegated-decision-conflict:" + record.DelegatedDecisionId);
+                }
+
+                return;
+            }
+
             delegated[record.DelegatedDecisionId] = record;
+        }
+    }
+
+    public DelegatedDecisionRecord? GetDelegatedDecision(string delegatedDecisionId)
+    {
+        lock (gate)
+        {
+            return delegated.TryGetValue(delegatedDecisionId, out var record) ? record : null;
         }
     }
 
@@ -484,6 +518,22 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             approvals[record.ApprovalId] = record;
+        }
+    }
+
+    public bool TryCompareAndSetApproval(string approvalId, string expectedStatus, DurableApprovalRecord replacement)
+    {
+            ArgumentNullException.ThrowIfNull(replacement);
+        lock (gate)
+        {
+            if (!approvals.TryGetValue(approvalId, out var current) ||
+                !StringComparer.Ordinal.Equals(current.Status, expectedStatus))
+            {
+                return false;
+            }
+
+            approvals[approvalId] = replacement;
+            return true;
         }
     }
 
@@ -571,6 +621,30 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
                      StringComparer.Ordinal.Equals(item.Status, "running")))
                 .OrderByDescending(item => item.AttemptNo)
                 .FirstOrDefault();
+        }
+    }
+
+    public bool StorylineExists(string storylineId) => !string.IsNullOrWhiteSpace(storylineId);
+
+    public DurableToolCallRecord? GetToolCall(string toolCallId)
+    {
+        lock (gate)
+        {
+            return toolCalls.TryGetValue(toolCallId, out var record) ? record : null;
+        }
+    }
+
+    public bool TryCancelToolCall(string toolCallId)
+    {
+        lock (gate)
+        {
+            if (!toolCalls.TryGetValue(toolCallId, out var record))
+            {
+                return false;
+            }
+
+            toolCalls[toolCallId] = record with { Status = "cancelled" };
+            return true;
         }
     }
 }

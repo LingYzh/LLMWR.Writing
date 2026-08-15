@@ -18,11 +18,18 @@ public enum RuntimeError
     CompletionFailed,
     SemanticReviewRequired,
     OversightDenied,
+    TaskOwnershipDenied,
+    ResultFrozen,
+    IllegalCompletionLifecycle,
     GrillAuthorRequired,
     GrillAlreadyResolved,
+    GrillOptionRejected,
+    GrillOwnershipDenied,
     SpecialistImmutable,
     SpecialistInvalid,
-    BackgroundIllegalTransition
+    SpecialistIdentityMismatch,
+    BackgroundIllegalTransition,
+    BackgroundStopUnavailable
 }
 
 public sealed record RuntimeFailure(RuntimeError Code, string? Detail = null);
@@ -92,7 +99,7 @@ public interface IRuntimePersistence
 {
     SchedulerSnapshot LoadSnapshot();
 
-    DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs);
+    DurableWorkflowRunRecord InsertWorkflowRun(string workflowRunId, string status, long nowMs, string? storylineId = null);
 
     DurableRunRecord InsertRun(DurableRunRecord run);
 
@@ -148,6 +155,8 @@ public interface IRuntimePersistence
 
     IReadOnlyList<EvidenceRecord> EvidenceForTask(string taskId);
 
+    EvidenceRecord? GetEvidence(string evidenceId);
+
     void MarkEvidenceStale(string evidenceId, bool stale);
 
     DurableDependencyRecord? GetDependency(string dependencyId);
@@ -160,9 +169,11 @@ public interface IRuntimePersistence
 
     IReadOnlyList<OversightOverrideRecord> ListOversightOverrides();
 
-    void BindPendingOversightOverrides(string checkpointId, long checkpointCreatedAtMs);
+    void BindPendingOversightOverrides(string checkpointId, string runId, string? taskId, long checkpointCreatedAtMs);
 
     void InsertDelegatedDecision(DelegatedDecisionRecord record);
+
+    DelegatedDecisionRecord? GetDelegatedDecision(string delegatedDecisionId);
 
     IReadOnlyList<DelegatedDecisionRecord> ListDelegatedDecisions();
 
@@ -171,6 +182,8 @@ public interface IRuntimePersistence
     DurableApprovalRecord? GetApproval(string approvalId);
 
     void UpdateApproval(DurableApprovalRecord record);
+
+    bool TryCompareAndSetApproval(string approvalId, string expectedStatus, DurableApprovalRecord replacement);
 
     IReadOnlyList<DurableApprovalRecord> ListApprovals(string? runId);
 
@@ -189,6 +202,12 @@ public interface IRuntimePersistence
     IReadOnlyList<DurableProjectSpecialistRecord> ListProjectSpecialists();
 
     DurableAttemptRecord? FindActiveAttempt(string taskId);
+
+    bool StorylineExists(string storylineId);
+
+    DurableToolCallRecord? GetToolCall(string toolCallId);
+
+    bool TryCancelToolCall(string toolCallId);
 }
 
 public sealed record WorkerLaunchRequest(

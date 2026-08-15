@@ -145,7 +145,7 @@ public sealed class NarrativeChangeService
         }
         else if (principalKind == PrincipalKind.AgentRun)
         {
-            var policy = oversightSource.Resolve(command.Principal?.ProjectScope?.ProjectId.ToString("D"), null, null);
+            var policy = oversightSource.ResolveForPrincipal(command.Principal);
             if (!policy.NarrativeDelegated || command.DeciderKind != NarrativeDecisionKind.AgentDelegated)
             {
                 return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
@@ -225,12 +225,15 @@ public sealed class NarrativeChangeService
                 return commitAuthorization;
             }
 
+            var deciderId = command.Principal?.Kind == PrincipalKind.AgentRun
+                ? command.Principal.ToString()
+                : command.Principal?.TrustedInstanceId ?? command.DeciderId;
             var applied = store.Apply(
                 new NarrativeApplyStoreRequest(
                     command.ChangeSetId,
                     command.IdempotencyKey,
                     command.DeciderKind,
-                    command.DeciderId,
+                    deciderId,
                     analysis?.ImpactAnalysisId ?? changeSet.ImpactAnalysisId),
                 cancellationToken);
             if (!applied.Succeeded)
@@ -240,16 +243,22 @@ public sealed class NarrativeChangeService
 
             if (command.DeciderKind == NarrativeDecisionKind.AgentDelegated)
             {
-                var policy = oversightSource.Resolve(command.Principal?.ProjectScope?.ProjectId.ToString("D"), null, null);
-                delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
-                    applied.Value!.ChangeSetId,
-                    applied.Value.TransactionId,
-                    OversightScopeKind.Project,
-                    command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? applied.Value.ChangeSetId,
-                    command.Principal?.ToString() ?? "agent",
-                    policy,
-                    null,
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                var policy = oversightSource.ResolveForPrincipal(command.Principal);
+                try
+                {
+                    delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
+                        applied.Value!.ChangeSetId,
+                        applied.Value.TransactionId,
+                        policy.WinningScope,
+                        policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? applied.Value.ChangeSetId,
+                        command.Principal?.ToString() ?? "agent",
+                        policy,
+                        null,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                }
+                catch (Exception)
+                {
+                }
             }
 
             var warnings = analysis?.Warnings ?? [];

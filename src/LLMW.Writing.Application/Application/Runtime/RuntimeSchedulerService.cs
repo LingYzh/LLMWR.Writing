@@ -16,6 +16,8 @@ public sealed class RuntimeSchedulerService
     private readonly ITrustedIpcBindingRegistry? bindings;
     private readonly RunSessionService? sessions;
 
+    public IOversightCheckpointListener? OversightActivationListener { get; set; }
+
     public RuntimeSchedulerService(
         IRuntimePersistence store,
         IConcurrencyBudgetPolicy budgetPolicy,
@@ -41,11 +43,28 @@ public sealed class RuntimeSchedulerService
     public SchedulerView RebuildView() =>
         SchedulerProjection.Rebuild(store.LoadSnapshot(), budgetPolicy.Current);
 
-    public RuntimeResult<DurableWorkflowRunRecord> CreateWorkflowRun(string? workflowRunId)
+    public bool ProbeCapability(CallerPrincipal? principal, Capability capability) =>
+        authorization.Authorize(principal, new AuthorizationRequest(capability)).Decision ==
+        CapabilityDecisionKind.Allowed;
+
+    public bool WorkerIsAlive(string workerInstanceId) => workers.IsAlive(workerInstanceId);
+
+    public IReadOnlyList<LiveWorkerObservation> WorkerSnapshot() => workers.Snapshot();
+
+    public RuntimeResult<DurableWorkflowRunRecord> CreateWorkflowRun(string? workflowRunId = null, string? storylineId = null)
     {
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
         var id = string.IsNullOrWhiteSpace(workflowRunId) ? Guid.NewGuid().ToString("D") : workflowRunId;
-        return RuntimeResults.Success(store.InsertWorkflowRun(id, WorkflowRunStatusCodec.ToDurableValue(WorkflowRunStatus.Created), now));
+        if (!string.IsNullOrWhiteSpace(storylineId) && !store.StorylineExists(storylineId))
+        {
+            return RuntimeResults.Fail<DurableWorkflowRunRecord>(RuntimeError.NotFound, "storyline");
+        }
+
+        return RuntimeResults.Success(store.InsertWorkflowRun(
+            id,
+            WorkflowRunStatusCodec.ToDurableValue(WorkflowRunStatus.Created),
+            now,
+            string.IsNullOrWhiteSpace(storylineId) ? null : storylineId));
     }
 
     public RuntimeResult<DurableRunRecord> CreateRun(string workflowRunId, string role, string? parentRunId, string? runId)
@@ -325,7 +344,8 @@ public sealed class RuntimeSchedulerService
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
         var id = Guid.NewGuid().ToString("D");
         store.InsertCheckpoint(new DurableCheckpointRecord(id, runId, taskId, schemaVersion, payloadJson, inputDigestSetJson, now));
-        store.BindPendingOversightOverrides(id, now);
+        store.BindPendingOversightOverrides(id, runId, taskId, now);
+        OversightActivationListener?.OnSafeCheckpoint(id, runId, taskId, now);
         return RuntimeResults.Success(id);
     }
 

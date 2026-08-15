@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.ChapterAuthority;
+using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Infrastructure.Authority;
@@ -266,6 +267,7 @@ internal static partial class Program
             ImmutableBlobStore blobStore,
             DeterministicReviewer reviewer,
             AuthorityTransactionCoordinator coordinator,
+            IChapterAuthorityStore authorityStore,
             ChapterAuthorityService service)
         {
             this.root = root;
@@ -276,6 +278,7 @@ internal static partial class Program
             this.blobStore = blobStore;
             Reviewer = reviewer;
             Coordinator = coordinator;
+            AuthorityStore = authorityStore;
             Service = service;
         }
 
@@ -287,13 +290,16 @@ internal static partial class Program
         public string DraftPath { get; }
         public DeterministicReviewer Reviewer { get; }
         public AuthorityTransactionCoordinator Coordinator { get; }
+        public IChapterAuthorityStore AuthorityStore { get; }
         public ChapterAuthorityService Service { get; }
         public string CurrentManuscriptPath => Path.Combine(root, "Manuscript", "current", ChapterId + ".md");
 
         public static Wp05Fixture Create(
             ChapterReviewOutcome outcome,
             AuthorityTransactionFaultPoint? faultPoint = null,
-            IAuthorizationService? authorizationService = null)
+            IAuthorizationService? authorizationService = null,
+            IEffectiveOversightSource? oversightSource = null,
+            IDelegatedDecisionSink? delegatedDecisionSink = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP05", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -338,8 +344,10 @@ internal static partial class Program
                 store,
                 reviewer,
                 LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
-                authorizationService ?? Wp09Authorization);
-            return new Wp05Fixture(root, databasePath, storylineId, chapterId, draftPath, blobStore, reviewer, coordinator, service);
+                authorizationService ?? Wp09Authorization,
+                oversightSource,
+                delegatedDecisionSink);
+            return new Wp05Fixture(root, databasePath, storylineId, chapterId, draftPath, blobStore, reviewer, coordinator, store, service);
         }
 
         public byte[] ReadBlob(string digest)

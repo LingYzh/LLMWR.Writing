@@ -115,7 +115,7 @@ public sealed class Wp13IpcCommandHandler : IIpcApplicationCommandHandler
     private IpcApplicationCommandResult UpdateDep(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.UpdateResultDependencyRequest);
-        var result = service.UpdateResultDependency(request.DependencyId, request.DependencyKind, request.Status);
+        var result = service.UpdateResultDependency(request.DependencyId, request.DependencyKind);
         return result.Succeeded && result.Value is not null
             ? Respond(context, result.Value, IpcJsonContext.Default.UpdateResultDependencyResponseEnvelope)
             : Fail(context, result.Failure);
@@ -362,11 +362,18 @@ public sealed class Wp13IpcCommandHandler : IIpcApplicationCommandHandler
         RuntimeError.CompletionFailed => IpcErrorCodes.CompletionContractFailed,
         RuntimeError.SemanticReviewRequired => IpcErrorCodes.SemanticReviewRequired,
         RuntimeError.OversightDenied => IpcErrorCodes.OversightMutationDenied,
+        RuntimeError.TaskOwnershipDenied => IpcErrorCodes.TaskOwnershipDenied,
+        RuntimeError.ResultFrozen => IpcErrorCodes.ResultFrozen,
+        RuntimeError.IllegalCompletionLifecycle => IpcErrorCodes.IllegalCompletionLifecycle,
         RuntimeError.GrillAuthorRequired => IpcErrorCodes.RuntimeGrillAuthorRequired,
         RuntimeError.GrillAlreadyResolved => IpcErrorCodes.RuntimeGrillAlreadyResolved,
+        RuntimeError.GrillOptionRejected => IpcErrorCodes.RuntimeGrillOptionRejected,
+        RuntimeError.GrillOwnershipDenied => IpcErrorCodes.RuntimeGrillOwnershipDenied,
         RuntimeError.SpecialistImmutable => IpcErrorCodes.SpecialistImmutable,
         RuntimeError.SpecialistInvalid => IpcErrorCodes.SpecialistValidationFailed,
+        RuntimeError.SpecialistIdentityMismatch => IpcErrorCodes.SpecialistIdentityMismatch,
         RuntimeError.BackgroundIllegalTransition => IpcErrorCodes.BackgroundIllegalTransition,
+        RuntimeError.BackgroundStopUnavailable => IpcErrorCodes.BackgroundStopUnavailable,
         RuntimeError.NotFound => IpcErrorCodes.CommandUnavailable,
         _ => IpcErrorCodes.CommandUnavailable
     };

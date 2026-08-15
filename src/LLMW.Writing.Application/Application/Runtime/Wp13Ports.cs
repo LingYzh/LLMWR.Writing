@@ -1,3 +1,4 @@
+using LLMW.Writing.Application.Security;
 using LLMW.Writing.Domain.Runtime;
 
 namespace LLMW.Writing.Application.Runtime;
@@ -141,9 +142,30 @@ public sealed class SyntheticBuiltInSpecialistCatalog : IBuiltInSpecialistCatalo
         StringComparer.Ordinal.Equals(profileId, reviewer.ProfileId) ? reviewer : null;
 }
 
+public interface IOversightCheckpointListener
+{
+    void OnSafeCheckpoint(string checkpointId, string runId, string? taskId, long createdAtMs);
+}
+
 public interface IEffectiveOversightSource
 {
     EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId);
+
+    EffectiveOversightPolicy ResolveForPrincipal(CallerPrincipal? principal, string? taskId = null, string? storylineId = null) =>
+        Resolve(principal?.ProjectScope?.ProjectId.ToString("D"), storylineId, taskId);
+}
+
+public sealed class LateBoundOversightSource : IEffectiveOversightSource
+{
+    public IEffectiveOversightSource? Inner { get; set; }
+
+    public EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId) =>
+        (Inner ?? FailClosedOversightSource.Instance).Resolve(projectId, storylineId, taskId);
+
+    public EffectiveOversightPolicy ResolveForPrincipal(CallerPrincipal? principal, string? taskId = null, string? storylineId = null) =>
+        Inner is null
+            ? ((IEffectiveOversightSource)FailClosedOversightSource.Instance).ResolveForPrincipal(principal, taskId, storylineId)
+            : Inner.ResolveForPrincipal(principal, taskId, storylineId);
 }
 
 public sealed class FailClosedOversightSource : IEffectiveOversightSource

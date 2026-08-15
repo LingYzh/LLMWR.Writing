@@ -80,9 +80,11 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
                 var store = new SqliteRuntimeStore(bind.DatabasePath);
                 var sessions = new RunSessionService(sessionStore);
+                var oversightBinder = new LateBoundOversightSource();
+                var authorization = new CoreAuthorizationService(oversightSource: oversightBinder);
                 var sandboxHost = CreateSandboxHost(bind.CanonicalRoot, scope);
                 var broker = new TrustedSandboxBroker(
-                    new CoreAuthorizationService(),
+                    authorization,
                     sandboxHost,
                     UnavailableSandboxPathGuard.Instance,
                     new SandboxProjectContext(bind.CanonicalRoot, scope),
@@ -103,7 +105,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
                     SystemSecurityClock.Instance,
                     supervisor,
-                    new CoreAuthorizationService(),
+                    authorization,
                     bindings: bindings,
                     sessions: sessions);
                 var userLibraryRoot = Path.Combine(
@@ -118,6 +120,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new FileUserSpecialistProfileStore(userLibraryRoot),
                     SyntheticBuiltInSpecialistCatalog.Instance,
                     UnavailableSemanticCompletionEvaluator.Instance);
+                oversightBinder.Inner = wp13;
+                scheduler.OversightActivationListener = wp13;
 
                 bindings.Register(new TrustedIpcLaunchRecord(
                     AuthenticatedClientKind.AgentRuntime,

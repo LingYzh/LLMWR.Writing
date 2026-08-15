@@ -226,7 +226,10 @@ public static class ResultArtifactCanonicalJson
         ArgumentNullException.ThrowIfNull(artifact);
         if (SecretRedaction.ContainsSecretMaterial(artifact.Conclusion) ||
             artifact.Findings.Any(item => SecretRedaction.ContainsSecretMaterial(item.Text)) ||
-            (!string.IsNullOrWhiteSpace(artifact.Uncertainty) && SecretRedaction.ContainsSecretMaterial(artifact.Uncertainty)))
+            (!string.IsNullOrWhiteSpace(artifact.Uncertainty) && SecretRedaction.ContainsSecretMaterial(artifact.Uncertainty)) ||
+            artifact.Diagnostics.Any(item => SecretRedaction.ContainsSecretMaterial(item.Message) || SecretRedaction.ContainsSecretMaterial(item.Code)) ||
+            artifact.EvidenceIds.Any(SecretRedaction.ContainsSecretMaterial) ||
+            ContainsFreshnessSecrets(artifact.Freshness))
         {
             artifact = Redact(artifact);
         }
@@ -447,15 +450,72 @@ public static class ResultArtifactCanonicalJson
     private static TaskResultArtifactV1 Redact(TaskResultArtifactV1 artifact) =>
         artifact with
         {
-            Conclusion = "[redacted]",
+            Conclusion = SecretRedaction.ContainsSecretMaterial(artifact.Conclusion) ? "[redacted]" : artifact.Conclusion,
             Findings = artifact.Findings.Select(item => item with
             {
                 Text = SecretRedaction.ContainsSecretMaterial(item.Text) ? "[redacted]" : item.Text
             }).ToArray(),
             Uncertainty = artifact.Uncertainty is null
                 ? null
-                : SecretRedaction.ContainsSecretMaterial(artifact.Uncertainty) ? "[redacted]" : artifact.Uncertainty
+                : SecretRedaction.ContainsSecretMaterial(artifact.Uncertainty) ? "[redacted]" : artifact.Uncertainty,
+            Diagnostics = artifact.Diagnostics.Select(item => item with
+            {
+                Message = SecretRedaction.ContainsSecretMaterial(item.Message) ? "[redacted]" : item.Message,
+                Code = SecretRedaction.ContainsSecretMaterial(item.Code) ? "[redacted]" : item.Code
+            }).ToArray(),
+            EvidenceIds = artifact.EvidenceIds.Select(item =>
+                SecretRedaction.ContainsSecretMaterial(item) ? "[redacted]" : item).ToArray(),
+            Freshness = RedactFreshness(artifact.Freshness)
         };
+
+    private static bool ContainsFreshnessSecrets(ResultFreshnessV1 freshness)
+    {
+        var produced = freshness.ProducedAgainst;
+        var provenance = freshness.Provenance;
+        return SecretRedaction.ContainsSecretMaterial(produced.AuthorityRevision ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.EvidenceDigest ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.PromptConfigId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.EffectivePromptDigest ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.AgentsDigest ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.ProviderId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(produced.ModelId ?? "") ||
+               produced.NarrativeObjectDigests.Any(SecretRedaction.ContainsSecretMaterial) ||
+               produced.SkillDigests.Any(SecretRedaction.ContainsSecretMaterial) ||
+               produced.UpstreamRequiredResultRefs.Any(SecretRedaction.ContainsSecretMaterial) ||
+               SecretRedaction.ContainsSecretMaterial(provenance.ProducedByRunId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.ProducedByTaskId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.AttemptId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.SpecialistProfileId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.ApprovedPlanRef ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.OriginalUserRequestRef ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.ChangeSetId ?? "") ||
+               SecretRedaction.ContainsSecretMaterial(provenance.TransactionId ?? "");
+    }
+
+    private static ResultFreshnessV1 RedactFreshness(ResultFreshnessV1 freshness) =>
+        freshness with
+        {
+            ProducedAgainst = freshness.ProducedAgainst with
+            {
+                AuthorityRevision = RedactOptional(freshness.ProducedAgainst.AuthorityRevision),
+                EvidenceDigest = RedactOptional(freshness.ProducedAgainst.EvidenceDigest),
+                PromptConfigId = RedactOptional(freshness.ProducedAgainst.PromptConfigId),
+                EffectivePromptDigest = RedactOptional(freshness.ProducedAgainst.EffectivePromptDigest),
+                AgentsDigest = RedactOptional(freshness.ProducedAgainst.AgentsDigest),
+                ProviderId = RedactOptional(freshness.ProducedAgainst.ProviderId),
+                ModelId = RedactOptional(freshness.ProducedAgainst.ModelId)
+            },
+            Provenance = freshness.Provenance with
+            {
+                ProducedByRunId = RedactOptional(freshness.Provenance.ProducedByRunId),
+                ProducedByTaskId = RedactOptional(freshness.Provenance.ProducedByTaskId),
+                AttemptId = RedactOptional(freshness.Provenance.AttemptId),
+                SpecialistProfileId = RedactOptional(freshness.Provenance.SpecialistProfileId)
+            }
+        };
+
+    private static string? RedactOptional(string? value) =>
+        value is not null && SecretRedaction.ContainsSecretMaterial(value) ? "[redacted]" : value;
 
     private static void WriteFreshness(Utf8JsonWriter writer, ResultFreshnessV1 freshness)
     {

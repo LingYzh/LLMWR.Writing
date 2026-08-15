@@ -209,6 +209,13 @@ public static class IpcErrorCodes
     public const string SpecialistValidationFailed = "SPECIALIST_VALIDATION_FAILED";
     public const string SpecialistTestUnavailable = "SPECIALIST_TEST_UNAVAILABLE";
     public const string BackgroundIllegalTransition = "BACKGROUND_ILLEGAL_TRANSITION";
+    public const string TaskOwnershipDenied = "TASK_OWNERSHIP_DENIED";
+    public const string ResultFrozen = "RESULT_FROZEN";
+    public const string IllegalCompletionLifecycle = "ILLEGAL_COMPLETION_LIFECYCLE";
+    public const string RuntimeGrillOptionRejected = "RUNTIME_GRILL_OPTION_REJECTED";
+    public const string RuntimeGrillOwnershipDenied = "RUNTIME_GRILL_OWNERSHIP_DENIED";
+    public const string BackgroundStopUnavailable = "BACKGROUND_STOP_UNAVAILABLE";
+    public const string SpecialistIdentityMismatch = "SPECIALIST_IDENTITY_MISMATCH";
 }
 
 public static class IpcServerCapabilities

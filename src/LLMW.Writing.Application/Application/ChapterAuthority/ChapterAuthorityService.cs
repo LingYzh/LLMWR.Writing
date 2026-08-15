@@ -251,7 +251,7 @@ public sealed class ChapterAuthorityService
             return authorization;
         }
 
-        var formal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out var authorityKind);
+        var formal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out var authorityKind, out var formalPolicy);
         if (formal is not null)
         {
             return formal;
@@ -282,14 +282,35 @@ public sealed class ChapterAuthorityService
 
                 var recoveryFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(
                     command.Principal,
-                    out _);
+                    out var recoveryKind,
+                    out var recoveryPolicy);
                 if (recoveryFormal is not null)
                 {
                     return recoveryFormal;
                 }
 
-                return ChapterAuthorityResults.Success(
-                    store.RecoverAcceptance(context, cancellationToken));
+                var recovered = store.RecoverAcceptance(context, cancellationToken);
+                if (recoveryKind == DecisionAuthorityKind.AgentDelegated)
+                {
+                    var policy = recoveryPolicy ?? oversightSource.ResolveForPrincipal(command.Principal);
+                    try
+                    {
+                        delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
+                            recovered.AcceptanceId,
+                            recovered.TransactionId,
+                            policy.WinningScope,
+                            policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
+                            command.Principal?.ToString() ?? "agent",
+                            policy,
+                            null,
+                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+
+                return ChapterAuthorityResults.Success(recovered);
             }
 
             if (context.TransactionState == AuthorityTransactionState.RecoveryRequired)
@@ -400,11 +421,15 @@ public sealed class ChapterAuthorityService
                 return commitAuthorization;
             }
 
-            var commitFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out _);
+            var commitFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(command.Principal, out authorityKind, out var commitPolicy);
             if (commitFormal is not null)
             {
                 return commitFormal;
             }
+
+            var acceptedById = command.Principal?.Kind == PrincipalKind.AgentRun
+                ? command.Principal.ToString()
+                : command.Principal?.TrustedInstanceId ?? "user-interactive";
 
             if (requiresPreparation)
             {
@@ -412,25 +437,28 @@ public sealed class ChapterAuthorityService
                 var relativePath = Path.Combine("Manuscript", "current", context.ChapterId + extension)
                     .Replace(Path.DirectorySeparatorChar, '/');
                 context = store.PrepareAcceptance(
-                    new PrepareAcceptanceRequest(context, decision, command.AcceptedById, relativePath));
+                    new PrepareAcceptanceRequest(context, decision, acceptedById, relativePath));
             }
 
             var committed = store.CommitAcceptance(context, cancellationToken);
             if (authorityKind == DecisionAuthorityKind.AgentDelegated)
             {
-                var policy = oversightSource.Resolve(
-                    command.Principal?.ProjectScope?.ProjectId.ToString("D"),
-                    null,
-                    null);
-                delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
-                    committed.AcceptanceId,
-                    committed.TransactionId,
-                    OversightScopeKind.Project,
-                    command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
-                    command.Principal?.ToString() ?? "agent",
-                    policy,
-                    null,
-                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                var policy = commitPolicy ?? oversightSource.ResolveForPrincipal(command.Principal);
+                try
+                {
+                    delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
+                        committed.AcceptanceId,
+                        committed.TransactionId,
+                        policy.WinningScope,
+                        policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
+                        command.Principal?.ToString() ?? "agent",
+                        policy,
+                        null,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                }
+                catch (Exception)
+                {
+                }
             }
 
             return ChapterAuthorityResults.Success(committed);
@@ -480,9 +508,11 @@ public sealed class ChapterAuthorityService
 
     private ChapterAuthorityResult<T>? EnsureFormalNarrativeDecision<T>(
         CallerPrincipal? principal,
-        out DecisionAuthorityKind authorityKind)
+        out DecisionAuthorityKind authorityKind,
+        out EffectiveOversightPolicy? policy)
     {
         authorityKind = DecisionAuthorityKind.AuthorConfirmed;
+        policy = null;
         if (principal?.Kind == PrincipalKind.UserInteractive)
         {
             return null;
@@ -495,7 +525,7 @@ public sealed class ChapterAuthorityService
                 "Formal acceptance requires USER_INTERACTIVE or effective AGENT_DELEGATED Oversight.");
         }
 
-        var policy = oversightSource.Resolve(principal.ProjectScope?.ProjectId.ToString("D"), null, null);
+        policy = oversightSource.ResolveForPrincipal(principal);
         if (!policy.NarrativeDelegated)
         {
             return ChapterAuthorityResults.Fail<T>(

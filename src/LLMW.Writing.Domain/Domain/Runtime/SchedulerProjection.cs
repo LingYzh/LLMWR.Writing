@@ -90,7 +90,8 @@ public sealed record DurableWorkflowRunRecord(
     string WorkflowRunId,
     string Status,
     long CreatedAtMs,
-    long UpdatedAtMs);
+    long UpdatedAtMs,
+    string? StorylineId = null);
 
 public sealed record DurableRunRecord(
     string RunId,

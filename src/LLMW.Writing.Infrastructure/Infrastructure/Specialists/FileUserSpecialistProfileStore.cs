@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Domain.Runtime;
@@ -28,6 +30,11 @@ public sealed class FileUserSpecialistProfileStore : IUserSpecialistProfileStore
             var list = new List<DurableProjectSpecialistRecord>();
             foreach (var file in Directory.GetFiles(root, "*.json").OrderBy(item => item, StringComparer.Ordinal))
             {
+                if (file.EndsWith(".tmp.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 var record = ReadFile(file);
                 if (record is not null)
                 {
@@ -64,7 +71,10 @@ public sealed class FileUserSpecialistProfileStore : IUserSpecialistProfileStore
                 record.Enabled,
                 record.CreatedAtMs,
                 record.UpdatedAtMs));
-            File.WriteAllText(Path.Combine(root, SafeFileName(record.SpecialistProfileId)), payload);
+            var path = Path.Combine(root, SafeFileName(record.SpecialistProfileId));
+            var temp = path + ".tmp";
+            File.WriteAllText(temp, payload);
+            File.Move(temp, path, overwrite: true);
         }
     }
 
@@ -96,9 +106,8 @@ public sealed class FileUserSpecialistProfileStore : IUserSpecialistProfileStore
 
     private static string SafeFileName(string profileId)
     {
-        var chars = profileId.Select(character =>
-            char.IsAsciiLetterOrDigit(character) || character is '-' or '_' or '.' ? character : '_').ToArray();
-        return new string(chars) + ".json";
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(profileId))).ToLowerInvariant();
+        return digest + ".json";
     }
 
     private sealed record FileRecord(

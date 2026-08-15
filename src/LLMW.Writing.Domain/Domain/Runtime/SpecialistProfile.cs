@@ -107,6 +107,27 @@ public sealed record SpecialistValidationError(string Code, string Path, string 
 
 public sealed record SpecialistValidationResult(bool IsValid, IReadOnlyList<SpecialistValidationError> Errors);
 
+public static class SpecialistProfileIdGrammar
+{
+    public const int MaxLength = 128;
+
+    public static bool IsValid(string? profileId)
+    {
+        if (string.IsNullOrWhiteSpace(profileId) || profileId.Length > MaxLength)
+        {
+            return false;
+        }
+
+        if (!char.IsAsciiLetter(profileId[0]))
+        {
+            return false;
+        }
+
+        return profileId.All(character =>
+            char.IsAsciiLetterOrDigit(character) || character is '.' or '_' or '-');
+    }
+}
+
 public static class SpecialistProfileValidator
 {
     public static SpecialistValidationResult Validate(SpecialistProfileDefinitionV1 profile)
@@ -122,6 +143,10 @@ public static class SpecialistProfileValidator
             string.IsNullOrWhiteSpace(profile.DisplayName))
         {
             errors.Add(new("identity-required", "identity", "Profile id, name, and display name are required."));
+        }
+        else if (!SpecialistProfileIdGrammar.IsValid(profile.ProfileId))
+        {
+            errors.Add(new("invalid-profile-id", "profileId", "Profile id must match the canonical safe grammar."));
         }
 
         if (profile.Version < 1)
