@@ -18,7 +18,9 @@ internal static partial class Program
         await ForgedWorkerBindingCannotSelectAnotherRunAsync();
         await ProductionOpenProjectBindsDescriptorIdentityAndCanonicalDbAsync();
         await ProductionOpenProjectRejectsEmptyDirectoryWithoutMutationAsync();
-        Console.WriteLine("WP12 scheduler integration tests passed (4).");
+        await ProductionSameRuntimeConnectionCreateRunSessionAndSpawnChildAfterOpenProjectAsync();
+        await ProductionRuntimeReconnectAfterOpenProjectObtainsNewRunSessionAsync();
+        Console.WriteLine("WP12 scheduler integration tests passed (6).");
     }
 
     private static async Task SchedulerIpcDispatchesFourAndQueuesFifthAsync()
@@ -246,6 +248,28 @@ internal static partial class Program
                 AssertEqual(IpcErrorCodes.BindingMismatch, exception.ErrorCode, "Arbitrary directory OpenProject must fail closed.");
             }
 
+            await using var runtime = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Runtime(workspaceInstanceId),
+                workspaceInstanceId,
+                runtimeToken,
+                IpcClientKind.AgentRuntime,
+                timeout.Token);
+            try
+            {
+                await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateRunSession,
+                    new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest("run-after-failed-open", null),
+                    IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("Failed OpenProject must not publish Runtime RunSession authority.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
+                    "Failed preflight must leave CreateRunSession fail-closed.");
+            }
+
             AssertTrue(!File.Exists(Path.Combine(empty, "project.db")), "Rejected OpenProject must not create root project.db.");
             AssertTrue(!File.Exists(Path.Combine(empty, ".llmw", "project.db")), "Rejected OpenProject must not create .llmw/project.db.");
         }
@@ -255,6 +279,256 @@ internal static partial class Program
             if (Directory.Exists(empty))
             {
                 Directory.Delete(empty, recursive: true);
+            }
+        }
+    }
+
+    private static async Task ProductionSameRuntimeConnectionCreateRunSessionAndSpawnChildAfterOpenProjectAsync()
+    {
+        var root = CreateValidProjectFixture();
+        var workspaceInstanceId = "wp12sess" + Guid.NewGuid().ToString("N");
+        var uiToken = IpcBootstrapToken.Create();
+        var runtimeToken = IpcBootstrapToken.Create();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        using var core = StartCore(workspaceInstanceId, uiToken, runtimeToken);
+        try
+        {
+            await using var runtime = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Runtime(workspaceInstanceId),
+                workspaceInstanceId,
+                runtimeToken,
+                IpcClientKind.AgentRuntime,
+                timeout.Token);
+
+            try
+            {
+                await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateRunSession,
+                    new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest("pre-open-run", null),
+                    IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("CreateRunSession must fail closed before OpenProject.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
+                    "Same Runtime connection must not obtain a RunSession before OpenProject.");
+            }
+
+            await using var ui = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Core(workspaceInstanceId),
+                workspaceInstanceId,
+                uiToken,
+                IpcClientKind.Ui,
+                timeout.Token);
+            var opened = await ui.RequestAsync(
+                IpcSemanticTypes.OpenProject,
+                new OpenProjectRequest(root),
+                IpcJsonContext.Default.OpenProjectRequestEnvelope,
+                IpcJsonContext.Default.OpenProjectResponseEnvelope,
+                timeout.Token);
+            AssertEqual(Wp12DescriptorProjectId, opened.Payload.ProjectId, "OpenProject must bind the fixture ProjectId.");
+
+            var workflow = await runtime.RequestAsync(
+                IpcSemanticTypes.CreateWorkflowRun,
+                new CreateWorkflowRunRequest(null),
+                IpcJsonContext.Default.CreateWorkflowRunRequestEnvelope,
+                IpcJsonContext.Default.CreateWorkflowRunResponseEnvelope,
+                timeout.Token);
+            var parent = await runtime.RequestAsync(
+                IpcSemanticTypes.CreateRun,
+                new CreateRunRequest(workflow.Payload.WorkflowRunId, "pm", null, null),
+                IpcJsonContext.Default.CreateRunRequestEnvelope,
+                IpcJsonContext.Default.CreateRunResponseEnvelope,
+                timeout.Token);
+            var parentTask = await runtime.RequestAsync(
+                IpcSemanticTypes.CreateTask,
+                new CreateTaskRequest(parent.Payload.RunId, "write", 1, null, null),
+                IpcJsonContext.Default.CreateTaskRequestEnvelope,
+                IpcJsonContext.Default.CreateTaskResponseEnvelope,
+                timeout.Token);
+
+            var session = await runtime.RequestAsync(
+                IpcSemanticTypes.CreateRunSession,
+                new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest(parent.Payload.RunId, null),
+                IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                timeout.Token);
+            AssertEqual(parent.Payload.RunId, session.Payload.RunId, "CreateRunSession must return the parent RunId.");
+            AssertTrue(!string.IsNullOrWhiteSpace(session.Payload.OpaqueToken), "CreateRunSession must return a non-empty opaque token.");
+
+            var spawned = await runtime.RequestAsync(
+                IpcSemanticTypes.SpawnChildRun,
+                new SpawnChildRunRequest(
+                    parent.Payload.RunId,
+                    parentTask.Payload.TaskId,
+                    "writer",
+                    null,
+                    new RunSessionProof(session.Payload.RunId, session.Payload.OpaqueToken)),
+                IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                timeout.Token);
+            AssertTrue(spawned.Payload.ChildRunId is not null, "Authorized spawnChildRun must return a durable child RunId.");
+            AssertTrue(
+                spawned.Payload.Outcome is "spawned" or "queued",
+                "spawnChildRun must use the normal secure path, not InvalidSession.");
+
+            var sqlite = new SqliteRuntimeStore(Path.Combine(root, ".llmw", "project.db"));
+            var child = sqlite.GetRun(spawned.Payload.ChildRunId!);
+            AssertTrue(child is not null, "Child Run must be durable.");
+            AssertEqual(workflow.Payload.WorkflowRunId, child!.WorkflowRunId, "Child must share the parent workflow.");
+            AssertTrue(StringComparer.Ordinal.Equals(parent.Payload.RunId, child.ParentRunId), "Child ParentRunId must be the parent Run.");
+            AssertEqual(parent.Payload.Depth + 1, child.Depth, "Child depth must be parent + 1.");
+
+            try
+            {
+                await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateRun,
+                    new CreateRunRequest(workflow.Payload.WorkflowRunId, "writer", parent.Payload.RunId, "denied-child"),
+                    IpcJsonContext.Default.CreateRunRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("createRun(parentRunId) must remain denied.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.AgentSpawnDenied, exception.ErrorCode,
+                    "createRun must remain root-only after the secure spawn path is wired.");
+            }
+        }
+        finally
+        {
+            StopCore(core);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static async Task ProductionRuntimeReconnectAfterOpenProjectObtainsNewRunSessionAsync()
+    {
+        var root = CreateValidProjectFixture();
+        var workspaceInstanceId = "wp12reconn" + Guid.NewGuid().ToString("N");
+        var uiToken = IpcBootstrapToken.Create();
+        var runtimeToken = IpcBootstrapToken.Create();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(40));
+        using var core = StartCore(workspaceInstanceId, uiToken, runtimeToken);
+        try
+        {
+            await using var ui = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Core(workspaceInstanceId),
+                workspaceInstanceId,
+                uiToken,
+                IpcClientKind.Ui,
+                timeout.Token);
+            _ = await ui.RequestAsync(
+                IpcSemanticTypes.OpenProject,
+                new OpenProjectRequest(root),
+                IpcJsonContext.Default.OpenProjectRequestEnvelope,
+                IpcJsonContext.Default.OpenProjectResponseEnvelope,
+                timeout.Token);
+
+            string parentRunId;
+            string parentTaskId;
+            string firstToken;
+            string rotatedToken;
+            await using (var runtime = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Runtime(workspaceInstanceId),
+                workspaceInstanceId,
+                runtimeToken,
+                IpcClientKind.AgentRuntime,
+                timeout.Token))
+            {
+                var workflow = await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateWorkflowRun,
+                    new CreateWorkflowRunRequest(null),
+                    IpcJsonContext.Default.CreateWorkflowRunRequestEnvelope,
+                    IpcJsonContext.Default.CreateWorkflowRunResponseEnvelope,
+                    timeout.Token);
+                var parent = await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateRun,
+                    new CreateRunRequest(workflow.Payload.WorkflowRunId, "pm", null, null),
+                    IpcJsonContext.Default.CreateRunRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunResponseEnvelope,
+                    timeout.Token);
+                var parentTask = await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateTask,
+                    new CreateTaskRequest(parent.Payload.RunId, "write", 1, null, null),
+                    IpcJsonContext.Default.CreateTaskRequestEnvelope,
+                    IpcJsonContext.Default.CreateTaskResponseEnvelope,
+                    timeout.Token);
+                var firstSession = await runtime.RequestAsync(
+                    IpcSemanticTypes.CreateRunSession,
+                    new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest(parent.Payload.RunId, null),
+                    IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                    timeout.Token);
+                parentRunId = parent.Payload.RunId;
+                parentTaskId = parentTask.Payload.TaskId;
+                firstToken = firstSession.Payload.OpaqueToken;
+                rotatedToken = runtime.RotatedBootstrapToken ?? runtimeToken;
+            }
+
+            await using var reconnected = await ConnectAndHandshakeAsync(
+                IpcPipeNames.Runtime(workspaceInstanceId),
+                workspaceInstanceId,
+                rotatedToken,
+                IpcClientKind.AgentRuntime,
+                timeout.Token);
+            var secondSession = await reconnected.RequestAsync(
+                IpcSemanticTypes.CreateRunSession,
+                new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest(parentRunId, null),
+                IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                timeout.Token);
+            AssertEqual(parentRunId, secondSession.Payload.RunId, "Reconnected Runtime must obtain a RunSession for the durable Run.");
+            AssertTrue(!string.IsNullOrWhiteSpace(secondSession.Payload.OpaqueToken), "Reconnect CreateRunSession must return a non-empty token.");
+            AssertTrue(!StringComparer.Ordinal.Equals(firstToken, secondSession.Payload.OpaqueToken),
+                "Reconnect must issue a new opaque token.");
+
+            try
+            {
+                await reconnected.RequestAsync(
+                    IpcSemanticTypes.SpawnChildRun,
+                    new SpawnChildRunRequest(
+                        parentRunId,
+                        parentTaskId,
+                        "writer",
+                        null,
+                        new RunSessionProof(parentRunId, firstToken)),
+                    IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                    IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                    timeout.Token);
+                throw new InvalidOperationException("Disconnected-channel RunSession must remain revoked.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertTrue(
+                    exception.ErrorCode is IpcErrorCodes.SessionRevoked or IpcErrorCodes.InvalidSession,
+                    "Old disconnected-channel session must not authorize spawnChildRun. Actual: " + exception.ErrorCode);
+            }
+
+            var spawned = await reconnected.RequestAsync(
+                IpcSemanticTypes.SpawnChildRun,
+                new SpawnChildRunRequest(
+                    parentRunId,
+                    parentTaskId,
+                    "writer",
+                    null,
+                    new RunSessionProof(secondSession.Payload.RunId, secondSession.Payload.OpaqueToken)),
+                IpcJsonContext.Default.SpawnChildRunRequestEnvelope,
+                IpcJsonContext.Default.SpawnChildRunResponseEnvelope,
+                timeout.Token);
+            AssertTrue(spawned.Payload.ChildRunId is not null, "New reconnect RunSession must authorize spawnChildRun.");
+        }
+        finally
+        {
+            StopCore(core);
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
             }
         }
     }

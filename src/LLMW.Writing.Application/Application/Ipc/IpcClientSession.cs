@@ -240,6 +240,14 @@ public sealed class IpcClientSession : IAsyncDisposable
         {
         }
 
+        try
+        {
+            await stream.DisposeAsync().ConfigureAwait(false);
+        }
+        catch (IOException)
+        {
+        }
+
         lifetime.Dispose();
     }
 

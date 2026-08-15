@@ -22,6 +22,10 @@ public sealed class IpcServerOptions
 
     public RunSessionService? RunSessions { get; init; }
 
+    public IRunSessionServiceAccessor? RunSessionAccessor { get; init; }
+
+    public RunSessionService? ResolveRunSessions() => RunSessions ?? RunSessionAccessor?.Current;
+
     public IIpcStateSnapshotProvider Snapshots { get; init; } = TransportOnlySnapshotProvider.Instance;
 
     public IIpcApplicationCommandHandler Commands { get; init; } = UnavailableIpcCommandHandler.Instance;
@@ -542,7 +546,9 @@ public static class IpcServerSession
         private void HandleCreateRunSession(IpcWireEnvelope wire)
         {
             var request = IpcJson.DeserializePayload(wire.Payload, IpcJsonContext.Default.CreateRunSessionRequest);
-            if (channel is null || options.RunSessions is null)
+            TryBindTrustedChannel();
+            var sessions = options.ResolveRunSessions();
+            if (channel is null || sessions is null)
             {
                 TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.TrustedBindingUnavailable, "Trusted channel binding is unavailable.", IpcSemanticTypes.CreateRunSession);
                 return;
@@ -557,7 +563,7 @@ public static class IpcServerSession
             DateTimeOffset? requested = request.ExpiresAtMs is long ms
                 ? DateTimeOffset.FromUnixTimeMilliseconds(ms)
                 : null;
-            var created = options.RunSessions.Create(new AppCreateRunSessionRequest(request.RunId, channel, requested));
+            var created = sessions.Create(new AppCreateRunSessionRequest(request.RunId, channel, requested));
             if (!created.Succeeded || created.Value is null)
             {
                 TryWriteError(wire.RequestId, wire.CorrelationId, MapSessionError(created.Failure?.Code), "RunSession issuance failed.", IpcSemanticTypes.CreateRunSession);
@@ -587,7 +593,9 @@ public static class IpcServerSession
         private void HandleRevokeRunSession(IpcWireEnvelope wire)
         {
             var request = IpcJson.DeserializePayload(wire.Payload, IpcJsonContext.Default.RevokeRunSessionRequest);
-            if (options.RunSessions is null)
+            TryBindTrustedChannel();
+            var sessions = options.ResolveRunSessions();
+            if (sessions is null)
             {
                 TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.TrustedBindingUnavailable, "RunSession store is unavailable.", IpcSemanticTypes.RevokeRunSession);
                 return;
@@ -601,7 +609,7 @@ public static class IpcServerSession
                     return;
                 }
 
-                var resolved = options.RunSessions.Resolve(new ResolveRunSessionRequest(request.Session.RunId, request.Session.OpaqueToken, channel));
+                var resolved = sessions.Resolve(new ResolveRunSessionRequest(request.Session.RunId, request.Session.OpaqueToken, channel));
                 if (!resolved.Succeeded || resolved.Value is null ||
                     !StringComparer.Ordinal.Equals(resolved.Value.SessionHandleId, request.HandleId))
                 {
@@ -615,7 +623,7 @@ public static class IpcServerSession
                 return;
             }
 
-            var revoked = options.RunSessions.Revoke(request.HandleId) > 0;
+            var revoked = sessions.Revoke(request.HandleId) > 0;
             WriteCritical(wire, IpcJson.Serialize(
                 IpcEnvelopeFactory.Create(
                     IpcMessageType.Response,
@@ -639,11 +647,7 @@ public static class IpcServerSession
                     return;
                 }
 
-                if (channel is null)
-                {
-                    options.Bindings?.TryBind(AuthenticatedClientKind.AgentRuntime, out channel);
-                }
-
+                TryBindTrustedChannel();
                 if (channel is null)
                 {
                     TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.TrustedBindingUnavailable, "Trusted Runtime launch binding is unavailable.", wire.SemanticType);
@@ -661,14 +665,16 @@ public static class IpcServerSession
             }
             else
             {
+                TryBindTrustedChannel();
+                var sessions = options.ResolveRunSessions();
                 RunSessionProof? proof = TryReadProof(wire);
-                if (proof is null || channel is null || options.RunSessions is null)
+                if (proof is null || channel is null || sessions is null)
                 {
                     TryWriteError(wire.RequestId, wire.CorrelationId, IpcErrorCodes.InvalidSession, "Agent commands require a Core-issued RunSession.", wire.SemanticType);
                     return;
                 }
 
-                var resolved = options.RunSessions.Resolve(new ResolveRunSessionRequest(proof.RunId, proof.OpaqueToken, channel));
+                var resolved = sessions.Resolve(new ResolveRunSessionRequest(proof.RunId, proof.OpaqueToken, channel));
                 if (!resolved.Succeeded || resolved.Value is null)
                 {
                     TryWriteError(wire.RequestId, wire.CorrelationId, MapSessionError(resolved.Failure?.Code), "RunSession resolution failed.", wire.SemanticType);
@@ -818,16 +824,38 @@ public static class IpcServerSession
             connectionLifetime.Cancel();
         }
 
+        private void TryBindTrustedChannel()
+        {
+            if (channel is not null)
+            {
+                return;
+            }
+
+            if (options.ExpectedClientKind == IpcClientKind.AgentRuntime)
+            {
+                options.Bindings?.TryBind(AuthenticatedClientKind.AgentRuntime, out channel);
+                return;
+            }
+
+            if (options.ExpectedClientKind == IpcClientKind.Worker &&
+                !string.IsNullOrWhiteSpace(options.LaunchBindingId))
+            {
+                options.Bindings?.TryBind(options.LaunchBindingId, AuthenticatedClientKind.Worker, out channel);
+            }
+        }
+
         private void RevokeBoundSessions()
         {
-            if (Interlocked.Exchange(ref releasedSessions, 1) != 0 || channel is null || options.RunSessions is null)
+            TryBindTrustedChannel();
+            var sessions = options.ResolveRunSessions();
+            if (Interlocked.Exchange(ref releasedSessions, 1) != 0 || channel is null || sessions is null)
             {
                 return;
             }
 
             if (options.ExpectedClientKind is IpcClientKind.AgentRuntime or IpcClientKind.Worker)
             {
-                options.RunSessions.RevokeByChannelWorker(channel);
+                sessions.RevokeByChannelWorker(channel);
             }
 
             if (options.ExpectedClientKind == IpcClientKind.Worker &&

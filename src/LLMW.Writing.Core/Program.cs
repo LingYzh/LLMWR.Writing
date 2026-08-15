@@ -31,6 +31,7 @@ internal static class Program
         var nativeUi = new TrustedNativePrincipalSource("core-native-ui");
         var runtimeWorkerInstanceId = "runtime-" + Guid.NewGuid().ToString("N");
         var runtimeChannelInstanceId = "runtime-channel-" + Guid.NewGuid().ToString("N");
+        var runSessions = new ProjectRunSessionServiceHolder();
         commands.Inner = new CoreOpenProjectHandler(
             commands,
             bindings,
@@ -38,7 +39,8 @@ internal static class Program
             workspaceInstanceId,
             runtimeWorkerInstanceId,
             runtimeChannelInstanceId,
-            nativeUi);
+            nativeUi,
+            runSessions);
 
         var uiOptions = new IpcServerOptions
         {
@@ -57,7 +59,8 @@ internal static class Program
             Bootstrap = new IpcBootstrapAuthenticator(runtimeBootstrapToken),
             EventRing = eventRing,
             Bindings = bindings,
-            Commands = commands
+            Commands = commands,
+            RunSessionAccessor = runSessions
         };
 
         var uiServer = new Ipc.CorePipeServer(

@@ -4,6 +4,7 @@ using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
+using LLMW.Writing.Domain.Security;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
@@ -20,6 +21,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
     private readonly string runtimeWorkerInstanceId;
     private readonly string runtimeChannelInstanceId;
     private readonly TrustedNativePrincipalSource nativeUi;
+    private readonly ProjectRunSessionServiceHolder runSessions;
     private bool opened;
 
     public CoreOpenProjectHandler(
@@ -29,7 +31,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         string workspaceInstanceId,
         string runtimeWorkerInstanceId,
         string runtimeChannelInstanceId,
-        TrustedNativePrincipalSource nativeUi)
+        TrustedNativePrincipalSource nativeUi,
+        ProjectRunSessionServiceHolder runSessions)
     {
         this.commands = commands;
         this.bindings = bindings;
@@ -38,6 +41,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         this.runtimeWorkerInstanceId = runtimeWorkerInstanceId;
         this.runtimeChannelInstanceId = runtimeChannelInstanceId;
         this.nativeUi = nativeUi;
+        this.runSessions = runSessions;
     }
 
     public Task<IpcApplicationCommandResult?> HandleAsync(IpcApplicationCommandContext context)
@@ -67,44 +71,72 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     Error(context, IpcErrorCodes.BindingMismatch, bind.DenyReason ?? "Existing project preflight failed."));
             }
 
-            var scope = new ProjectScope(bind.ProjectId, workspaceInstanceId);
-            bindings.Register(new TrustedIpcLaunchRecord(
-                AuthenticatedClientKind.AgentRuntime,
-                runtimeWorkerInstanceId,
-                runtimeChannelInstanceId,
-                scope));
+            var previousInner = commands.Inner;
+            RunSessionService? published = null;
+            var runtimeBindingInstalled = false;
+            try
+            {
+                var scope = new ProjectScope(bind.ProjectId, workspaceInstanceId);
+                var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
+                var store = new SqliteRuntimeStore(bind.DatabasePath);
+                var sessions = new RunSessionService(sessionStore);
+                var sandboxHost = CreateSandboxHost(bind.CanonicalRoot, scope);
+                var broker = new TrustedSandboxBroker(
+                    new CoreAuthorizationService(),
+                    sandboxHost,
+                    UnavailableSandboxPathGuard.Instance,
+                    new SandboxProjectContext(bind.CanonicalRoot, scope),
+                    sessionRevalidator: new RunSessionRevalidator(sessionStore));
+                var workerExe = Path.Combine(AppContext.BaseDirectory, "worker", "LLMW.Writing.Worker.exe");
+                var supervisor = new CoreRunWorkerSupervisor(
+                    broker,
+                    sandboxHost,
+                    bindings,
+                    eventRing,
+                    workspaceInstanceId,
+                    workerExe,
+                    nativeUi.ResolveUserInteractive(),
+                    scope,
+                    sessions);
+                var scheduler = new RuntimeSchedulerService(
+                    store,
+                    new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+                    SystemSecurityClock.Instance,
+                    supervisor,
+                    new CoreAuthorizationService(new OpenedProjectAgentSpawnPolicySource()),
+                    bindings: bindings,
+                    sessions: sessions);
 
-            var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
-            var store = new SqliteRuntimeStore(bind.DatabasePath);
-            var sessions = new RunSessionService(sessionStore);
-            var sandboxHost = CreateSandboxHost(bind.CanonicalRoot, scope);
-            var broker = new TrustedSandboxBroker(
-                new CoreAuthorizationService(),
-                sandboxHost,
-                UnavailableSandboxPathGuard.Instance,
-                new SandboxProjectContext(bind.CanonicalRoot, scope),
-                sessionRevalidator: new RunSessionRevalidator(sessionStore));
-            var workerExe = Path.Combine(AppContext.BaseDirectory, "worker", "LLMW.Writing.Worker.exe");
-            var supervisor = new CoreRunWorkerSupervisor(
-                broker,
-                sandboxHost,
-                bindings,
-                eventRing,
-                workspaceInstanceId,
-                workerExe,
-                nativeUi.ResolveUserInteractive(),
-                scope,
-                sessions);
-            var scheduler = new RuntimeSchedulerService(
-                store,
-                new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
-                SystemSecurityClock.Instance,
-                supervisor,
-                new CoreAuthorizationService(),
-                bindings: bindings,
-                sessions: sessions);
-            commands.Inner = new CompositeIpcCommandHandler(this, new RuntimeIpcCommandHandler(scheduler, workspaceInstanceId));
-            opened = true;
+                bindings.Register(new TrustedIpcLaunchRecord(
+                    AuthenticatedClientKind.AgentRuntime,
+                    runtimeWorkerInstanceId,
+                    runtimeChannelInstanceId,
+                    scope));
+                runtimeBindingInstalled = true;
+
+                commands.Inner = new CompositeIpcCommandHandler(this, new RuntimeIpcCommandHandler(scheduler, workspaceInstanceId));
+                runSessions.PublishOnce(sessions);
+                published = sessions;
+                opened = true;
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                opened = false;
+                commands.Inner = previousInner;
+                if (published is not null)
+                {
+                    runSessions.TryAbandon(published);
+                }
+
+                if (runtimeBindingInstalled)
+                {
+                    bindings.Unregister(AuthenticatedClientKind.AgentRuntime);
+                }
+
+                return Task.FromResult<IpcApplicationCommandResult?>(
+                    Error(context, IpcErrorCodes.ProtocolViolation, "Project composition failed closed: " + exception.GetType().Name));
+            }
+
             var response = IpcJson.Serialize(
                 IpcEnvelopeFactory.Create(
                     IpcMessageType.Response,
@@ -148,4 +180,30 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 context.CorrelationId,
                 context.RequestId),
             IpcJsonContext.Default.ErrorEnvelope));
+}
+
+/// <summary>
+/// After a successful existing-project bind, Agent.Spawn is evaluated against the role matrix
+/// with project-trusted product flags. Sandbox authorization remains FailClosed.
+/// Writer + Ask still requires approval; PM Agent.Spawn is Allowed.
+/// </summary>
+file sealed class OpenedProjectAgentSpawnPolicySource : ISecurityPolicySource
+{
+    public SecurityPolicySnapshot? Resolve(CallerPrincipal principal, Capability capability)
+    {
+        if (capability != Capability.AgentSpawn || principal.Kind != PrincipalKind.AgentRun)
+        {
+            return null;
+        }
+
+        return new SecurityPolicySnapshot(
+            ProductAllowed: true,
+            ToolGranted: true,
+            ExtensionGranted: true,
+            ProjectTrusted: true,
+            Scope: SecurityScopeClassification.InScope,
+            HardDeny: HardDeny.None,
+            NarrativeAuthorityAvailable: false,
+            ExplicitUserTask: false);
+    }
 }

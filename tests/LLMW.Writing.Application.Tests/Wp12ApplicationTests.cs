@@ -40,8 +40,9 @@ internal static class Wp12ApplicationTests
         CapacityFullSpawnPersistsQueuedChild();
         TaskCancelDoesNotCancelSiblingOrContainingRun();
         WorkerRunSessionCompositionFailsClosedAndRevokesOwnSession();
-        Console.WriteLine("Application WP12 scheduler tests passed (23).");
-        return 23;
+        RuntimeRunSessionAccessorIsResolvedLiveNotCopiedAtConstruction();
+        Console.WriteLine("Application WP12 scheduler tests passed (24).");
+        return 24;
     }
 
     private static void ConcurrentWorkerBindingsRemainDistinctAndForgedIdsAreDenied()
@@ -792,6 +793,76 @@ internal static class Wp12ApplicationTests
             AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
                 "Session failure must not be swallowed.");
         }
+    }
+
+    private static void RuntimeRunSessionAccessorIsResolvedLiveNotCopiedAtConstruction()
+    {
+        var holder = new ProjectRunSessionServiceHolder();
+        var bindings = new TrustedIpcBindingRegistry();
+        var sessionStore = new MemoryRunSessionStore();
+        sessionStore.Runs["late-run"] = new DurableRunIdentity("late-run", "writer");
+        var sessions = new RunSessionService(sessionStore);
+        var token = IpcBootstrapToken.Create();
+        var options = new IpcServerOptions
+        {
+            WorkspaceInstanceId = Workspace,
+            ExpectedClientKind = IpcClientKind.AgentRuntime,
+            Bootstrap = new IpcBootstrapAuthenticator(token),
+            EventRing = new IpcEventRing(Guid.NewGuid().ToString("D")),
+            Bindings = bindings,
+            RunSessionAccessor = holder
+        };
+        AssertTrue(options.RunSessions is null, "Runtime options must not snapshot a concrete RunSession service before OpenProject.");
+        AssertTrue(options.ResolveRunSessions() is null, "Holder must be empty before publication.");
+
+        RunHosted(token, options, async client =>
+        {
+            try
+            {
+                await client.RequestAsync(
+                    IpcSemanticTypes.CreateRunSession,
+                    new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest("late-run", null),
+                    IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                    CancellationToken.None);
+                throw new InvalidOperationException("CreateRunSession before OpenProject must fail closed.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
+                    "Pre-OpenProject CreateRunSession must be TRUSTED_BINDING_UNAVAILABLE.");
+            }
+
+            bindings.Register(new TrustedIpcLaunchRecord(
+                AuthenticatedClientKind.AgentRuntime, "runtime-late", "runtime-late-ch", Scope));
+            try
+            {
+                await client.RequestAsync(
+                    IpcSemanticTypes.CreateRunSession,
+                    new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest("late-run", null),
+                    IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                    IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                    CancellationToken.None);
+                throw new InvalidOperationException("Binding without RunSession publication must fail closed.");
+            }
+            catch (IpcProtocolException exception)
+            {
+                AssertEqual(IpcErrorCodes.TrustedBindingUnavailable, exception.ErrorCode,
+                    "Runtime binding without a published RunSession service must fail closed.");
+            }
+
+            holder.PublishOnce(sessions);
+            AssertTrue(ReferenceEquals(options.ResolveRunSessions(), sessions),
+                "The same connection must observe the published Core-owned RunSession service.");
+            var created = await client.RequestAsync(
+                IpcSemanticTypes.CreateRunSession,
+                new LLMW.Writing.Contracts.Ipc.CreateRunSessionRequest("late-run", null),
+                IpcJsonContext.Default.CreateRunSessionRequestEnvelope,
+                IpcJsonContext.Default.CreateRunSessionResponseEnvelope,
+                CancellationToken.None);
+            AssertEqual("late-run", created.Payload.RunId, "Late-bound CreateRunSession must issue for the requested Run.");
+            AssertTrue(!string.IsNullOrWhiteSpace(created.Payload.OpaqueToken), "Late-bound CreateRunSession must return a non-empty opaque token.");
+        }, IpcClientKind.AgentRuntime);
     }
 
     private static void DispatchAndLaunch(RuntimeSchedulerService service, string runId, string taskId)
