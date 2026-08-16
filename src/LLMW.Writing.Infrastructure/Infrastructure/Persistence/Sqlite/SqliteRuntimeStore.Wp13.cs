@@ -240,24 +240,31 @@ public sealed partial class SqliteRuntimeStore
             ("$result_artifact_id", (object?)resultArtifactId ?? DBNull.Value),
             ("$id", dependencyId));
 
-    public void InsertOversightOverride(OversightOverrideRecord record)
+    public OversightOverrideRecord InsertOversightOverride(OversightOverrideRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
-        Execute(
-            """
-            INSERT INTO oversight_overrides(
-                override_id, scope_kind, scope_id, narrative_authority, runtime_permission_mode,
-                effective_after_checkpoint_id, created_by, created_at_ms)
-            VALUES ($id, $scope_kind, $scope_id, $narrative, $permission, $checkpoint, $created_by, $created_at_ms);
-            """,
-            ("$id", record.OverrideId),
-            ("$scope_kind", OversightScopeKindCodec.ToDurableValue(record.ScopeKind)),
-            ("$scope_id", (object?)record.ScopeId ?? DBNull.Value),
-            ("$narrative", NarrativeDecisionAuthorityCodec.ToDurableValue(record.NarrativeAuthority)),
-            ("$permission", RuntimePermissionModeDurableCodec.ToDurableValue(record.RuntimePermission)),
-            ("$checkpoint", (object?)record.EffectiveAfterCheckpointId ?? DBNull.Value),
-            ("$created_by", record.CreatedBy),
-            ("$created_at_ms", record.CreatedAtMs));
+        lock (gate)
+        {
+            using var lease = Open();
+            var allocated = AllocateCreatedAtMs(lease, record.CreatedAtMs);
+            var stored = record with { CreatedAtMs = allocated };
+            using var command = Create(lease, """
+                INSERT INTO oversight_overrides(
+                    override_id, scope_kind, scope_id, narrative_authority, runtime_permission_mode,
+                    effective_after_checkpoint_id, created_by, created_at_ms)
+                VALUES ($id, $scope_kind, $scope_id, $narrative, $permission, $checkpoint, $created_by, $created_at_ms);
+                """);
+            Add(command, "$id", stored.OverrideId);
+            Add(command, "$scope_kind", OversightScopeKindCodec.ToDurableValue(stored.ScopeKind));
+            Add(command, "$scope_id", (object?)stored.ScopeId ?? DBNull.Value);
+            Add(command, "$narrative", NarrativeDecisionAuthorityCodec.ToDurableValue(stored.NarrativeAuthority));
+            Add(command, "$permission", RuntimePermissionModeDurableCodec.ToDurableValue(stored.RuntimePermission));
+            Add(command, "$checkpoint", (object?)stored.EffectiveAfterCheckpointId ?? DBNull.Value);
+            Add(command, "$created_by", stored.CreatedBy);
+            Add(command, "$created_at_ms", stored.CreatedAtMs);
+            command.ExecuteNonQuery();
+            return stored;
+        }
     }
 
     public IReadOnlyList<OversightOverrideRecord> ListOversightOverrides()

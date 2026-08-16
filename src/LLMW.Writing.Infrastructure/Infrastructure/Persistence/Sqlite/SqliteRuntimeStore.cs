@@ -1,11 +1,12 @@
 using System.Data.Common;
+using System.Globalization;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.Persistence;
 
 namespace LLMW.Writing.Infrastructure.Persistence.Sqlite;
 
-public sealed partial class SqliteRuntimeStore : IRuntimePersistence
+public sealed partial class SqliteRuntimeStore : IRuntimePersistence, IRuntimeLogicalTimestampAllocator
 {
     private readonly string databasePath;
     private readonly SqliteDatabaseConnectionFactory connectionFactory;
@@ -60,6 +61,8 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             using var lease = Open();
+            var allocated = AllocateCreatedAtMs(lease, run.CreatedAtMs);
+            var stored = run with { CreatedAtMs = allocated, UpdatedAtMs = Math.Max(run.UpdatedAtMs, allocated) };
             using var command = Create(lease, """
                 INSERT INTO runs(
                     run_id, workflow_run_id, parent_run_id, role, status, depth,
@@ -68,20 +71,20 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
                     $run_id, $workflow_run_id, $parent_run_id, $role, $status, $depth,
                     $provider_id, $model_id, $prompt_config_id, $effective_prompt_digest, $created_at_ms, $updated_at_ms);
                 """);
-            Add(command, "$run_id", run.RunId);
-            Add(command, "$workflow_run_id", run.WorkflowRunId);
-            Add(command, "$parent_run_id", (object?)run.ParentRunId ?? DBNull.Value);
-            Add(command, "$role", run.Role);
-            Add(command, "$status", run.Status);
-            Add(command, "$depth", run.Depth);
-            Add(command, "$provider_id", (object?)run.ProviderId ?? DBNull.Value);
-            Add(command, "$model_id", (object?)run.ModelId ?? DBNull.Value);
-            Add(command, "$prompt_config_id", (object?)run.PromptConfigId ?? DBNull.Value);
-            Add(command, "$effective_prompt_digest", (object?)run.EffectivePromptDigest ?? DBNull.Value);
-            Add(command, "$created_at_ms", run.CreatedAtMs);
-            Add(command, "$updated_at_ms", run.UpdatedAtMs);
+            Add(command, "$run_id", stored.RunId);
+            Add(command, "$workflow_run_id", stored.WorkflowRunId);
+            Add(command, "$parent_run_id", (object?)stored.ParentRunId ?? DBNull.Value);
+            Add(command, "$role", stored.Role);
+            Add(command, "$status", stored.Status);
+            Add(command, "$depth", stored.Depth);
+            Add(command, "$provider_id", (object?)stored.ProviderId ?? DBNull.Value);
+            Add(command, "$model_id", (object?)stored.ModelId ?? DBNull.Value);
+            Add(command, "$prompt_config_id", (object?)stored.PromptConfigId ?? DBNull.Value);
+            Add(command, "$effective_prompt_digest", (object?)stored.EffectivePromptDigest ?? DBNull.Value);
+            Add(command, "$created_at_ms", stored.CreatedAtMs);
+            Add(command, "$updated_at_ms", stored.UpdatedAtMs);
             command.ExecuteNonQuery();
-            return run;
+            return stored;
         }
     }
 
@@ -91,23 +94,25 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             using var lease = Open();
+            var allocated = AllocateCreatedAtMs(lease, task.CreatedAtMs);
+            var stored = task with { CreatedAtMs = allocated, UpdatedAtMs = Math.Max(task.UpdatedAtMs, allocated) };
             using var command = Create(lease, """
                 INSERT INTO tasks(
                     task_id, run_id, parent_task_id, task_kind, status, priority, completion_contract_json, created_at_ms, updated_at_ms)
                 VALUES (
                     $task_id, $run_id, $parent_task_id, $task_kind, $status, $priority, $completion_contract_json, $created_at_ms, $updated_at_ms);
                 """);
-            Add(command, "$task_id", task.TaskId);
-            Add(command, "$run_id", task.RunId);
-            Add(command, "$parent_task_id", (object?)task.ParentTaskId ?? DBNull.Value);
-            Add(command, "$task_kind", task.TaskKind);
-            Add(command, "$status", task.Status);
-            Add(command, "$priority", task.Priority);
-            Add(command, "$completion_contract_json", (object?)task.CompletionContractJson ?? DBNull.Value);
-            Add(command, "$created_at_ms", task.CreatedAtMs);
-            Add(command, "$updated_at_ms", task.UpdatedAtMs);
+            Add(command, "$task_id", stored.TaskId);
+            Add(command, "$run_id", stored.RunId);
+            Add(command, "$parent_task_id", (object?)stored.ParentTaskId ?? DBNull.Value);
+            Add(command, "$task_kind", stored.TaskKind);
+            Add(command, "$status", stored.Status);
+            Add(command, "$priority", stored.Priority);
+            Add(command, "$completion_contract_json", (object?)stored.CompletionContractJson ?? DBNull.Value);
+            Add(command, "$created_at_ms", stored.CreatedAtMs);
+            Add(command, "$updated_at_ms", stored.UpdatedAtMs);
             command.ExecuteNonQuery();
-            return task;
+            return stored;
         }
     }
 
@@ -167,6 +172,30 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
             ("$now", nowMs),
             ("$id", runId));
 
+    public void UpdateRun(DurableRunRecord run)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        Execute(
+            """
+            UPDATE runs
+            SET workflow_run_id=$workflow_run_id, parent_run_id=$parent_run_id, role=$role, status=$status, depth=$depth,
+                provider_id=$provider_id, model_id=$model_id, prompt_config_id=$prompt_config_id,
+                effective_prompt_digest=$effective_prompt_digest, updated_at_ms=$updated_at_ms
+            WHERE run_id=$run_id;
+            """,
+            ("$workflow_run_id", run.WorkflowRunId),
+            ("$parent_run_id", (object?)run.ParentRunId ?? DBNull.Value),
+            ("$role", run.Role),
+            ("$status", run.Status),
+            ("$depth", run.Depth),
+            ("$provider_id", (object?)run.ProviderId ?? DBNull.Value),
+            ("$model_id", (object?)run.ModelId ?? DBNull.Value),
+            ("$prompt_config_id", (object?)run.PromptConfigId ?? DBNull.Value),
+            ("$effective_prompt_digest", (object?)run.EffectivePromptDigest ?? DBNull.Value),
+            ("$updated_at_ms", run.UpdatedAtMs),
+            ("$run_id", run.RunId));
+    }
+
     public void UpdateTaskStatus(string taskId, string status, long nowMs) =>
         Execute(
             "UPDATE tasks SET status=$status, updated_at_ms=$now WHERE task_id=$id;",
@@ -201,6 +230,7 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
         lock (gate)
         {
             using var lease = Open();
+            var allocated = AllocateCreatedAtMs(lease, checkpoint.CreatedAtMs);
             using var command = Create(lease, """
                 INSERT INTO checkpoints(
                     checkpoint_id, run_id, task_id, schema_version, payload_json, input_digest_set_json, created_at_ms)
@@ -213,7 +243,7 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
             Add(command, "$schema_version", checkpoint.SchemaVersion);
             Add(command, "$payload_json", checkpoint.PayloadJson);
             Add(command, "$input_digest_set_json", checkpoint.InputDigestSetJson);
-            Add(command, "$created_at_ms", checkpoint.CreatedAtMs);
+            Add(command, "$created_at_ms", allocated);
             command.ExecuteNonQuery();
             return checkpoint.CheckpointId;
         }
@@ -444,6 +474,37 @@ public sealed partial class SqliteRuntimeStore : IRuntimePersistence
 
             command.ExecuteNonQuery();
         }
+    }
+
+    public long AllocateCreatedAtMs(long wallClockMs)
+    {
+        lock (gate)
+        {
+            using var lease = Open();
+            return AllocateCreatedAtMs(lease, wallClockMs);
+        }
+    }
+
+    private static long AllocateCreatedAtMs(ConnectionLease lease, long wallClockMs) =>
+        RuntimeLogicalTimestamp.Allocate(wallClockMs, ReadPersistedMaxCreatedAtMs(lease));
+
+    private static long? ReadPersistedMaxCreatedAtMs(ConnectionLease lease)
+    {
+        using var command = Create(lease, """
+            SELECT MAX(ts) FROM (
+                SELECT created_at_ms AS ts FROM runs
+                UNION ALL SELECT created_at_ms FROM tasks
+                UNION ALL SELECT created_at_ms FROM checkpoints
+                UNION ALL SELECT created_at_ms FROM oversight_overrides
+            );
+            """);
+        var value = command.ExecuteScalar();
+        if (value is null or DBNull)
+        {
+            return null;
+        }
+
+        return Convert.ToInt64(value, CultureInfo.InvariantCulture);
     }
 
     private ConnectionLease Open()

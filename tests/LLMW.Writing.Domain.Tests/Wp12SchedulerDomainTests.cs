@@ -23,6 +23,7 @@ internal static partial class Program
         Run(nameof(CheckpointV1SerializesDeterministicallyAndExcludesSecrets), CheckpointV1SerializesDeterministicallyAndExcludesSecrets);
         Run(nameof(CheckpointRetainsLatestTwentyMessagesAndTruncatesToolRefs), CheckpointRetainsLatestTwentyMessagesAndTruncatesToolRefs);
         Run(nameof(ResumeClassifierCoversFrozenDecisionsAndUnknownSideEffect), ResumeClassifierCoversFrozenDecisionsAndUnknownSideEffect);
+        Run(nameof(ResumeClassifierComparesCurrentInputsToExactCheckpointBaseline), ResumeClassifierComparesCurrentInputsToExactCheckpointBaseline);
         Run(nameof(UnrelatedDraftChangeDoesNotStaleTask), UnrelatedDraftChangeDoesNotStaleTask);
         Run(nameof(UnknownSideEffectBlocksAutomaticRetry), UnknownSideEffectBlocksAutomaticRetry);
         Run(nameof(RequiredUnsatisfiedDependencyBlocksDispatch), RequiredUnsatisfiedDependencyBlocksDispatch);
@@ -266,6 +267,52 @@ internal static partial class Program
         AssertEqual(ResumeDecisionKind.RestartRun, restartRun.Kind, "Structural invalidation must RESTART_RUN.");
         var blocked = ResumeClassifier.Classify(run, checkpoint, Fresh(unknown: true));
         AssertEqual(ResumeDecisionKind.BlockUnknown, blocked.Kind, "UNKNOWN side effect must block.");
+    }
+
+    private static void ResumeClassifierComparesCurrentInputsToExactCheckpointBaseline()
+    {
+        var run = Run("run-1", null, 0, "interrupted") with
+        {
+            PromptConfigId = "P-run",
+            ProviderId = "prov-run",
+            ModelId = "m-run",
+            EffectivePromptDigest = "e-run"
+        };
+        var checkpoint = new DurableCheckpointRecord(
+            "cp-1",
+            "run-1",
+            "t-1",
+            1,
+            "{}",
+            """{"effectivePromptDigest":"E1","modelId":"M1","promptConfigId":"P1","providerId":"A"}""",
+            10);
+        var matching = Fresh() with
+        {
+            PromptConfigId = "P1",
+            ProviderId = "A",
+            ModelId = "M1",
+            EffectivePromptDigest = "E1"
+        };
+        AssertEqual(ResumeDecisionKind.Continue, ResumeClassifier.Classify(run, checkpoint, matching).Kind,
+            "CURRENT matching the exact checkpoint baseline must CONTINUE even when the Run row differs.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, checkpoint, matching with { PromptConfigId = "P2" }).Kind,
+            "PromptConfigId change vs checkpoint baseline must REPLAN.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, checkpoint, matching with { ProviderId = "B" }).Kind,
+            "ProviderId change vs checkpoint baseline must REPLAN.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, checkpoint, matching with { ModelId = "M2" }).Kind,
+            "ModelId change vs checkpoint baseline must REPLAN.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, checkpoint, matching with { EffectivePromptDigest = "E2" }).Kind,
+            "EffectivePromptDigest change vs checkpoint baseline must REPLAN.");
+        var later = checkpoint with { CheckpointId = "cp-2", CreatedAtMs = 20, InputDigestSetJson = "{}" };
+        AssertEqual(ResumeDecisionKind.Continue, ResumeClassifier.Classify(run, checkpoint, matching).Kind,
+            "An unrelated later checkpoint must not replace CP1 as the comparison baseline.");
+        _ = later;
+        var unknownBaseline = new DurableCheckpointRecord("cp-unknown", "run-1", "t-1", 1, "{}", "{}", 10);
+        AssertEqual(ResumeDecisionKind.Continue,
+            ResumeClassifier.Classify(run, unknownBaseline, matching with { PromptConfigId = "P2" }).Kind,
+            "A checkpoint that retained no prompt/provider/model baseline must not invent a difference.");
+        AssertEqual(ResumeDecisionKind.BlockUnknown, ResumeClassifier.Classify(run, checkpoint, matching with { UnknownSideEffect = true }).Kind,
+            "UNKNOWN must remain BLOCK_UNKNOWN.");
     }
 
     private static void UnrelatedDraftChangeDoesNotStaleTask()

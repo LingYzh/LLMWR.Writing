@@ -468,8 +468,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         store.UpdateDependencyRecord(dependencyId, kind, current.Status, current.ResultArtifactId);
-        RecomputeOne(store.GetDependency(dependencyId)!);
-        RefreshConsumerReadiness(current.ConsumerTaskId);
+        PropagateProducerFreshness([current.ProducerTaskId]);
         var updated = store.GetDependency(dependencyId)!;
         return RuntimeResults.Success(new UpdateResultDependencyResponse(
             dependencyId,
@@ -520,7 +519,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     public RuntimeResult<RefreshResultDependencyStatusResponse> RefreshResultDependencyStatus(string? producerTaskId, string? consumerTaskId)
     {
         var snapshot = store.LoadSnapshot();
-        var updated = 0;
+        var origins = new SortedSet<string>(StringComparer.Ordinal);
         foreach (var dependency in snapshot.Dependencies)
         {
             if ((!string.IsNullOrWhiteSpace(producerTaskId) &&
@@ -531,11 +530,23 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 continue;
             }
 
-            RecomputeOne(dependency);
-            updated++;
-            RefreshConsumerReadiness(dependency.ConsumerTaskId);
+            origins.Add(dependency.ProducerTaskId);
         }
 
+        if (string.IsNullOrWhiteSpace(producerTaskId) && !string.IsNullOrWhiteSpace(consumerTaskId))
+        {
+            origins.Add(consumerTaskId);
+        }
+
+        if (string.IsNullOrWhiteSpace(producerTaskId) && string.IsNullOrWhiteSpace(consumerTaskId))
+        {
+            foreach (var dependency in snapshot.Dependencies)
+            {
+                origins.Add(dependency.ProducerTaskId);
+            }
+        }
+
+        var updated = PropagateProducerFreshness(origins);
         return RuntimeResults.Success(new RefreshResultDependencyStatusResponse(updated));
     }
 
@@ -569,14 +580,6 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
-        foreach (var existing in store.ListOversightOverrides())
-        {
-            if (existing.CreatedAtMs >= now)
-            {
-                now = existing.CreatedAtMs + 1;
-            }
-        }
-
         var id = Guid.NewGuid().ToString("D");
         _ = request.EffectiveAfterCheckpointId;
         string? checkpoint = null;
@@ -594,9 +597,9 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             checkpoint,
             principal.TrustedInstanceId,
             now);
-        store.InsertOversightOverride(record);
+        var stored = store.InsertOversightOverride(record);
         var active = OversightActivation.IsActiveForExecution(
-            record,
+            stored,
             BuildActivationContext(
                 scope == OversightScopeKind.Project ? request.ScopeId : principal.ProjectScope?.ProjectId.ToString("D"),
                 scope == OversightScopeKind.Storyline ? request.ScopeId : null,
@@ -1358,12 +1361,142 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
 
     private void RecomputeConsumersOf(string producerTaskId, string? resultArtifactId)
     {
-        foreach (var dependency in store.LoadSnapshot().Dependencies.Where(item =>
-                     StringComparer.Ordinal.Equals(item.ProducerTaskId, producerTaskId)))
+        _ = resultArtifactId;
+        PropagateProducerFreshness([producerTaskId]);
+    }
+
+    private int PropagateProducerFreshness(IEnumerable<string> originProducerTaskIds)
+    {
+        var origins = originProducerTaskIds
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray();
+        if (origins.Length == 0)
         {
-            RecomputeOne(dependency with { ResultArtifactId = resultArtifactId ?? dependency.ResultArtifactId });
+            return 0;
+        }
+
+        var bound = ResultDependencyGraph.Bound(store.LoadSnapshot().Dependencies);
+        var queue = new Queue<string>();
+        var queued = new HashSet<string>(StringComparer.Ordinal);
+        var visits = new Dictionary<string, int>(StringComparer.Ordinal);
+        var steps = 0;
+        var updated = 0;
+
+        void Enqueue(string taskId)
+        {
+            if (queued.Contains(taskId))
+            {
+                return;
+            }
+
+            visits.TryGetValue(taskId, out var seen);
+            if (seen >= bound)
+            {
+                FailClosedProducer(taskId);
+                return;
+            }
+
+            queue.Enqueue(taskId);
+            queued.Add(taskId);
+        }
+
+        foreach (var origin in origins)
+        {
+            Enqueue(origin);
+        }
+
+        while (queue.Count > 0)
+        {
+            if (steps >= bound)
+            {
+                foreach (var remaining in queue)
+                {
+                    FailClosedProducer(remaining);
+                }
+
+                break;
+            }
+
+            steps++;
+            var producer = queue.Dequeue();
+            queued.Remove(producer);
+            visits[producer] = visits.GetValueOrDefault(producer) + 1;
+            if (visits[producer] > bound)
+            {
+                FailClosedProducer(producer);
+                continue;
+            }
+
+            var outgoing = store.LoadSnapshot().Dependencies
+                .Where(item => StringComparer.Ordinal.Equals(item.ProducerTaskId, producer))
+                .OrderBy(item => item.DependencyId, StringComparer.Ordinal)
+                .ToArray();
+            foreach (var dependency in outgoing)
+            {
+                var beforeStatus = dependency.Status;
+                var beforeFreshness = ReadResultFreshness(dependency.ConsumerTaskId);
+                var beforeResultId = store.GetLatestResultArtifact(dependency.ConsumerTaskId)?.ResultArtifactId;
+                RecomputeOne(dependency);
+                updated++;
+                RefreshConsumerReadiness(dependency.ConsumerTaskId);
+                var after = store.GetDependency(dependency.DependencyId);
+                var afterFreshness = ReadResultFreshness(dependency.ConsumerTaskId);
+                var afterResultId = store.GetLatestResultArtifact(dependency.ConsumerTaskId)?.ResultArtifactId;
+                var changed = !StringComparer.Ordinal.Equals(beforeStatus, after?.Status) ||
+                              beforeFreshness != afterFreshness ||
+                              !StringComparer.Ordinal.Equals(beforeResultId, afterResultId);
+                if (changed)
+                {
+                    Enqueue(dependency.ConsumerTaskId);
+                }
+            }
+        }
+
+        return updated;
+    }
+
+    private void FailClosedProducer(string producerTaskId)
+    {
+        var outgoing = store.LoadSnapshot().Dependencies
+            .Where(item => StringComparer.Ordinal.Equals(item.ProducerTaskId, producerTaskId))
+            .OrderBy(item => item.DependencyId, StringComparer.Ordinal)
+            .ToArray();
+        foreach (var dependency in outgoing)
+        {
+            if (ResultDependencyKindCodec.IsRequired(dependency.DependencyKind) &&
+                ResultDependencyStatusCodec.IsCurrent(dependency.Status))
+            {
+                store.UpdateDependencyRecord(
+                    dependency.DependencyId,
+                    dependency.DependencyKind,
+                    ResultDependencyStatusCodec.ToDurableValue(ResultDependencyStatus.Stale),
+                    dependency.ResultArtifactId);
+            }
+
+            var artifact = store.GetLatestResultArtifact(dependency.ConsumerTaskId);
+            if (artifact is not null)
+            {
+                var parsed = ResultArtifactCanonicalJson.FromDurable(artifact);
+                if (parsed.Freshness.State == ResultFreshnessState.Current)
+                {
+                    store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(
+                        parsed with
+                        {
+                            Freshness = parsed.Freshness with { State = ResultFreshnessState.NeedsRevalidation }
+                        }));
+                }
+            }
+
             RefreshConsumerReadiness(dependency.ConsumerTaskId);
         }
+    }
+
+    private ResultFreshnessState? ReadResultFreshness(string taskId)
+    {
+        var artifact = store.GetLatestResultArtifact(taskId);
+        return artifact is null ? null : ResultArtifactCanonicalJson.FromDurable(artifact).Freshness.State;
     }
 
     private void RecomputeOne(DurableDependencyRecord dependency)

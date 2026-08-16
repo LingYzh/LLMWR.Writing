@@ -197,11 +197,9 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
                    (SELECT json_extract(event_payload_json,'$[0].TargetRelativePath')
                     FROM authority_events WHERE transaction_id=t.transaction_id AND event_type='wp03.materialization_plan'
                     ORDER BY event_seq DESC LIMIT 1),
-                   COALESCE(
-                       a.warnings_ack_digest,
-                       (SELECT event_payload_json FROM authority_events
-                        WHERE transaction_id=t.transaction_id AND event_type='wp13.delegated_authorization'
-                        ORDER BY event_seq DESC LIMIT 1))
+                   (SELECT event_payload_json FROM authority_events
+                    WHERE transaction_id=t.transaction_id AND event_type='wp13.delegated_authorization'
+                    ORDER BY event_seq DESC LIMIT 1)
             FROM candidates c
             JOIN chapters ch ON ch.chapter_id=c.chapter_id
             JOIN authority_transactions t ON t.transaction_id=COALESCE(
@@ -349,7 +347,7 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
                 acceptance_id,scope_kind,scope_id,candidate_id,manuscript_revision_id,review_attempt_id,
                 accepted_by_kind,accepted_by_id,warnings_ack_digest,transaction_id,accepted_at_ms)
             VALUES($acceptance_id,'chapter',$chapter_id,$candidate_id,$revision_id,$review_id,
-                   $accepted_by_kind,$accepted_by_id,$snapshot,$transaction_id,$now);
+                   $accepted_by_kind,$accepted_by_id,$warnings_ack,$transaction_id,$now);
             """,
             ("$acceptance_id", context.AcceptanceId),
             ("$chapter_id", context.ChapterId),
@@ -358,7 +356,7 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             ("$review_id", context.ReviewAttemptId),
             ("$accepted_by_kind", context.AcceptedByKind),
             ("$accepted_by_id", context.AcceptedById ?? "user-interactive"),
-            ("$snapshot", (object?)context.AuthorizationSnapshotJson ?? DBNull.Value),
+            ("$warnings_ack", DBNull.Value),
             ("$transaction_id", context.TransactionId),
             ("$now", now));
         Execute(

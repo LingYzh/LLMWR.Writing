@@ -499,7 +499,7 @@ public static class ResumeClassifier
             throw new CheckpointSchemaException(RuntimeRejectionCode.CheckpointUnsupported, latestCheckpoint.SchemaVersion);
         }
 
-        var changed = InputsChanged(latestCheckpoint, run, inputs);
+        var changed = InputsChanged(latestCheckpoint, inputs);
         return changed
             ? new ResumeDecision(ResumeDecisionKind.Replan, "inputs-changed-plan-valid", latestCheckpoint.CheckpointId)
             : new ResumeDecision(ResumeDecisionKind.Continue, "unchanged", latestCheckpoint.CheckpointId);
@@ -530,36 +530,14 @@ public static class ResumeClassifier
         return ResumeDecisionKind.Continue;
     }
 
-    private static bool InputsChanged(DurableCheckpointRecord checkpoint, DurableRunRecord run, FreshnessInputs inputs)
+    private static bool InputsChanged(DurableCheckpointRecord checkpoint, FreshnessInputs inputs)
     {
         var retained = ParseDigestSet(checkpoint.InputDigestSetJson);
-        if (!string.IsNullOrWhiteSpace(inputs.AuthorityRevision) &&
-            retained.TryGetValue("authorityRevision", out var previousRevision) &&
-            !StringComparer.Ordinal.Equals(previousRevision, inputs.AuthorityRevision))
-        {
-            return true;
-        }
-
-        if (!string.IsNullOrWhiteSpace(inputs.PromptConfigId) &&
-            !string.Equals(inputs.PromptConfigId, run.PromptConfigId, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (!string.IsNullOrWhiteSpace(inputs.EffectivePromptDigest) &&
-            !string.Equals(inputs.EffectivePromptDigest, run.EffectivePromptDigest, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (!string.IsNullOrWhiteSpace(inputs.ProviderId) &&
-            !string.Equals(inputs.ProviderId, run.ProviderId, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (!string.IsNullOrWhiteSpace(inputs.ModelId) &&
-            !string.Equals(inputs.ModelId, run.ModelId, StringComparison.Ordinal))
+        if (CheckpointBaselineDiffers(retained, "authorityRevision", inputs.AuthorityRevision) ||
+            CheckpointBaselineDiffers(retained, "promptConfigId", inputs.PromptConfigId) ||
+            CheckpointBaselineDiffers(retained, "effectivePromptDigest", inputs.EffectivePromptDigest) ||
+            CheckpointBaselineDiffers(retained, "providerId", inputs.ProviderId) ||
+            CheckpointBaselineDiffers(retained, "modelId", inputs.ModelId))
         {
             return true;
         }
@@ -599,6 +577,19 @@ public static class ResumeClassifier
         }
 
         return false;
+    }
+
+    private static bool CheckpointBaselineDiffers(
+        Dictionary<string, string> retained,
+        string key,
+        string? current)
+    {
+        if (!retained.TryGetValue(key, out var baseline) || string.IsNullOrWhiteSpace(baseline))
+        {
+            return false;
+        }
+
+        return !StringComparer.Ordinal.Equals(baseline, current ?? "");
     }
 
     private static Dictionary<string, string> ParseDigestSet(string json)

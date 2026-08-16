@@ -34,6 +34,7 @@ internal static partial class Program
         Run(nameof(ConsumerFreshnessRequiresFrozenUpstreamRefs), ConsumerFreshnessRequiresFrozenUpstreamRefs);
         Run(nameof(SameRunEvidenceIsNotImplicitlyOwned), SameRunEvidenceIsNotImplicitlyOwned);
         Run(nameof(NewExecutionAfterOverrideUsesNewPolicyImmediately), NewExecutionAfterOverrideUsesNewPolicyImmediately);
+        Run(nameof(RuntimeLogicalTimestampIsStrictlyMonotonic), RuntimeLogicalTimestampIsStrictlyMonotonic);
         Run(nameof(FormalAuthorizationSnapshotRoundtripsWinningScope), FormalAuthorizationSnapshotRoundtripsWinningScope);
     }
 
@@ -611,6 +612,9 @@ internal static partial class Program
         var inFlight = new OversightActivationContext("proj", null, "task-a", "run-a", [], 10, 10);
         AssertTrue(!OversightActivation.IsActiveForExecution(pending, inFlight),
             "In-flight Run A must keep the pinned old policy until its safe checkpoint.");
+        var sameClock = new OversightActivationContext("proj", null, "task-same", "run-same", [], 50, 50);
+        AssertTrue(!OversightActivation.IsActiveForExecution(pending, sameClock),
+            "Equal created_at_ms must treat the execution as pre-override, not born after.");
         var bornAfter = new OversightActivationContext("proj", null, "task-b", "run-b", [], 80, 80);
         AssertTrue(OversightActivation.IsActiveForExecution(pending, bornAfter),
             "Run B created after the override must start under the new policy immediately.");
@@ -639,6 +643,14 @@ internal static partial class Program
         AssertEqual(OversightScopeKind.Task, parsed!.WinningScope, "Winning scope must be frozen.");
         AssertEqual("task-win", parsed.WinningScopeId, "Winning scope id must be frozen.");
         AssertEqual("task-win", parsed.ToDelegatedDecision().ScopeId, "Delegated repair must use the frozen scope.");
+    }
+
+    private static void RuntimeLogicalTimestampIsStrictlyMonotonic()
+    {
+        AssertEqual(1_000L, RuntimeLogicalTimestamp.Allocate(1_000, null), "Empty store must use wall-clock.");
+        AssertEqual(1_001L, RuntimeLogicalTimestamp.Allocate(1_000, 1_000), "Same-millisecond wall-clock must bump past persisted max.");
+        AssertEqual(5_000L, RuntimeLogicalTimestamp.Allocate(5_000, 1_000), "Later wall-clock must win when it is already ahead.");
+        AssertEqual(1_001L, RuntimeLogicalTimestamp.Allocate(1_000, 1_000), "Restart must not allocate at or below the persisted max.");
     }
 
     private static CompletionCheckInputs Inputs(

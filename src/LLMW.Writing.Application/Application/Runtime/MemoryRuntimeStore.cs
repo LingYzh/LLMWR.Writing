@@ -2,7 +2,7 @@ using LLMW.Writing.Domain.Runtime;
 
 namespace LLMW.Writing.Application.Runtime;
 
-public sealed class MemoryRuntimeStore : IRuntimePersistence
+public sealed class MemoryRuntimeStore : IRuntimePersistence, IRuntimeLogicalTimestampAllocator
 {
     private readonly object gate = new();
     private readonly Dictionary<string, DurableWorkflowRunRecord> workflows = new(StringComparer.Ordinal);
@@ -46,13 +46,23 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
+    public long AllocateCreatedAtMs(long wallClockMs)
+    {
+        lock (gate)
+        {
+            return AllocateCreatedAtMsLocked(wallClockMs);
+        }
+    }
+
     public DurableRunRecord InsertRun(DurableRunRecord run)
     {
         ArgumentNullException.ThrowIfNull(run);
         lock (gate)
         {
-            runs[run.RunId] = run;
-            return run;
+            var allocated = AllocateCreatedAtMsLocked(run.CreatedAtMs);
+            var stored = run with { CreatedAtMs = allocated, UpdatedAtMs = Math.Max(run.UpdatedAtMs, allocated) };
+            runs[stored.RunId] = stored;
+            return stored;
         }
     }
 
@@ -61,13 +71,15 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         ArgumentNullException.ThrowIfNull(task);
         lock (gate)
         {
-            tasks[task.TaskId] = task;
-            if (!string.IsNullOrWhiteSpace(task.CompletionContractJson))
+            var allocated = AllocateCreatedAtMsLocked(task.CreatedAtMs);
+            var stored = task with { CreatedAtMs = allocated, UpdatedAtMs = Math.Max(task.UpdatedAtMs, allocated) };
+            tasks[stored.TaskId] = stored;
+            if (!string.IsNullOrWhiteSpace(stored.CompletionContractJson))
             {
-                completionContracts[task.TaskId] = task.CompletionContractJson;
+                completionContracts[stored.TaskId] = stored.CompletionContractJson;
             }
 
-            return task;
+            return stored;
         }
     }
 
@@ -104,6 +116,20 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
             }
 
             runs[runId] = current with { Status = status, UpdatedAtMs = nowMs };
+        }
+    }
+
+    public void UpdateRun(DurableRunRecord run)
+    {
+        ArgumentNullException.ThrowIfNull(run);
+        lock (gate)
+        {
+            if (!runs.TryGetValue(run.RunId, out var existing))
+            {
+                return;
+            }
+
+            runs[run.RunId] = run with { CreatedAtMs = existing.CreatedAtMs };
         }
     }
 
@@ -153,7 +179,8 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         ArgumentNullException.ThrowIfNull(checkpoint);
         lock (gate)
         {
-            checkpoints[checkpoint.CheckpointId] = checkpoint;
+            var allocated = AllocateCreatedAtMsLocked(checkpoint.CreatedAtMs);
+            checkpoints[checkpoint.CheckpointId] = checkpoint with { CreatedAtMs = allocated };
             return checkpoint.CheckpointId;
         }
     }
@@ -429,12 +456,15 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
-    public void InsertOversightOverride(OversightOverrideRecord record)
+    public OversightOverrideRecord InsertOversightOverride(OversightOverrideRecord record)
     {
         ArgumentNullException.ThrowIfNull(record);
         lock (gate)
         {
-            oversight[record.OverrideId] = record;
+            var allocated = AllocateCreatedAtMsLocked(record.CreatedAtMs);
+            var stored = record with { CreatedAtMs = allocated };
+            oversight[stored.OverrideId] = stored;
+            return stored;
         }
     }
 
@@ -655,6 +685,36 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
             toolCalls[toolCallId] = record with { Status = "cancelled" };
             return true;
         }
+    }
+
+    private long AllocateCreatedAtMsLocked(long wallClockMs) =>
+        RuntimeLogicalTimestamp.Allocate(wallClockMs, PersistedMaxCreatedAtMsLocked());
+
+    private long? PersistedMaxCreatedAtMsLocked()
+    {
+        long? max = null;
+        void Consider(long value) => max = max is null ? value : Math.Max(max.Value, value);
+        foreach (var run in runs.Values)
+        {
+            Consider(run.CreatedAtMs);
+        }
+
+        foreach (var task in tasks.Values)
+        {
+            Consider(task.CreatedAtMs);
+        }
+
+        foreach (var checkpoint in checkpoints.Values)
+        {
+            Consider(checkpoint.CreatedAtMs);
+        }
+
+        foreach (var record in oversight.Values)
+        {
+            Consider(record.CreatedAtMs);
+        }
+
+        return max;
     }
 }
 

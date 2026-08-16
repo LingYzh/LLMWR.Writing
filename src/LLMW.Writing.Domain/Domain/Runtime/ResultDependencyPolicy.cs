@@ -176,3 +176,19 @@ public static class ResultDependencyPolicy
 
     public static bool ProposalMutatesEffectiveEdge => false;
 }
+
+public static class ResultDependencyGraph
+{
+    public static int Bound(IReadOnlyList<DurableDependencyRecord> dependencies)
+    {
+        ArgumentNullException.ThrowIfNull(dependencies);
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var dependency in dependencies)
+        {
+            ids.Add(dependency.ProducerTaskId);
+            ids.Add(dependency.ConsumerTaskId);
+        }
+
+        return Math.Max(1, ids.Count + dependencies.Count);
+    }
+}

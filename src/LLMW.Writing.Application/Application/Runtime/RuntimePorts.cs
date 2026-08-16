@@ -95,6 +95,11 @@ public sealed class SchedulerFaultInjectedException : Exception
     public SchedulerFaultPoint Point { get; }
 }
 
+public interface IRuntimeLogicalTimestampAllocator
+{
+    long AllocateCreatedAtMs(long wallClockMs);
+}
+
 public interface IRuntimePersistence
 {
     SchedulerSnapshot LoadSnapshot();
@@ -110,6 +115,8 @@ public interface IRuntimePersistence
     void UpdateWorkflowRunStatus(string workflowRunId, string status, long nowMs);
 
     void UpdateRunStatus(string runId, string status, long nowMs);
+
+    void UpdateRun(DurableRunRecord run);
 
     void UpdateTaskStatus(string taskId, string status, long nowMs);
 
@@ -167,7 +174,7 @@ public interface IRuntimePersistence
 
     void UpdateDependencyRecord(string dependencyId, string kind, string status, string? resultArtifactId);
 
-    void InsertOversightOverride(OversightOverrideRecord record);
+    OversightOverrideRecord InsertOversightOverride(OversightOverrideRecord record);
 
     IReadOnlyList<OversightOverrideRecord> ListOversightOverrides();
 

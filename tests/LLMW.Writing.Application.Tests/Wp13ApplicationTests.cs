@@ -78,8 +78,11 @@ internal static class Wp13ApplicationTests
         HistoricalDelegatedProvenanceSurvivesOversightChange();
         DelegatedProvenanceConflictIsVisible();
         MissingDependencyEdgesAreEmitted();
-        Console.WriteLine("Application WP13 tests passed (58).");
-        return 58;
+        TransitiveRequiredFreshnessPropagatesAndRestores();
+        GrillPromptProviderModelChangedSinceExactCheckpoint();
+        SameMillisecondOversightOrderingIsDeterministic();
+        Console.WriteLine("Application WP13 tests passed (61).");
+        return 61;
     }
 
     private static void DeterministicCompletionPassesAndIsIdempotent()
@@ -1638,6 +1641,167 @@ internal static class Wp13ApplicationTests
         AssertTrue(string.IsNullOrWhiteSpace(optional.ResultArtifactId), "OPTIONAL missing Result must be null.");
     }
 
+    private static void TransitiveRequiredFreshnessPropagatesAndRestores()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-trans", "writer");
+        SeedDispatchedTask(harness, "run-trans", "task-a");
+        SeedDispatchedTask(harness, "run-trans", "task-b");
+        Success(harness.Scheduler.CreateTask("run-trans", "write", 1, null, "task-c"));
+        Success(harness.Scheduler.CreateTask("run-trans", "write", 1, null, "task-d"));
+        SubmitComplete(harness, agent, "task-a");
+        Success(harness.Wp13.RequestTaskCompletion("task-a", agent));
+        var aId = harness.Store.GetLatestResultArtifact("task-a")!.ResultArtifactId;
+        var ab = Success(harness.Wp13.CreateResultDependency("task-b", "task-a", "required"));
+        SubmitAgainst(harness, agent, "task-b", [aId]);
+        Success(harness.Wp13.RequestTaskCompletion("task-b", agent));
+        var bId = harness.Store.GetLatestResultArtifact("task-b")!.ResultArtifactId;
+        var bc = Success(harness.Wp13.CreateResultDependency("task-c", "task-b", "required"));
+        var ad = Success(harness.Wp13.CreateResultDependency("task-d", "task-a", "required"));
+        AssertEqual("current", harness.Store.GetDependency(ab.DependencyId)?.Status, "A→B must start CURRENT.");
+        AssertEqual("current", harness.Store.GetDependency(bc.DependencyId)?.Status, "B→C must start CURRENT.");
+        AssertEqual("current", harness.Store.GetDependency(ad.DependencyId)?.Status, "A→D must start CURRENT.");
+        AssertEqual("ready", harness.Store.GetTask("task-c")?.Status, "C must be ready while required inputs are current.");
+
+        var frozenA = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-a")!);
+        harness.Store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(
+            frozenA with { Freshness = frozenA.Freshness with { State = ResultFreshnessState.Stale } }));
+        Success(harness.Wp13.RefreshResultDependencyStatus("task-a", null));
+        AssertEqual("stale", harness.Store.GetDependency(ab.DependencyId)?.Status, "A→B must become STALE.");
+        AssertEqual(ResultFreshnessState.Stale,
+            ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-b")!).Freshness.State,
+            "B Result must become STALE.");
+        AssertEqual(bId, harness.Store.GetLatestResultArtifact("task-b")!.ResultArtifactId,
+            "Completed B ResultArtifactId must stay frozen.");
+        AssertEqual("stale", harness.Store.GetDependency(bc.DependencyId)?.Status, "B→C must become STALE.");
+        AssertEqual("blocked", harness.Store.GetTask("task-c")?.Status, "C must be blocked/non-current.");
+        AssertEqual("stale", harness.Store.GetDependency(ad.DependencyId)?.Status, "A→D branch must recompute.");
+        AssertEqual("blocked", harness.Store.GetTask("task-d")?.Status, "D must be blocked after A stales.");
+
+        harness.Store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(
+            frozenA with { Freshness = frozenA.Freshness with { State = ResultFreshnessState.Current } }));
+        Success(harness.Wp13.RefreshResultDependencyStatus("task-a", null));
+        AssertEqual("current", harness.Store.GetDependency(ab.DependencyId)?.Status, "Restored A must make A→B CURRENT.");
+        AssertEqual(ResultFreshnessState.Current,
+            ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-b")!).Freshness.State,
+            "B Result must return to CURRENT after A is restored.");
+        AssertEqual("current", harness.Store.GetDependency(bc.DependencyId)?.Status, "B→C must return to CURRENT.");
+        AssertEqual("ready", harness.Store.GetTask("task-c")?.Status, "C must become ready after restore.");
+        AssertEqual("current", harness.Store.GetDependency(ad.DependencyId)?.Status, "A→D must return to CURRENT.");
+
+        var reloaded = new Wp13RuntimeService(harness.Store, harness.Scheduler, new FixedClock(1_000));
+        Success(reloaded.RefreshResultDependencyStatus(null, null));
+        AssertEqual("current", harness.Store.GetDependency(ab.DependencyId)?.Status, "Reload must keep A→B CURRENT.");
+        AssertEqual("current", harness.Store.GetDependency(bc.DependencyId)?.Status, "Reload must keep B→C CURRENT.");
+        AssertEqual("current", harness.Store.GetDependency(ad.DependencyId)?.Status, "Reload must keep A→D CURRENT.");
+    }
+
+    private static void GrillPromptProviderModelChangedSinceExactCheckpoint()
+    {
+        AssertGrillBaselineChange(run => run, "Continue");
+        AssertGrillBaselineChange(run => run with { PromptConfigId = "P2" }, "Replan");
+        AssertGrillBaselineChange(run => run with { ProviderId = "B" }, "Replan");
+        AssertGrillBaselineChange(run => run with { ModelId = "M2" }, "Replan");
+        AssertGrillBaselineChange(run => run with { EffectivePromptDigest = "E2" }, "Replan");
+        AssertGrillBaselineChange(run => run with { PromptConfigId = "P2" }, "Replan", persistUnrelatedCheckpoint: true);
+    }
+
+    private static void AssertGrillBaselineChange(
+        Func<DurableRunRecord, DurableRunRecord> mutate,
+        string expected,
+        bool persistUnrelatedCheckpoint = false)
+    {
+        var harness = Harness();
+        var user = User();
+        SeedDispatchedTask(harness, "run-grill-base", "task-grill-base");
+        var seeded = harness.Store.GetRun("run-grill-base")!;
+        harness.Store.UpdateRun(seeded with
+        {
+            PromptConfigId = "P1",
+            ProviderId = "A",
+            ModelId = "M1",
+            EffectivePromptDigest = "E1"
+        });
+        var paused = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-base",
+            "task-grill-base",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "grill-base"));
+        var cp1 = harness.Store.CheckpointsForRun("run-grill-base")
+            .Last(item => item.PayloadJson.Contains(paused.ApprovalId, StringComparison.Ordinal));
+        AssertTrue(cp1.InputDigestSetJson.Contains("\"promptConfigId\":\"P1\"", StringComparison.Ordinal),
+            "Grill pause must retain promptConfigId in the exact checkpoint digest set.");
+        if (persistUnrelatedCheckpoint)
+        {
+            Success(harness.Scheduler.CreateTask("run-grill-base", "write", 1, null, "task-unrelated-base"));
+            Success(harness.Scheduler.PersistCheckpoint(
+                "run-grill-base",
+                "task-unrelated-base",
+                1,
+                CanonicalJson.WriteCheckpoint(CheckpointV1.Create(
+                    "later",
+                    "other",
+                    "{}",
+                    "{}",
+                    "task",
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    null,
+                    null,
+                    null,
+                    null)),
+                "{}"));
+        }
+
+        var live = harness.Store.GetRun("run-grill-base")!;
+        harness.Store.UpdateRun(mutate(live));
+        var resolved = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null), user));
+        AssertEqual(expected, resolved.ResumeDecision, "Exact CP1 baseline comparison drifted.");
+    }
+
+    private static void SameMillisecondOversightOrderingIsDeterministic()
+    {
+        var clock = new MutableClock(50_000);
+        var harness = Harness(clock: clock);
+        var user = User();
+        var project = ProjectId.ToString("D");
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", project, "agent_delegated", "auto_approve_scoped", null), user));
+        SeedRunningTask(harness, "run-a-same", "task-a-same");
+        harness.Store.UpdateTaskStatus("task-a-same", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 50_000);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", project, "author_confirmed_required", "ask", null), user));
+        var runA = Success(harness.Wp13.GetEffectiveOversight(project, null, "task-a-same"));
+        AssertEqual("agent_delegated", runA.NarrativeAuthority, "Case A AUTO→MANUAL: Run A remains AUTO.");
+        SeedRunningTask(harness, "run-b-same", "task-b-same");
+        var runB = Success(harness.Wp13.GetEffectiveOversight(project, null, "task-b-same"));
+        AssertEqual("author_confirmed_required", runB.NarrativeAuthority, "Case B AUTO→MANUAL: Run B is MANUAL immediately.");
+
+        SeedRunningTask(harness, "run-c-same", "task-c-same");
+        harness.Store.UpdateTaskStatus("task-c-same", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 50_000);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", project, "agent_delegated", "auto_approve_scoped", null), user));
+        var runC = Success(harness.Wp13.GetEffectiveOversight(project, null, "task-c-same"));
+        AssertEqual("author_confirmed_required", runC.NarrativeAuthority, "Case A MANUAL→AUTO: Run C remains MANUAL.");
+        SeedRunningTask(harness, "run-d-same", "task-d-same");
+        var runD = Success(harness.Wp13.GetEffectiveOversight(project, null, "task-d-same"));
+        AssertEqual("agent_delegated", runD.NarrativeAuthority, "Case B MANUAL→AUTO: Run D is AUTO immediately.");
+
+        var runACreated = harness.Store.GetRun("run-a-same")!.CreatedAtMs;
+        var manual = harness.Store.ListOversightOverrides()
+            .Where(item => item.NarrativeAuthority == NarrativeDecisionAuthority.AuthorConfirmedRequired)
+            .OrderBy(item => item.CreatedAtMs)
+            .Last();
+        AssertTrue(runACreated < manual.CreatedAtMs,
+            "Persisted created_at_ms must distinguish Run A from the same-clock MANUAL override.");
+    }
+
     private static HarnessState Harness(
         ISemanticCompletionEvaluator? semantic = null,
         IPendingApprovalSafetyEvaluator? pending = null,
@@ -1711,6 +1875,30 @@ internal static class Wp13ApplicationTests
     private static void SubmitComplete(HarnessState harness, CallerPrincipal agent, string taskId)
     {
         var artifact = Artifact(taskId, ResultArtifactStatus.Complete);
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                taskId,
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("findings", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", artifact),
+                null),
+            agent));
+    }
+
+    private static void SubmitAgainst(HarnessState harness, CallerPrincipal agent, string taskId, IReadOnlyList<string> upstream)
+    {
+        var artifact = Artifact(taskId, ResultArtifactStatus.Complete) with
+        {
+            Freshness = new ResultFreshnessV1(
+                1,
+                ResultFreshnessState.Current,
+                new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, upstream),
+                new ResultProvenanceV1(null, taskId, null, null, null, null, null, null))
+        };
         Success(harness.Wp13.SubmitResultArtifact(
             new SubmitResultArtifactRequest(
                 taskId,
