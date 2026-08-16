@@ -24,7 +24,8 @@ public sealed record CheckpointV1(
     string? PromptConfigId,
     string? ProviderId,
     string? ModelId,
-    string? EffectivePromptDigest)
+    string? EffectivePromptDigest,
+    IReadOnlyList<string> InvocationLog)
 {
     public const int CurrentSchemaVersion = 1;
     public const int RetainedCriticalMessageLimit = 20;
@@ -45,7 +46,8 @@ public sealed record CheckpointV1(
         string? promptConfigId,
         string? providerId,
         string? modelId,
-        string? effectivePromptDigest) =>
+        string? effectivePromptDigest,
+        IReadOnlyList<string>? invocationLog = null) =>
         new(
             CurrentSchemaVersion,
             approvedPlanReference,
@@ -62,7 +64,8 @@ public sealed record CheckpointV1(
             promptConfigId,
             providerId,
             modelId,
-            effectivePromptDigest);
+            effectivePromptDigest,
+            (invocationLog ?? []).Select(SecretRedaction.RedactObjectJson).ToArray());
 
     public static IReadOnlyList<CheckpointCriticalMessage> RetainLatestMessages(
         IReadOnlyList<CheckpointCriticalMessage> messages)
@@ -226,6 +229,18 @@ public static class CanonicalJson
             WriteOptionalString(writer, "providerId", checkpoint.ProviderId);
             WriteOptionalString(writer, "modelId", checkpoint.ModelId);
             WriteOptionalString(writer, "effectivePromptDigest", checkpoint.EffectivePromptDigest);
+            if (checkpoint.InvocationLog.Count > 0)
+            {
+                writer.WritePropertyName("invocationLog");
+                writer.WriteStartArray();
+                foreach (var item in checkpoint.InvocationLog)
+                {
+                    WriteRawOrEmptyObject(writer, item);
+                }
+
+                writer.WriteEndArray();
+            }
+
             writer.WriteEndObject();
         }
 
@@ -269,7 +284,8 @@ public static class CanonicalJson
                 OptionalString(root, "promptConfigId"),
                 OptionalString(root, "providerId"),
                 OptionalString(root, "modelId"),
-                OptionalString(root, "effectivePromptDigest"));
+                OptionalString(root, "effectivePromptDigest"),
+                ReadInvocationLog(root));
         }
         catch (JsonException exception)
         {
@@ -385,6 +401,22 @@ public static class CanonicalJson
 
     private static string? OptionalString(JsonElement root, string name) =>
         root.TryGetProperty(name, out var property) ? property.GetString() : null;
+
+    private static List<string> ReadInvocationLog(JsonElement root)
+    {
+        if (!root.TryGetProperty("invocationLog", out var property) || property.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        var list = new List<string>();
+        foreach (var item in property.EnumerateArray())
+        {
+            list.Add(item.GetRawText());
+        }
+
+        return list;
+    }
 
     private static List<CheckpointCriticalMessage> ReadMessages(JsonElement array)
     {

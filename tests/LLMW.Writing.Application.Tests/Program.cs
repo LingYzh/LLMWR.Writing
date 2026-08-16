@@ -28,7 +28,8 @@ internal static class Program
             var wp11 = Wp11ApplicationTests.Run();
             var wp13 = Wp13ApplicationTests.Run();
             var wp12 = Wp12ApplicationTests.Run();
-            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10 + wp11 + wp12 + wp13}).");
+            var wp14 = Wp14ApplicationTests.Run();
+            Console.WriteLine($"Application Narrative Change/Registry/Security tests passed ({6 + wp10 + wp11 + wp12 + wp13 + wp14}).");
             return 0;
         }
         catch (Exception exception)
