@@ -1,0 +1,54 @@
+name: Windows Sandbox Security
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref (branch, tag, or SHA) to validate
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-sandbox-security-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+  DOTNET_NOLOGO: '1'
+  NUGET_XMLDOC_MODE: skip
+
+jobs:
+  sandbox-security:
+    name: WP10 Windows Sandbox Security
+    runs-on: [self-hosted, windows, x64, llmw-sandbox]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout requested ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Setup .NET from global.json
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Show runner identity
+        shell: pwsh
+        run: |
+          Write-Host "Runner: $env:RUNNER_NAME"
+          Write-Host "OS: $([System.Environment]::OSVersion.VersionString)"
+          whoami
+
+      - name: Run full release test gate with WP10 OS enforcement
+        shell: pwsh
+        run: ./build.ps1 -Target Test -Configuration Release
+
+      - name: Run full release integration gate with WP10 OS enforcement
+        shell: pwsh
+        run: ./build.ps1 -Target IntegrationTest -Configuration Release

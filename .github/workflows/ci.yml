@@ -25,37 +25,37 @@ env:
 
 jobs:
   core-tests:
-    name: Core Tests
+    name: Hosted Core Tests
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup .NET from global.json
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
 
-      - name: Run release test gate
+      - name: Run hosted release test gate
         shell: pwsh
-        run: ./build.ps1 -Target Test -Configuration Release
+        run: ./.github/scripts/run-hosted-gate.ps1 -Gate Core -Configuration Release
 
   integration-tests:
-    name: Integration Tests
+    name: Hosted Integration Tests
     runs-on: windows-latest
     timeout-minutes: 30
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup .NET from global.json
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
 
-      - name: Run release integration gate
+      - name: Run hosted release integration gate
         shell: pwsh
-        run: ./build.ps1 -Target IntegrationTest -Configuration Release
+        run: ./.github/scripts/run-hosted-gate.ps1 -Gate Integration -Configuration Release
