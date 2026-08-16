@@ -30,6 +30,11 @@ internal static partial class Program
         Run(nameof(EvidenceStaleWhenSourceDigestChanges), EvidenceStaleWhenSourceDigestChanges);
         Run(nameof(ResultFreshnessAuthorityIgnoresCallerCurrent), ResultFreshnessAuthorityIgnoresCallerCurrent);
         Run(nameof(ForwardOnlyActivationIsExecutionScoped), ForwardOnlyActivationIsExecutionScoped);
+        Run(nameof(RequiredDependencyIgnoresProvisionalProducerResult), RequiredDependencyIgnoresProvisionalProducerResult);
+        Run(nameof(ConsumerFreshnessRequiresFrozenUpstreamRefs), ConsumerFreshnessRequiresFrozenUpstreamRefs);
+        Run(nameof(SameRunEvidenceIsNotImplicitlyOwned), SameRunEvidenceIsNotImplicitlyOwned);
+        Run(nameof(NewExecutionAfterOverrideUsesNewPolicyImmediately), NewExecutionAfterOverrideUsesNewPolicyImmediately);
+        Run(nameof(FormalAuthorizationSnapshotRoundtripsWinningScope), FormalAuthorizationSnapshotRoundtripsWinningScope);
     }
 
     private static void CompletionContractDeterministicPassAndMissingOutput()
@@ -468,6 +473,172 @@ internal static partial class Program
                 boundB,
                 contextB with { ExecutionCheckpoints = [checkpointA, checkpointB] }),
             "Binding the pending token to Task B's own checkpoint must activate it.");
+    }
+
+    private static void RequiredDependencyIgnoresProvisionalProducerResult()
+    {
+        var provisional = ResultDependencyPolicy.Recompute(
+            ResultDependencyKind.Required,
+            "r1",
+            ResultFreshnessState.Current,
+            true,
+            producerFormallyCompleted: false);
+        AssertEqual(ResultDependencyStatus.Missing, provisional,
+            "REQUIRED must not become CURRENT on a provisional Running producer Result.");
+        var frozen = ResultDependencyPolicy.Recompute(
+            ResultDependencyKind.Required,
+            "r2",
+            ResultFreshnessState.Current,
+            true,
+            producerFormallyCompleted: true);
+        AssertEqual(ResultDependencyStatus.Current, frozen,
+            "REQUIRED becomes CURRENT only after formal producer completion.");
+        var advisoryProvisional = ResultDependencyPolicy.Recompute(
+            ResultDependencyKind.Advisory,
+            "r1",
+            ResultFreshnessState.Current,
+            true,
+            producerFormallyCompleted: false);
+        AssertEqual(ResultDependencyStatus.Warning, advisoryProvisional,
+            "ADVISORY provisional data must not masquerade as a completed CURRENT Result.");
+    }
+
+    private static void ConsumerFreshnessRequiresFrozenUpstreamRefs()
+    {
+        var submitted = new ResultFreshnessV1(
+            1,
+            ResultFreshnessState.Current,
+            new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, ["r1"]),
+            new ResultProvenanceV1("run-1", "consumer", "att-1", null, null, null, null, null));
+        var omitted = ResultFreshnessAuthority.Stamp(
+            submitted with { ProducedAgainst = submitted.ProducedAgainst with { UpstreamRequiredResultRefs = [] } },
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "consumer",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal),
+                null,
+                new HashSet<string>(StringComparer.Ordinal),
+                ["r2"],
+                1),
+            []);
+        AssertEqual(ResultFreshnessState.Stale, omitted.State,
+            "Omitting the current REQUIRED frozen Result must not remain CURRENT.");
+        var oldR1 = ResultFreshnessAuthority.Stamp(
+            submitted,
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "consumer",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal),
+                null,
+                new HashSet<string>(StringComparer.Ordinal),
+                ["r2"],
+                1),
+            []);
+        AssertEqual(ResultFreshnessState.Stale, oldR1.State,
+            "Produced-against R1 must stale when the frozen producer Result is R2.");
+        var incompleteProducer = ResultFreshnessAuthority.Stamp(
+            submitted,
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "consumer",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal),
+                null,
+                new HashSet<string>(StringComparer.Ordinal),
+                [],
+                1),
+            []);
+        AssertEqual(ResultFreshnessState.NeedsRevalidation, incompleteProducer.State,
+            "REQUIRED edges without a frozen producer Result must not silently be CURRENT.");
+    }
+
+    private static void SameRunEvidenceIsNotImplicitlyOwned()
+    {
+        var submitted = new ResultFreshnessV1(
+            1,
+            ResultFreshnessState.Current,
+            new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, []),
+            new ResultProvenanceV1("run-1", "task-a", "att-1", null, null, null, null, null));
+        var foreign = new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal)
+        {
+            ["ev-b"] = new EvidenceRecord("ev-b", "run-1", "task-b", "narrative", "obj", "digest", "{}", false, 1)
+        };
+        var stamped = ResultFreshnessAuthority.Stamp(
+            submitted,
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "task-a",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                foreign,
+                null,
+                new HashSet<string>(StringComparer.Ordinal)),
+            ["ev-b"]);
+        AssertEqual(ResultFreshnessState.NeedsRevalidation, stamped.State,
+            "Same-Run evidence from another Task is not implicitly owned.");
+        var allowed = ResultFreshnessAuthority.Stamp(
+            submitted,
+            new ResultFreshnessAuthorityInputs(
+                "run-1",
+                "task-a",
+                "att-1",
+                new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal),
+                foreign,
+                null,
+                new HashSet<string>(StringComparer.Ordinal),
+                AllowedCrossTaskEvidenceIds: new HashSet<string>(["ev-b"], StringComparer.Ordinal)),
+            ["ev-b"]);
+        AssertEqual(ResultFreshnessState.Current, allowed.State,
+            "Explicit cross-task evidence references may be current.");
+    }
+
+    private static void NewExecutionAfterOverrideUsesNewPolicyImmediately()
+    {
+        var pending = new OversightOverrideRecord(
+            "o-manual",
+            OversightScopeKind.Project,
+            "proj",
+            NarrativeDecisionAuthority.AuthorConfirmedRequired,
+            RuntimePermissionMode.Ask,
+            OversightActivation.PendingBindToken("o-manual"),
+            "user",
+            50);
+        var inFlight = new OversightActivationContext("proj", null, "task-a", "run-a", [], 10, 10);
+        AssertTrue(!OversightActivation.IsActiveForExecution(pending, inFlight),
+            "In-flight Run A must keep the pinned old policy until its safe checkpoint.");
+        var bornAfter = new OversightActivationContext("proj", null, "task-b", "run-b", [], 80, 80);
+        AssertTrue(OversightActivation.IsActiveForExecution(pending, bornAfter),
+            "Run B created after the override must start under the new policy immediately.");
+        var inverse = pending with
+        {
+            NarrativeAuthority = NarrativeDecisionAuthority.AgentDelegated,
+            RuntimePermission = RuntimePermissionMode.AutoApproveScoped
+        };
+        AssertTrue(OversightActivation.IsActiveForExecution(inverse, bornAfter),
+            "MANUAL→AUTO must also apply immediately to executions created after the change.");
+    }
+
+    private static void FormalAuthorizationSnapshotRoundtripsWinningScope()
+    {
+        var policy = new EffectiveOversightPolicy(
+            NarrativeDecisionAuthority.AgentDelegated,
+            RuntimePermissionMode.AutoApproveScoped,
+            OversightScopeKind.Task,
+            "task-win",
+            "ovr-1",
+            null,
+            true);
+        var snapshot = FormalAuthorizationSnapshot.Capture("acc-1", "tx-1", policy, "agent-1", 9);
+        var parsed = FormalAuthorizationSnapshot.TryParse(snapshot.WriteCanonical());
+        AssertTrue(parsed is not null, "Authorization snapshot must round-trip.");
+        AssertEqual(OversightScopeKind.Task, parsed!.WinningScope, "Winning scope must be frozen.");
+        AssertEqual("task-win", parsed.WinningScopeId, "Winning scope id must be frozen.");
+        AssertEqual("task-win", parsed.ToDelegatedDecision().ScopeId, "Delegated repair must use the frozen scope.");
     }
 
     private static CompletionCheckInputs Inputs(

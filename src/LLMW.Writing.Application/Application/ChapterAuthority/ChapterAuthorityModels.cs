@@ -90,7 +90,8 @@ public sealed record AcceptChapterCandidateResult(
     string TransactionId,
     string MaterializedRelativePath,
     AuthorityTransactionState TransactionState,
-    bool Existing);
+    bool Existing,
+    bool ProvenanceConflict = false);
 
 public sealed record CandidateReviewInput(
     string CandidateId,
@@ -134,7 +135,8 @@ public sealed record CandidateAcceptanceContext(
     string? ManuscriptRevisionId,
     string? MaterializedRelativePath,
     string? AcceptedById,
-    string AcceptedByKind = "AUTHOR_CONFIRMED");
+    string AcceptedByKind = "AUTHOR_CONFIRMED",
+    string? AuthorizationSnapshotJson = null);
 
 public sealed record PersistCandidateRequest(
     string ChapterId,
@@ -151,4 +153,5 @@ public sealed record PrepareAcceptanceRequest(
     CandidateAcceptanceContext Context,
     AcceptanceDecisionContext Decision,
     string AcceptedById,
-    string MaterializedRelativePath);
+    string MaterializedRelativePath,
+    string? AuthorizationSnapshotJson = null);

@@ -575,8 +575,24 @@ public static class ResumeClassifier
 
         foreach (var pair in inputs.RequiredArtifactDigests)
         {
-            if (retained.TryGetValue("artifact:" + pair.Key, out var previous) &&
+            var key = "artifact:" + pair.Key;
+            if (!retained.TryGetValue(key, out var previous) ||
                 !StringComparer.Ordinal.Equals(previous, pair.Value))
+            {
+                return true;
+            }
+        }
+
+        foreach (var pair in retained)
+        {
+            if (!pair.Key.StartsWith("artifact:", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var id = pair.Key["artifact:".Length..];
+            if (!inputs.RequiredArtifactDigests.TryGetValue(id, out var current) ||
+                !StringComparer.Ordinal.Equals(current, pair.Value))
             {
                 return true;
             }

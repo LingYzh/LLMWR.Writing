@@ -86,7 +86,8 @@ public sealed record ApplyNarrativeChangeSetResult(
     string ImpactAnalysisId,
     AuthorityTransactionState TransactionState,
     bool Existing,
-    IReadOnlyList<string> Warnings);
+    IReadOnlyList<string> Warnings,
+    bool ProvenanceConflict = false);
 
 public sealed record NarrativeChangeSetSnapshot(
     string ChangeSetId,
@@ -170,7 +171,8 @@ public sealed record NarrativeApplyStoreRequest(
     string IdempotencyKey,
     NarrativeDecisionKind DeciderKind,
     string? DeciderId,
-    string? ImpactAnalysisId);
+    string? ImpactAnalysisId,
+    string? AuthorizationSnapshotJson = null);
 
 public sealed record NarrativeApplyStoreResult(
     string ChangeSetId,

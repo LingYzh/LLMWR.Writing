@@ -1,3 +1,5 @@
+using System.Text;
+using System.Text.Json;
 using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Security;
 
@@ -194,13 +196,43 @@ public static class OversightActivation
 
         if (IsPendingBind(record.EffectiveAfterCheckpointId))
         {
-            return HasMatchingSafeCheckpoint(record, context);
+            return BornAfterOverride(record, context) || HasMatchingSafeCheckpoint(record, context);
         }
 
         return context.ExecutionCheckpoints.Any(item =>
             StringComparer.Ordinal.Equals(item.CheckpointId, record.EffectiveAfterCheckpointId) &&
             CheckpointMatchesScope(record, item, context));
     }
+
+    private static bool BornAfterOverride(OversightOverrideRecord record, OversightActivationContext context)
+    {
+        if (record.ScopeKind == OversightScopeKind.Task)
+        {
+            return StringComparer.Ordinal.Equals(record.ScopeId, context.TaskId) &&
+                   context.TaskCreatedAtMs is { } taskCreated &&
+                   taskCreated > record.CreatedAtMs;
+        }
+
+        if (!ScopeMatches(record, context))
+        {
+            return false;
+        }
+
+        if (context.TaskCreatedAtMs is { } createdTask && createdTask > record.CreatedAtMs)
+        {
+            return true;
+        }
+
+        return context.RunCreatedAtMs is { } createdRun && createdRun > record.CreatedAtMs;
+    }
+
+    private static bool ScopeMatches(OversightOverrideRecord record, OversightActivationContext context) =>
+        record.ScopeKind switch
+        {
+            OversightScopeKind.Storyline => StringComparer.Ordinal.Equals(record.ScopeId, context.StorylineId),
+            OversightScopeKind.Project => StringComparer.Ordinal.Equals(record.ScopeId, context.ProjectId),
+            _ => false
+        };
 
     private static bool HasMatchingSafeCheckpoint(OversightOverrideRecord record, OversightActivationContext context)
     {
@@ -247,7 +279,9 @@ public sealed record OversightActivationContext(
     string? StorylineId,
     string? TaskId,
     string? RunId,
-    IReadOnlyList<DurableCheckpointRecord> ExecutionCheckpoints);
+    IReadOnlyList<DurableCheckpointRecord> ExecutionCheckpoints,
+    long? RunCreatedAtMs = null,
+    long? TaskCreatedAtMs = null);
 
 public static class OversightResolver
 {
@@ -423,6 +457,138 @@ public static class DelegatedDecisionEquality
                left.AuthorityKind == right.AuthorityKind &&
                StringComparer.Ordinal.Equals(left.DecidedBy, right.DecidedBy) &&
                StringComparer.Ordinal.Equals(left.OversightMode, right.OversightMode);
+    }
+}
+
+public sealed class DelegatedDecisionConflictException : InvalidOperationException
+{
+    public DelegatedDecisionConflictException(string decisionId)
+        : base("delegated-decision-conflict:" + decisionId)
+    {
+        DecisionId = decisionId;
+    }
+
+    public string DecisionId { get; }
+}
+
+public enum DelegatedProvenanceWriteResult
+{
+    Written,
+    Equivalent,
+    Conflict,
+    Unavailable
+}
+
+public sealed record FormalAuthorizationSnapshot(
+    string DecisionId,
+    string? TransactionId,
+    DecisionAuthorityKind AuthorityKind,
+    OversightScopeKind WinningScope,
+    string WinningScopeId,
+    NarrativeDecisionAuthority NarrativeAuthority,
+    RuntimePermissionMode RuntimePermission,
+    string DecidedBy,
+    long DecidedAtMs)
+{
+    public const string EventType = "wp13.delegated_authorization";
+
+    public static FormalAuthorizationSnapshot Capture(
+        string decisionId,
+        string? transactionId,
+        EffectiveOversightPolicy policy,
+        string decidedBy,
+        long decidedAtMs) =>
+        new(
+            decisionId,
+            transactionId,
+            policy.AuthorityKind,
+            policy.WinningScope,
+            policy.WinningScopeId ?? decisionId,
+            policy.NarrativeAuthority,
+            policy.RuntimePermission,
+            decidedBy,
+            decidedAtMs);
+
+    public DelegatedDecisionRecord ToDelegatedDecision() =>
+        NarrativeDecisionProvenance.AgentDelegated(
+            DecisionId,
+            TransactionId,
+            WinningScope,
+            WinningScopeId,
+            DecidedBy,
+            new EffectiveOversightPolicy(
+                NarrativeAuthority,
+                RuntimePermission,
+                WinningScope,
+                WinningScopeId,
+                null,
+                null,
+                true),
+            null,
+            DecidedAtMs);
+
+    public string WriteCanonical()
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { SkipValidation = false }))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("decisionId", DecisionId);
+            if (!string.IsNullOrWhiteSpace(TransactionId))
+            {
+                writer.WriteString("transactionId", TransactionId);
+            }
+
+            writer.WriteString("authorityKind", NarrativeDecisionProvenance.AuthorityKindDurable(AuthorityKind));
+            writer.WriteString("winningScope", OversightScopeKindCodec.ToDurableValue(WinningScope));
+            writer.WriteString("winningScopeId", WinningScopeId);
+            writer.WriteString("narrativeAuthority", NarrativeDecisionAuthorityCodec.ToDurableValue(NarrativeAuthority));
+            writer.WriteString("runtimePermission", RuntimePermissionModeDurableCodec.ToDurableValue(RuntimePermission));
+            writer.WriteString("decidedBy", DecidedBy);
+            writer.WriteNumber("decidedAtMs", DecidedAtMs);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    public static FormalAuthorizationSnapshot? TryParse(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object ||
+                !OversightScopeKindCodec.TryParse(root.GetProperty("winningScope").GetString(), out var scope) ||
+                !NarrativeDecisionAuthorityCodec.TryParse(root.GetProperty("narrativeAuthority").GetString(), out var narrative) ||
+                !RuntimePermissionModeDurableCodec.TryParse(root.GetProperty("runtimePermission").GetString(), out var permission))
+            {
+                return null;
+            }
+
+            var authority = StringComparer.Ordinal.Equals(root.GetProperty("authorityKind").GetString(), "AGENT_DELEGATED")
+                ? DecisionAuthorityKind.AgentDelegated
+                : DecisionAuthorityKind.AuthorConfirmed;
+            return new FormalAuthorizationSnapshot(
+                root.GetProperty("decisionId").GetString() ?? "",
+                root.TryGetProperty("transactionId", out var tx) ? tx.GetString() : null,
+                authority,
+                scope,
+                root.GetProperty("winningScopeId").GetString() ?? "",
+                narrative,
+                permission,
+                root.GetProperty("decidedBy").GetString() ?? "",
+                root.TryGetProperty("decidedAtMs", out var at) ? at.GetInt64() : 0);
+        }
+        catch (Exception exception) when (exception is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
+        {
+            return null;
+        }
     }
 }
 

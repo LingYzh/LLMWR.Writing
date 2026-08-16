@@ -236,14 +236,16 @@ Agent cannot set `AGENT_DELEGATED` on itself. Built-in Specialist mutation is re
 
 `background_tasks.kind` stores versioned canonical JSON `BackgroundExecutionKindV1` (kind + execution identity). Application Oversight defaults and User Library Specialists are not stored as the global Source of Truth inside a single `project.db`.
 
-Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL is immediately active when no matching execution is in-flight. During in-flight execution, Core stores a documented pending-bind token `pending:{overrideId}` (not a Checkpoint v1 id). Activation is execution-scoped: a Task override becomes active only after that Task's own safe checkpoint; Storyline/Project pending tokens activate per Run that has crossed a safe checkpoint after the override was created. An unrelated Task A checkpoint must not activate a Task B override. `setOversightOverride.effectiveAfterCheckpointId` is non-authoritative wire compatibility; Core ignores caller-selected existing checkpoint ids and chooses the activation boundary.
+Forward-only Oversight: `oversight_overrides.effective_after_checkpoint_id` NULL is immediately active when no matching execution is in-flight. During in-flight execution, Core stores a documented pending-bind token `pending:{overrideId}` (not a Checkpoint v1 id). Activation is execution-scoped: a Task override becomes active only after that Task's own safe checkpoint; Storyline/Project pending tokens activate per in-flight Run that has crossed a safe checkpoint after the override was created. A Run or Task created after the policy change starts under the new policy immediately and must not inherit the pinned old policy until its first checkpoint. An unrelated Task A checkpoint must not activate a Task B override. `setOversightOverride.effectiveAfterCheckpointId` is non-authoritative wire compatibility; Core ignores caller-selected existing checkpoint ids and chooses the activation boundary.
+
+REQUIRED Result dependencies are CURRENT only when the producer Task is formally COMPLETED and the referenced Result is that completion's frozen Result with acceptable freshness. A provisional Result from a Running producer does not satisfy REQUIRED. `getTaskHandoff.edges` includes every dependency edge, including missing Results (`resultArtifactId` omitted/null) with kind, Core-derived status, freshness, and block/warning flags.
 
 | semanticType | Request | Response |
 |---|---|---|
 | `requestTaskCompletion` | `taskId` + session | `outcome` pass/fail/semantic-review + failures |
 | `submitResultArtifact` | task + canonical JSON columns + session | `resultArtifactId` |
 | `getResultArtifact` | `taskId` | canonical Result Artifact columns |
-| `getTaskHandoff` | consumer task | Result refs, optional evidence, per-edge kind/status/freshness/block/warning; transcript omitted by default |
+| `getTaskHandoff` | consumer task | Result refs, optional evidence, **all** dependency edges (including missing Results) with kind/status/freshness/block/warning; transcript omitted by default |
 | `createResultDependency` | consumer/producer/`required`\|`advisory`\|`optional` | dependency id + Core-derived status |
 | `updateResultDependency` | orchestrator `dependencyId` + `dependencyKind` | effective kind + Core-recomputed status (caller status is not trusted) |
 | `proposeResultDependencyChange` | proposed kind + reason | recorded; effective kind unchanged unless orchestrator applies |

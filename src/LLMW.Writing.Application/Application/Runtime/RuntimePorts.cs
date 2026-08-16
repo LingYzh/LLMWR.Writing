@@ -147,6 +147,8 @@ public interface IRuntimePersistence
 
     DurableResultArtifactRecord InsertResultArtifact(DurableResultArtifactRecord artifact);
 
+    void ReplaceResultArtifact(DurableResultArtifactRecord artifact);
+
     DurableResultArtifactRecord? GetLatestResultArtifact(string taskId);
 
     DurableResultArtifactRecord? GetResultArtifact(string resultArtifactId);

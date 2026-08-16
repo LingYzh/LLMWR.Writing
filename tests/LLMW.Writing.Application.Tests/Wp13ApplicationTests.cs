@@ -65,8 +65,21 @@ internal static class Wp13ApplicationTests
         SpecialistUpdateIdentityMustMatch();
         SecretMaterialInFreshnessRejectsArtifact();
         IpcRunACannotSubmitResultForTaskB();
-        Console.WriteLine("Application WP13 tests passed (44).");
-        return 44;
+        RequiredDependencyIgnoresProvisionalProducerResult();
+        ConsumerStalesWhenProducerFinalResultChanges();
+        SameRunEvidenceIsNotOwnedWithoutReference();
+        NewRunAfterPolicyChangeUsesNewPolicy();
+        PendingReevaluationHandlesAllOutcomes();
+        GrillResumeAnchorsToExactCheckpoint();
+        GrillResumeIgnoresLaterUnrelatedCheckpoint();
+        GrillUnknownRemainsBlockedAndUnchangedContinues();
+        ToolCallStopUnavailableLeavesRunning();
+        ToolCallStopConfirmedCancelsExactCallOnly();
+        HistoricalDelegatedProvenanceSurvivesOversightChange();
+        DelegatedProvenanceConflictIsVisible();
+        MissingDependencyEdgesAreEmitted();
+        Console.WriteLine("Application WP13 tests passed (58).");
+        return 58;
     }
 
     private static void DeterministicCompletionPassesAndIsIdempotent()
@@ -358,6 +371,7 @@ internal static class Wp13ApplicationTests
         Success(harness.Scheduler.CreateTask("run-packet", "child", 1, "producer-p", "child-p"));
         var result = ResultArtifactCanonicalJson.ToDurable(Artifact("producer-p", ResultArtifactStatus.Complete));
         harness.Store.InsertResultArtifact(result);
+        harness.Store.UpdateTaskStatus("producer-p", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Completed), 2_000);
         Success(harness.Wp13.CreateResultDependency("child-p", "producer-p", "required"));
         var packet = Success(harness.Wp13.BuildIsolatedTaskPacket("run-packet", "child-p", "builtin.reviewer", "temp"));
         AssertEqual(SpecialistContextMode.Isolated, packet.ContextMode, "Default context must be isolated.");
@@ -1035,7 +1049,7 @@ internal static class Wp13ApplicationTests
 
     private static void ToolCallStopDoesNotCancelOwnerRun()
     {
-        var harness = Harness();
+        var harness = Harness(toolCancel: new ConfirmingToolCallCancellationPort(_ => true));
         SeedDispatchedTask(harness, "owner-tool", "owner-tool-t");
         harness.Store.InsertToolCall(new DurableToolCallRecord(
             "tool-stop",
@@ -1177,14 +1191,467 @@ internal static class Wp13ApplicationTests
             "Envelope Run A plus payload Task B must be denied at IPC.");
     }
 
-    private static HarnessState Harness(ISemanticCompletionEvaluator? semantic = null)
+    private static void RequiredDependencyIgnoresProvisionalProducerResult()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-prov-r1", "writer");
+        SeedDispatchedTask(harness, "run-prov-r1", "prod-r1");
+        Success(harness.Scheduler.CreateTask("run-prov-r1", "consume", 1, null, "cons-r1"));
+        SubmitComplete(harness, agent, "prod-r1");
+        var created = Success(harness.Wp13.CreateResultDependency("cons-r1", "prod-r1", "required"));
+        AssertEqual("missing", created.Status, "REQUIRED must not be CURRENT on a Running producer Result.");
+        AssertEqual("blocked", harness.Store.GetTask("cons-r1")?.Status, "Provisional REQUIRED must block dispatch.");
+        Success(harness.Wp13.RequestTaskCompletion("prod-r1", agent));
+        Success(harness.Wp13.RefreshResultDependencyStatus("prod-r1", "cons-r1"));
+        AssertEqual("current", harness.Store.GetDependency(created.DependencyId)?.Status,
+            "REQUIRED becomes CURRENT only after formal completion.");
+    }
+
+    private static void ConsumerStalesWhenProducerFinalResultChanges()
+    {
+        var clock = new MutableClock(1_000);
+        var harness = Harness(clock: clock);
+        var agent = Agent(harness, "run-r1r2", "writer");
+        SeedDispatchedTask(harness, "run-r1r2", "prod-final");
+        SeedDispatchedTask(harness, "run-r1r2", "cons-final");
+        SubmitComplete(harness, agent, "prod-final");
+        var r1 = harness.Store.GetLatestResultArtifact("prod-final")!.ResultArtifactId;
+        Success(harness.Wp13.CreateResultDependency("cons-final", "prod-final", "required"));
+        var againstR1 = Artifact("cons-final", ResultArtifactStatus.Complete) with
+        {
+            Freshness = new ResultFreshnessV1(
+                1,
+                ResultFreshnessState.Current,
+                new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, [r1]),
+                new ResultProvenanceV1(null, "cons-final", null, null, null, null, null, null))
+        };
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "cons-final",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", againstR1),
+                ResultArtifactCanonicalJson.WriteColumn("findings", againstR1),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", againstR1),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", againstR1),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", againstR1),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", againstR1),
+                null),
+            agent));
+        clock.UnixMs = 2_000;
+        var r2 = Artifact("prod-final", ResultArtifactStatus.Complete);
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "prod-final",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", r2),
+                ResultArtifactCanonicalJson.WriteColumn("findings", r2),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", r2),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", r2),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", r2),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", r2),
+                null),
+            agent));
+        Success(harness.Wp13.RequestTaskCompletion("prod-final", agent));
+        var consumer = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("cons-final")!);
+        AssertTrue(consumer.Freshness.State != ResultFreshnessState.Current,
+            "Consumer Result citing R1 must not remain CURRENT after producer freezes R2.");
+        AssertEqual(RuntimeError.CompletionFailed,
+            harness.Wp13.RequestTaskCompletion("cons-final", agent).Failure?.Code,
+            "Consumer must not formally complete against a stale required upstream.");
+    }
+
+    private static void SameRunEvidenceIsNotOwnedWithoutReference()
+    {
+        var harness = Harness();
+        var agent = Agent(harness, "run-ev-own", "writer");
+        SeedDispatchedTask(harness, "run-ev-own", "task-ev-a");
+        SeedDispatchedTask(harness, "run-ev-own", "task-ev-b");
+        harness.Store.InsertEvidence(new EvidenceRecord(
+            "ev-b-only",
+            "run-ev-own",
+            "task-ev-b",
+            "narrative",
+            "obj-b",
+            "digest-b",
+            "{}",
+            false,
+            1_000));
+        var claimed = Artifact("task-ev-a", ResultArtifactStatus.Complete) with { EvidenceIds = ["ev-b-only"] };
+        Success(harness.Wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "task-ev-a",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", claimed),
+                ResultArtifactCanonicalJson.WriteColumn("findings", claimed),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", claimed),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", claimed),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", claimed),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", claimed),
+                null),
+            agent));
+        var stored = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact("task-ev-a")!);
+        AssertEqual(ResultFreshnessState.NeedsRevalidation, stored.Freshness.State,
+            "Same-Run evidence from another Task must not be implicitly CURRENT.");
+    }
+
+    private static void NewRunAfterPolicyChangeUsesNewPolicy()
+    {
+        var clock = new MutableClock(1_000);
+        var harness = Harness(clock: clock);
+        var user = User();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), user));
+        SeedRunningTask(harness, "run-old-auto", "task-old-auto");
+        harness.Store.UpdateTaskStatus("task-old-auto", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 1_000);
+        clock.UnixMs = 2_000;
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "author_confirmed_required", "ask", null), user));
+        var runA = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-old-auto"));
+        AssertEqual("agent_delegated", runA.NarrativeAuthority, "In-flight Run A must keep AUTO until its safe checkpoint.");
+        clock.UnixMs = 3_000;
+        SeedRunningTask(harness, "run-new-manual", "task-new-manual");
+        var runB = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-new-manual"));
+        AssertEqual("author_confirmed_required", runB.NarrativeAuthority, "Run B created after AUTO→MANUAL must start MANUAL.");
+        Success(harness.Scheduler.PersistCheckpoint(
+            "run-old-auto",
+            "task-old-auto",
+            1,
+            CanonicalJson.WriteCheckpoint(CheckpointV1.Create(
+                "safe",
+                "d",
+                "{}",
+                "{}",
+                "task",
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                null,
+                null,
+                null,
+                null)),
+            "{}"));
+        var runAAfter = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-old-auto"));
+        AssertEqual("author_confirmed_required", runAAfter.NarrativeAuthority, "Run A must switch to MANUAL after its safe checkpoint.");
+        clock.UnixMs = 4_000;
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), user));
+        clock.UnixMs = 4_001;
+        SeedRunningTask(harness, "run-new-auto", "task-new-auto");
+        var inverse = Success(harness.Wp13.GetEffectiveOversight(ProjectId.ToString("D"), null, "task-new-auto"));
+        AssertEqual("agent_delegated", inverse.NarrativeAuthority, "Run created after MANUAL→AUTO must start AUTO.");
+    }
+
+    private static void PendingReevaluationHandlesAllOutcomes()
+    {
+        ApprovalSafetyFacts facts = new(false, false, false, false, false, false);
+        var harness = Harness(pending: new ProductionPendingApprovalSafetyEvaluator((_, _) => facts));
+        void SeedPending(string id) =>
+            harness.Store.InsertApproval(new DurableApprovalRecord(
+                id, "run-reeval-all", "task-reeval-all", ApprovalKindCodec.RuntimeGrill,
+                ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending), "digest", null, null, 1_000));
+
+        SeedPending("pending-no-trust");
+        facts = new ApprovalSafetyFacts(true, false, false, true, true, true);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual("denied", harness.Store.GetApproval("pending-no-trust")?.Status, "No Project Trust must not auto-approve.");
+
+        SeedPending("pending-delegated");
+        facts = new ApprovalSafetyFacts(true, true, false, true, true, true);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-reeval-all", "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual("resolved", harness.Store.GetApproval("pending-delegated")?.Status,
+            "Injected trust + capability + AUTO must approve delegated.");
+
+        SeedPending("pending-hard");
+        facts = new ApprovalSafetyFacts(true, true, true, true, true, true);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-reeval-all", "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual("denied", harness.Store.GetApproval("pending-hard")?.Status, "HardDeny must deny.");
+
+        SeedPending("pending-replan");
+        facts = new ApprovalSafetyFacts(true, true, false, false, false, true);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-reeval-all", "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual("denied", harness.Store.GetApproval("pending-replan")?.Status, "Invalid plan/gate must replan, not approve.");
+        AssertEqual("core:replan_required", harness.Store.GetApproval("pending-replan")?.DecidedBy, "ReplanRequired must be distinct.");
+
+        SeedPending("pending-stale");
+        facts = new ApprovalSafetyFacts(true, true, false, true, true, false);
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "task", "task-reeval-all", "agent_delegated", "auto_approve_scoped", null), User()));
+        AssertEqual("pending", harness.Store.GetApproval("pending-stale")?.Status, "Stale inputs must remain pending.");
+    }
+
+    private static void GrillResumeAnchorsToExactCheckpoint()
+    {
+        var harness = Harness();
+        var user = User();
+        SeedDispatchedTask(harness, "run-grill-cp", "task-grill-cp");
+        var producer = "prod-grill-cp";
+        SeedDispatchedTask(harness, "run-grill-cp", producer);
+        var agent = Agent(harness, "run-grill-cp", "writer");
+        SubmitComplete(harness, agent, producer);
+        Success(harness.Wp13.RequestTaskCompletion(producer, agent));
+        Success(harness.Wp13.CreateResultDependency("task-grill-cp", producer, "required"));
+        var paused = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-cp",
+            "task-grill-cp",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "grill-cp-base"));
+        var cp1 = harness.Store.CheckpointsForRun("run-grill-cp")
+            .Last(item => item.PayloadJson.Contains(paused.ApprovalId, StringComparison.Ordinal)).CheckpointId;
+        AssertTrue(!string.IsNullOrWhiteSpace(cp1), "Grill pause must persist an exact checkpoint.");
+        var r2 = Artifact(producer, ResultArtifactStatus.Complete);
+        harness.Store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(
+            ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact(producer)!) with
+            {
+                Freshness = ResultArtifactCanonicalJson.FromDurable(harness.Store.GetLatestResultArtifact(producer)!).Freshness with
+                {
+                    State = ResultFreshnessState.Stale
+                }
+            }));
+        Success(harness.Wp13.RefreshResultDependencyStatus(producer, "task-grill-cp"));
+        var changed = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null), user));
+        AssertTrue(!StringComparer.Ordinal.Equals(changed.ResumeDecision, "Continue"),
+            "Required input change at CP1 must not Continue.");
+    }
+
+    private static void GrillResumeIgnoresLaterUnrelatedCheckpoint()
+    {
+        var harness = Harness();
+        var user = User();
+        SeedDispatchedTask(harness, "run-grill-cp2", "task-grill-cp2");
+        SeedDispatchedTask(harness, "run-grill-cp2", "prod-grill-cp2");
+        var agent = Agent(harness, "run-grill-cp2", "writer");
+        SubmitComplete(harness, agent, "prod-grill-cp2");
+        Success(harness.Wp13.RequestTaskCompletion("prod-grill-cp2", agent));
+        Success(harness.Wp13.CreateResultDependency("task-grill-cp2", "prod-grill-cp2", "required"));
+        var first = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-cp2",
+            "task-grill-cp2",
+            RuntimeGrillPauseReason.PlanAuthorityAmbiguous,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "grill-cp2-base"));
+        var grillCheckpoint = harness.Store.CheckpointsForRun("run-grill-cp2")
+            .Last(item => item.PayloadJson.Contains(first.ApprovalId, StringComparison.Ordinal)).CheckpointId;
+        Success(harness.Scheduler.CreateTask("run-grill-cp2", "write", 1, null, "task-unrelated-cp"));
+        Success(harness.Scheduler.PersistCheckpoint(
+            "run-grill-cp2",
+            "task-unrelated-cp",
+            1,
+            CanonicalJson.WriteCheckpoint(CheckpointV1.Create(
+                "later",
+                "other",
+                "{}",
+                "{}",
+                "task",
+                [],
+                [],
+                [],
+                [],
+                [],
+                [],
+                null, null, null, null)),
+            "{}"));
+        AssertEqual("pending", harness.Store.GetApproval(first.ApprovalId)?.Status,
+            "An unrelated later checkpoint must not resolve the grill approval.");
+        var resolved = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(first.ApprovalId, "continue", "continue", null), user));
+        AssertEqual("Continue", resolved.ResumeDecision,
+            "Resolution must stay anchored to the grill checkpoint, not an unrelated later CP.");
+        AssertTrue(harness.Store.CheckpointsForRun("run-grill-cp2").Any(item =>
+                !StringComparer.Ordinal.Equals(item.CheckpointId, grillCheckpoint)),
+            "A later unrelated checkpoint must exist without becoming the resume anchor.");
+    }
+
+    private static void GrillUnknownRemainsBlockedAndUnchangedContinues()
+    {
+        var harness = Harness();
+        var user = User();
+        SeedDispatchedTask(harness, "run-grill-unk", "task-grill-unk");
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-unk", "run-grill-unk", "task-grill-unk", "Shell.Execute", "running", "unknown"));
+        var unk = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-unk",
+            "task-grill-unk",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "unk-base"));
+        var blocked = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(unk.ApprovalId, "continue", "continue", null), user));
+        AssertEqual("BlockUnknown", blocked.ResumeDecision, "UNKNOWN must remain BlockUnknown.");
+
+        SeedDispatchedTask(harness, "run-grill-cont", "task-grill-cont");
+        var unchanged = Success(harness.Wp13.PauseRuntimeGrill(
+            "run-grill-cont",
+            "task-grill-cont",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "cont-base"));
+        var continued = Success(harness.Wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(unchanged.ApprovalId, "continue", "continue", null), user));
+        AssertEqual("Continue", continued.ResumeDecision, "Unchanged verified inputs must Continue.");
+    }
+
+    private static void ToolCallStopUnavailableLeavesRunning()
+    {
+        var harness = Harness();
+        SeedRunningTask(harness, "owner-tool-unavail", "owner-tool-unavail-t");
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-unavail", "owner-tool-unavail", "owner-tool-unavail-t", "Shell.Execute", "running", "none"));
+        harness.Store.InsertBackgroundTask(new DurableBackgroundTaskRecord(
+            "bg-tool-unavail",
+            "owner-tool-unavail",
+            "owner-tool-unavail-t",
+            BackgroundExecutionRefCodec.WriteKindColumn(new BackgroundExecutionRef(
+                BackgroundTaskKind.ToolCall, "owner-tool-unavail", "tool-unavail", null, "owner-tool-unavail-t")),
+            "running",
+            null,
+            1_000,
+            null));
+        AssertEqual(RuntimeError.BackgroundStopUnavailable,
+            harness.Wp13.StopBackgroundTask("bg-tool-unavail").Failure?.Code,
+            "Unavailable cancellation must fail closed.");
+        AssertEqual("running", harness.Store.GetToolCall("tool-unavail")?.Status, "ToolCall must remain running.");
+        AssertEqual("running", harness.Store.GetBackgroundTask("bg-tool-unavail")?.Status, "Background Task must remain running.");
+        AssertTrue(!StringComparer.Ordinal.Equals(harness.Store.GetRun("owner-tool-unavail")?.Status, "cancelled"),
+            "Unavailable ToolCall stop must not cancel the owner Run.");
+    }
+
+    private static void ToolCallStopConfirmedCancelsExactCallOnly()
+    {
+        var harness = Harness(toolCancel: new ConfirmingToolCallCancellationPort(id =>
+            StringComparer.Ordinal.Equals(id, "tool-exact")));
+        SeedRunningTask(harness, "owner-tool-exact", "owner-tool-exact-t");
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-exact", "owner-tool-exact", "owner-tool-exact-t", "Shell.Execute", "running", "none"));
+        harness.Store.InsertToolCall(new DurableToolCallRecord(
+            "tool-other", "owner-tool-exact", "owner-tool-exact-t", "Shell.Execute", "running", "none"));
+        harness.Store.InsertBackgroundTask(new DurableBackgroundTaskRecord(
+            "bg-tool-exact",
+            "owner-tool-exact",
+            "owner-tool-exact-t",
+            BackgroundExecutionRefCodec.WriteKindColumn(new BackgroundExecutionRef(
+                BackgroundTaskKind.ToolCall, "owner-tool-exact", "tool-exact", null, "owner-tool-exact-t")),
+            "running",
+            null,
+            1_000,
+            null));
+        Success(harness.Wp13.StopBackgroundTask("bg-tool-exact"));
+        AssertEqual("cancelled", harness.Store.GetToolCall("tool-exact")?.Status, "Confirmed cancel must update the exact ToolCall.");
+        AssertEqual("running", harness.Store.GetToolCall("tool-other")?.Status, "Another ToolCall in the same Run must survive.");
+        AssertTrue(!StringComparer.Ordinal.Equals(harness.Store.GetRun("owner-tool-exact")?.Status, "cancelled"),
+            "Exact ToolCall stop must not cancel the owner Run.");
+    }
+
+    private static void HistoricalDelegatedProvenanceSurvivesOversightChange()
+    {
+        var harness = Harness();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), User()));
+        var agent = Agent(harness, "run-hist", "pm");
+        var store = new RecordingNarrativeStore();
+        var sink = new OneShotThrowingDelegatedSink(harness.Wp13);
+        var service = new NarrativeChangeService(
+            new UnusedBlobStore(),
+            store,
+            new UnusedSemanticAssessor(),
+            new UnusedImpactAnalyzer(),
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            harness.Auth,
+            harness.Wp13,
+            sink);
+        var first = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-hist",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(first.Succeeded, "COMMIT must succeed even if provenance insert fails.");
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "author_confirmed_required", "ask", null), User()));
+        var retry = service.Apply(new ApplyNarrativeChangeSetCommand(
+            RecordingNarrativeStore.ChangeSetId,
+            "idem-hist",
+            NarrativeDecisionKind.AgentDelegated,
+            "forged-user",
+            Principal: agent));
+        AssertTrue(retry.Succeeded, "Recovery must not require current AGENT_DELEGATED.");
+        AssertEqual(1, harness.Store.ListDelegatedDecisions().Count, "Exactly one provenance row must be repaired.");
+        var row = harness.Store.ListDelegatedDecisions().Single();
+        AssertEqual(OversightScopeKind.Project, row.ScopeKind, "Historical provenance must keep the original winning scope.");
+        AssertEqual(ProjectId.ToString("D"), row.ScopeId, "Historical provenance must keep the original winning scope id.");
+        AssertTrue(row.OversightMode.Contains("agent_delegated", StringComparison.Ordinal),
+            "Current MANUAL policy must not rewrite historical axes.");
+    }
+
+    private static void DelegatedProvenanceConflictIsVisible()
+    {
+        var harness = Harness();
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", ProjectId.ToString("D"), "agent_delegated", "auto_approve_scoped", null), User()));
+        var policy = harness.Wp13.Resolve(ProjectId.ToString("D"), null, null);
+        var first = NarrativeDecisionProvenance.AgentDelegated(
+            "decision-conflict",
+            "tx-1",
+            policy.WinningScope,
+            policy.WinningScopeId ?? ProjectId.ToString("D"),
+            "agent-a",
+            policy,
+            null,
+            1);
+        AssertEqual(DelegatedProvenanceWriteResult.Written, harness.Wp13.Record(first), "First provenance write must succeed.");
+        var conflict = first with { DecidedBy = "other-agent" };
+        AssertEqual(DelegatedProvenanceWriteResult.Conflict, harness.Wp13.Record(conflict),
+            "Conflicting audit data for the same decision id must be visible.");
+        AssertEqual(DelegatedProvenanceWriteResult.Equivalent, harness.Wp13.Record(first),
+            "Equivalent duplicate must succeed.");
+    }
+
+    private static void MissingDependencyEdgesAreEmitted()
+    {
+        var harness = Harness();
+        SeedRunningTask(harness, "run-edge", "prod-missing");
+        Success(harness.Scheduler.CreateTask("run-edge", "consume", 1, null, "cons-missing"));
+        Success(harness.Wp13.CreateResultDependency("cons-missing", "prod-missing", "required"));
+        Success(harness.Scheduler.CreateTask("run-edge", "consume", 1, null, "cons-adv"));
+        Success(harness.Wp13.CreateResultDependency("cons-adv", "prod-missing", "advisory"));
+        Success(harness.Scheduler.CreateTask("run-edge", "consume", 1, null, "cons-opt"));
+        Success(harness.Wp13.CreateResultDependency("cons-opt", "prod-missing", "optional"));
+        var required = Success(harness.Wp13.GetTaskHandoff("cons-missing", false)).Edges.Single();
+        AssertTrue(string.IsNullOrWhiteSpace(required.ResultArtifactId), "Missing ResultArtifactId must be null.");
+        AssertEqual("required", required.DependencyKind, "Kind must be present for a missing edge.");
+        AssertEqual("missing", required.DependencyStatus, "Status must be present for a missing edge.");
+        AssertEqual(true, required.BlocksDispatch, "Blocked REQUIRED must be visible.");
+        AssertEqual("missing", required.FreshnessState, "Missing freshness must be visible.");
+        var advisory = Success(harness.Wp13.GetTaskHandoff("cons-adv", false)).Edges.Single();
+        AssertEqual("advisory", advisory.DependencyKind, "ADVISORY missing edges must be emitted.");
+        AssertTrue(string.IsNullOrWhiteSpace(advisory.ResultArtifactId), "ADVISORY missing Result must be null.");
+        var optional = Success(harness.Wp13.GetTaskHandoff("cons-opt", false)).Edges.Single();
+        AssertEqual("optional", optional.DependencyKind, "OPTIONAL missing edges must be emitted.");
+        AssertTrue(string.IsNullOrWhiteSpace(optional.ResultArtifactId), "OPTIONAL missing Result must be null.");
+    }
+
+    private static HarnessState Harness(
+        ISemanticCompletionEvaluator? semantic = null,
+        IPendingApprovalSafetyEvaluator? pending = null,
+        IRuntimeGrillSafetyEvaluator? grill = null,
+        IToolCallCancellationPort? toolCancel = null,
+        ISecurityClock? clock = null)
     {
         var store = new MemoryRuntimeStore();
         var auth = new AllowAuth { Allow = true };
+        clock ??= new FixedClock(1_000);
         var scheduler = new RuntimeSchedulerService(
             store,
             new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
-            new FixedClock(1_000),
+            clock,
             new FakeRunWorkerSupervisor(),
             auth);
         Success(scheduler.CreateWorkflowRun("wf-temp"));
@@ -1207,12 +1674,15 @@ internal static class Wp13ApplicationTests
         var wp13 = new Wp13RuntimeService(
             store,
             scheduler,
-            new FixedClock(1_000),
+            clock,
             new MemoryApplicationOversightDefaults(),
             userStore,
             SyntheticBuiltInSpecialistCatalog.Instance,
             semantic,
-            new MutableSchedulerFaultInjector());
+            new MutableSchedulerFaultInjector(),
+            pending,
+            grill,
+            toolCancel);
         scheduler.OversightActivationListener = wp13;
         return new HarnessState(store, scheduler, wp13, auth, userStore);
     }
@@ -1349,6 +1819,13 @@ internal static class Wp13ApplicationTests
     private sealed class FixedClock(long unixMs) : ISecurityClock
     {
         public DateTimeOffset UtcNow { get; } = DateTimeOffset.FromUnixTimeMilliseconds(unixMs);
+    }
+
+    private sealed class MutableClock(long unixMs) : ISecurityClock
+    {
+        public long UnixMs { get; set; } = unixMs;
+
+        public DateTimeOffset UtcNow => DateTimeOffset.FromUnixTimeMilliseconds(UnixMs);
     }
 
     private sealed class AgentSessionStore(string runId, string role) : IRunSessionStore
@@ -1495,7 +1972,7 @@ internal static class Wp13ApplicationTests
         {
             _ = changeSet;
             _ = cancellationToken;
-            throw new InvalidOperationException("unused");
+            return new SemanticDependencyAssessment(SemanticDependencyFinding.NoEvidenceFound, "{}");
         }
     }
 
@@ -1519,14 +1996,18 @@ internal static class Wp13ApplicationTests
     {
         public DelegatedDecisionRecord? Last { get; private set; }
 
-        public void Record(DelegatedDecisionRecord record) => Last = record;
+        public DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record)
+        {
+            Last = record;
+            return DelegatedProvenanceWriteResult.Written;
+        }
     }
 
     private sealed class OneShotThrowingDelegatedSink(IDelegatedDecisionSink inner) : IDelegatedDecisionSink
     {
         private int calls;
 
-        public void Record(DelegatedDecisionRecord record)
+        public DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record)
         {
             calls++;
             if (calls == 1)
@@ -1534,7 +2015,7 @@ internal static class Wp13ApplicationTests
                 throw new InvalidOperationException("provenance-fault");
             }
 
-            inner.Record(record);
+            return inner.Record(record);
         }
     }
 
@@ -1543,9 +2024,11 @@ internal static class Wp13ApplicationTests
         public const string ChangeSetId = "018f3e78-1234-7abc-8def-0123456789c1";
         private const string ImpactId = "018f3e78-1234-7abc-8def-0123456789c2";
         private const string TransactionId = "018f3e78-1234-7abc-8def-0123456789c3";
-        private string status = "applied";
+        private string status = "working";
 
         public string? LastDeciderId { get; private set; }
+
+        public string? LastAuthorizationSnapshotJson { get; private set; }
 
         public void MarkApplied() => status = "applied";
 
@@ -1602,6 +2085,11 @@ internal static class Wp13ApplicationTests
         {
             _ = cancellationToken;
             LastDeciderId = request.DeciderId;
+            if (!string.IsNullOrWhiteSpace(request.AuthorizationSnapshotJson))
+            {
+                LastAuthorizationSnapshotJson = request.AuthorizationSnapshotJson;
+            }
+
             status = "applied";
             return NarrativeStoreResults.Success(new NarrativeApplyStoreResult(
                 request.ChangeSetId,
@@ -1609,6 +2097,12 @@ internal static class Wp13ApplicationTests
                 request.ImpactAnalysisId ?? ImpactId,
                 AuthorityTransactionState.Complete,
                 Existing: false));
+        }
+
+        public string? LoadAuthorizationSnapshot(string transactionId)
+        {
+            _ = transactionId;
+            return LastAuthorizationSnapshotJson;
         }
     }
 

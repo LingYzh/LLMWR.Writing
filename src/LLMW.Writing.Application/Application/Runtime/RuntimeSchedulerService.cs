@@ -349,7 +349,7 @@ public sealed class RuntimeSchedulerService
         return RuntimeResults.Success(id);
     }
 
-    public RuntimeResult<ResumeDecision> ClassifyResume(string runId, FreshnessInputs inputs)
+    public RuntimeResult<ResumeDecision> ClassifyResume(string runId, FreshnessInputs inputs, string? checkpointId = null)
     {
         var run = store.GetRun(runId);
         if (run is null)
@@ -359,10 +359,23 @@ public sealed class RuntimeSchedulerService
 
         var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(store.ToolCallsFor(runId, null), null);
         var checkpoints = store.CheckpointsForRun(runId);
-        var latest = checkpoints.Count == 0 ? null : checkpoints[0];
+        DurableCheckpointRecord? checkpoint;
+        if (!string.IsNullOrWhiteSpace(checkpointId))
+        {
+            checkpoint = checkpoints.FirstOrDefault(item => StringComparer.Ordinal.Equals(item.CheckpointId, checkpointId));
+            if (checkpoint is null)
+            {
+                return RuntimeResults.Success(new ResumeDecision(ResumeDecisionKind.RestartTask, "missing-grill-checkpoint", null));
+            }
+        }
+        else
+        {
+            checkpoint = checkpoints.Count == 0 ? null : checkpoints[0];
+        }
+
         try
         {
-            return RuntimeResults.Success(ResumeClassifier.Classify(run, latest, inputs with { UnknownSideEffect = unknown || inputs.UnknownSideEffect }));
+            return RuntimeResults.Success(ResumeClassifier.Classify(run, checkpoint, inputs with { UnknownSideEffect = unknown || inputs.UnknownSideEffect }));
         }
         catch (CheckpointSchemaException exception)
         {

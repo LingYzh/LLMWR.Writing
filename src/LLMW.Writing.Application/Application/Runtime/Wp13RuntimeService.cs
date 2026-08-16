@@ -1,3 +1,4 @@
+using System.Text.Json;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
@@ -18,6 +19,9 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     private readonly IBuiltInSpecialistCatalog builtIns;
     private readonly ISemanticCompletionEvaluator semanticEvaluator;
     private readonly ISchedulerFaultInjector faults;
+    private readonly IPendingApprovalSafetyEvaluator pendingSafety;
+    private readonly IRuntimeGrillSafetyEvaluator grillSafety;
+    private readonly IToolCallCancellationPort toolCancellation;
 
     public Wp13RuntimeService(
         IRuntimePersistence store,
@@ -27,7 +31,10 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         IUserSpecialistProfileStore? userSpecialists = null,
         IBuiltInSpecialistCatalog? builtIns = null,
         ISemanticCompletionEvaluator? semanticEvaluator = null,
-        ISchedulerFaultInjector? faults = null)
+        ISchedulerFaultInjector? faults = null,
+        IPendingApprovalSafetyEvaluator? pendingSafety = null,
+        IRuntimeGrillSafetyEvaluator? grillSafety = null,
+        IToolCallCancellationPort? toolCancellation = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
@@ -37,6 +44,21 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         this.builtIns = builtIns ?? SyntheticBuiltInSpecialistCatalog.Instance;
         this.semanticEvaluator = semanticEvaluator ?? UnavailableSemanticCompletionEvaluator.Instance;
         this.faults = faults ?? NoSchedulerFaultInjector.Instance;
+        this.pendingSafety = pendingSafety ?? new ProductionPendingApprovalSafetyEvaluator((approval, _) =>
+        {
+            var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(
+                store.ToolCallsFor(approval.RunId, approval.TaskId),
+                approval.TaskId);
+            return new ApprovalSafetyFacts(
+                scheduler.ProbeCapability(null, Capability.AuthorityAccept),
+                ProjectTrusted: false,
+                HardDenied: false,
+                GateValid: false,
+                PlanValid: false,
+                InputsFresh: !unknown);
+        });
+        this.grillSafety = grillSafety ?? FailClosedRuntimeGrillSafetyEvaluator.Instance;
+        this.toolCancellation = toolCancellation ?? UnavailableToolCallCancellationPort.Instance;
     }
 
     public EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId)
@@ -86,15 +108,24 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             BuildActivationContext(projectId, storylineId, taskId, runId));
     }
 
-    public void Record(DelegatedDecisionRecord record)
+    public DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record)
     {
         try
         {
+            var existing = store.GetDelegatedDecision(record.DelegatedDecisionId);
             store.InsertDelegatedDecision(record);
+            return existing is null
+                ? DelegatedProvenanceWriteResult.Written
+                : DelegatedProvenanceWriteResult.Equivalent;
+        }
+        catch (DelegatedDecisionConflictException)
+        {
+            return DelegatedProvenanceWriteResult.Conflict;
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             _ = exception;
+            return DelegatedProvenanceWriteResult.Unavailable;
         }
     }
 
@@ -244,6 +275,14 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 return;
             }
 
+            var restamped = StampFreshness(artifact, task, attempt, principal!);
+            if (restamped.Freshness.State != ResultFreshnessState.Current &&
+                store.DependenciesForConsumer(taskId).Any(item => ResultDependencyKindCodec.IsRequired(item.DependencyKind)))
+            {
+                failure = new RuntimeFailure(RuntimeError.CompletionFailed, "required-upstream-not-current");
+                return;
+            }
+
             var contract = TaskCompletionContractCanonicalJson.Parse(task.CompletionContractJson);
             var semantic = contract.HasSemanticCriteria
                 ? semanticEvaluator.Evaluate(contract, artifact)
@@ -350,16 +389,20 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                         evidenceIds.AddRange(ResultArtifactCanonicalJson.FromDurable(artifact).EvidenceIds);
                     }
                 }
-
-                edges.Add(new TaskHandoffEdgeDto(
-                    dependency.ResultArtifactId,
-                    dependency.DependencyKind,
-                    ResultDependencyStatusCodec.ToDurableValue(evaluation.EffectiveStatus),
-                    freshnessState,
-                    evaluation.BlocksDispatch,
-                    evaluation.BlocksCompletion,
-                    evaluation.HasWarning));
+                else
+                {
+                    freshnessState = "unknown";
+                }
             }
+
+            edges.Add(new TaskHandoffEdgeDto(
+                string.IsNullOrWhiteSpace(dependency.ResultArtifactId) ? null : dependency.ResultArtifactId,
+                dependency.DependencyKind,
+                ResultDependencyStatusCodec.ToDurableValue(evaluation.EffectiveStatus),
+                freshnessState,
+                evaluation.BlocksDispatch,
+                evaluation.BlocksCompletion,
+                evaluation.HasWarning));
         }
 
         return RuntimeResults.Success(new GetTaskHandoffResponse(
@@ -386,12 +429,19 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<CreateResultDependencyResponse>(RuntimeError.NotFound, "task");
         }
 
-        var producerResult = store.GetLatestResultArtifact(producerTaskId);
+        var producerResult = FrozenProducerResult(producerTaskId);
+        var producerCompleted = producerResult is not null;
+        var exposed = producerCompleted
+            ? producerResult
+            : ResultDependencyKindCodec.IsRequired(ResultDependencyKindCodec.ToDurableValue(parsedKind))
+                ? null
+                : store.GetLatestResultArtifact(producerTaskId);
         var status = ResultDependencyPolicy.Recompute(
             parsedKind,
-            producerResult?.ResultArtifactId,
-            producerResult is null ? null : ResultArtifactCanonicalJson.FromDurable(producerResult).Freshness.State,
-            producerResult is not null);
+            exposed?.ResultArtifactId,
+            exposed is null ? null : ResultArtifactCanonicalJson.FromDurable(exposed).Freshness.State,
+            exposed is not null,
+            producerCompleted);
         var id = Guid.NewGuid().ToString("D");
         store.InsertDependency(new DurableDependencyRecord(
             id,
@@ -399,7 +449,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             producerTaskId,
             ResultDependencyKindCodec.ToDurableValue(parsedKind),
             ResultDependencyStatusCodec.ToDurableValue(status),
-            producerResult?.ResultArtifactId));
+            exposed?.ResultArtifactId));
         RefreshConsumerReadiness(consumerTaskId);
         return RuntimeResults.Success(new CreateResultDependencyResponse(id, ResultDependencyStatusCodec.ToDurableValue(status)));
     }
@@ -623,7 +673,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             null,
             null,
             null));
-        var checkpoint = scheduler.PersistCheckpoint(runId, taskId, CheckpointV1.CurrentSchemaVersion, checkpointPayload, "{}");
+            var checkpoint = scheduler.PersistCheckpoint(runId, taskId, CheckpointV1.CurrentSchemaVersion, checkpointPayload, WriteInputDigestSet(runId, taskId));
         if (!checkpoint.Succeeded || checkpoint.Value is null)
         {
             return RuntimeResults.Fail<RuntimeGrillPauseOutcome>(
@@ -712,19 +762,27 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         }
 
         var oversight = ResolveForPrincipal(principal, persisted.TaskId);
-        var capability = scheduler.ProbeCapability(principal, Capability.AgentSpawn);
-        var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(
-            store.ToolCallsFor(persisted.RunId, persisted.TaskId),
-            persisted.TaskId);
-        var inputsFresh = !unknown;
+        var safety = grillSafety.Evaluate(persisted, principal, oversight);
+        if (grillSafety is FailClosedRuntimeGrillSafetyEvaluator)
+        {
+            var unknownSideEffect = UnknownSideEffectPolicy.BlocksAutomaticRetry(
+                store.ToolCallsFor(persisted.RunId, persisted.TaskId),
+                persisted.TaskId);
+            safety = safety with
+            {
+                CapabilityAllowed = scheduler.ProbeCapability(principal, Capability.AuthorityAccept),
+                InputsFresh = !unknownSideEffect && RequiredInputsFresh(persisted.TaskId)
+            };
+        }
+
         if (principal is { Kind: PrincipalKind.AgentRun } &&
             !RuntimeGrillPolicy.AgentMayResolve(
                 oversight,
                 persisted.Reason,
-                insideApprovedPlan: persisted.Reason is not RuntimeGrillPauseReason.TaskScopeExpansion,
-                taskScopeUnchanged: persisted.Reason is not RuntimeGrillPauseReason.TaskScopeExpansion,
-                capabilityAllowed: capability,
-                inputsFresh: inputsFresh))
+                insideApprovedPlan: safety.InsideApprovedPlan,
+                taskScopeUnchanged: safety.TaskScopeUnchanged,
+                capabilityAllowed: safety.CapabilityAllowed,
+                inputsFresh: safety.InputsFresh))
         {
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAuthorRequired, "author-required");
         }
@@ -746,15 +804,23 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.GrillAlreadyResolved, "stale_already_resolved");
         }
 
-        var checkpoint = store.CheckpointsForRun(persisted.RunId)
-            .OrderByDescending(item => item.CreatedAtMs)
-            .FirstOrDefault(item =>
-                StringComparer.Ordinal.Equals(item.CheckpointId, persisted.CheckpointId) ||
-                item.PayloadJson.Contains(persisted.ApprovalId, StringComparison.Ordinal));
+        var checkpoint = string.IsNullOrWhiteSpace(persisted.CheckpointId)
+            ? null
+            : store.CheckpointsForRun(persisted.RunId)
+                .FirstOrDefault(item => StringComparer.Ordinal.Equals(item.CheckpointId, persisted.CheckpointId));
+        if (checkpoint is null)
+        {
+            return RuntimeResults.Fail<RuntimeGrillResolveOutcome>(RuntimeError.CheckpointCorrupt, "grill-checkpoint-missing");
+        }
+
         var run = store.GetRun(persisted.RunId);
+        var unknown = UnknownSideEffectPolicy.BlocksAutomaticRetry(
+            store.ToolCallsFor(persisted.RunId, persisted.TaskId),
+            persisted.TaskId);
         var freshness = scheduler.ClassifyResume(
             persisted.RunId,
-            BuildResumeInputs(checkpoint, run, unknown, persisted.Reason));
+            BuildResumeInputs(checkpoint, run, unknown, persisted.TaskId),
+            checkpoint.CheckpointId);
         var mapped = freshness.Succeeded && freshness.Value is not null
             ? RuntimeGrillPolicy.MapResume(persisted.Reason, freshness.Value.Kind)
             : RuntimeGrillResolutionKind.PlanBlocked;
@@ -1306,14 +1372,61 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         {
             kind = ResultDependencyKind.Required;
         }
-        var artifact = store.GetLatestResultArtifact(dependency.ProducerTaskId);
-        var freshness = artifact is null ? (ResultFreshnessState?)null : ResultArtifactCanonicalJson.FromDurable(artifact).Freshness.State;
-        var status = ResultDependencyPolicy.Recompute(kind, artifact?.ResultArtifactId, freshness, artifact is not null);
+
+        var frozen = FrozenProducerResult(dependency.ProducerTaskId);
+        var producerCompleted = frozen is not null;
+        var exposed = producerCompleted
+            ? frozen
+            : kind == ResultDependencyKind.Required
+                ? null
+                : store.GetLatestResultArtifact(dependency.ProducerTaskId);
+        var freshness = exposed is null
+            ? (ResultFreshnessState?)null
+            : ResultArtifactCanonicalJson.FromDurable(exposed).Freshness.State;
+        var status = ResultDependencyPolicy.Recompute(
+            kind,
+            exposed?.ResultArtifactId,
+            freshness,
+            exposed is not null,
+            producerCompleted);
         store.UpdateDependencyRecord(
             dependency.DependencyId,
             dependency.DependencyKind,
             ResultDependencyStatusCodec.ToDurableValue(status),
-            artifact?.ResultArtifactId);
+            exposed?.ResultArtifactId);
+        RestampConsumerResults(dependency.ConsumerTaskId);
+    }
+
+    private DurableResultArtifactRecord? FrozenProducerResult(string producerTaskId)
+    {
+        var task = store.GetTask(producerTaskId);
+        if (task is null ||
+            !TaskStatusCodec.TryParse(task.Status, out var status) ||
+            status != RuntimeTaskStatus.Completed)
+        {
+            return null;
+        }
+
+        return store.GetLatestResultArtifact(producerTaskId);
+    }
+
+    private void RestampConsumerResults(string consumerTaskId)
+    {
+        var task = store.GetTask(consumerTaskId);
+        var artifact = store.GetLatestResultArtifact(consumerTaskId);
+        if (task is null || artifact is null)
+        {
+            return;
+        }
+
+        var parsed = ResultArtifactCanonicalJson.FromDurable(artifact);
+        var restamped = StampFreshness(parsed, task, store.FindActiveAttempt(consumerTaskId), null);
+        if (restamped.Freshness.State == parsed.Freshness.State)
+        {
+            return;
+        }
+
+        store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(restamped));
     }
 
     private void RefreshConsumerReadiness(string consumerTaskId)
@@ -1429,14 +1542,16 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             workflow?.StorylineId ?? storylineId,
             task?.TaskId ?? taskId,
             run?.RunId ?? runId,
-            checkpoints);
+            checkpoints,
+            run?.CreatedAtMs,
+            task?.CreatedAtMs);
     }
 
     private TaskResultArtifactV1 StampFreshness(
         TaskResultArtifactV1 artifact,
         DurableTaskRecord task,
         DurableAttemptRecord? attempt,
-        CallerPrincipal principal)
+        CallerPrincipal? principal)
     {
         var evidence = new Dictionary<string, EvidenceRecord>(StringComparer.Ordinal);
         foreach (var id in artifact.EvidenceIds)
@@ -1448,9 +1563,38 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             }
         }
 
+        var required = store.DependenciesForConsumer(task.TaskId)
+            .Where(item => ResultDependencyKindCodec.IsRequired(item.DependencyKind))
+            .ToArray();
+        var frozenIds = new List<string>();
+        var allowedEvidence = new HashSet<string>(StringComparer.Ordinal);
         var upstream = new Dictionary<string, DurableResultArtifactRecord>(StringComparer.Ordinal);
+        foreach (var dependency in required)
+        {
+            var frozen = FrozenProducerResult(dependency.ProducerTaskId);
+            if (frozen is not null)
+            {
+                frozenIds.Add(frozen.ResultArtifactId);
+                upstream[frozen.ResultArtifactId] = frozen;
+                foreach (var evidenceId in ResultArtifactCanonicalJson.FromDurable(frozen).EvidenceIds)
+                {
+                    allowedEvidence.Add(evidenceId);
+                    var row = store.GetEvidence(evidenceId);
+                    if (row is not null)
+                    {
+                        evidence[evidenceId] = row;
+                    }
+                }
+            }
+        }
+
         foreach (var reference in artifact.Freshness.ProducedAgainst.UpstreamRequiredResultRefs)
         {
+            if (upstream.ContainsKey(reference))
+            {
+                continue;
+            }
+
             var row = store.GetResultArtifact(reference) ??
                       store.GetLatestResultArtifact(reference);
             if (row is not null)
@@ -1462,13 +1606,16 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         var stamped = ResultFreshnessAuthority.Stamp(
             artifact.Freshness,
             new ResultFreshnessAuthorityInputs(
-                principal.RunId ?? task.RunId,
+                principal?.RunId ?? task.RunId,
                 task.TaskId,
                 attempt?.AttemptId,
                 upstream,
                 evidence,
                 null,
-                new HashSet<string>(StringComparer.Ordinal)),
+                new HashSet<string>(StringComparer.Ordinal),
+                frozenIds,
+                required.Length,
+                allowedEvidence),
             artifact.EvidenceIds);
         return artifact with { Freshness = stamped };
     }
@@ -1494,16 +1641,24 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         return null;
     }
 
-    private static FreshnessInputs BuildResumeInputs(
-        DurableCheckpointRecord? checkpoint,
+    private FreshnessInputs BuildResumeInputs(
+        DurableCheckpointRecord checkpoint,
         DurableRunRecord? run,
         bool unknown,
-        RuntimeGrillPauseReason reason)
+        string? taskId)
     {
-        _ = reason;
-        _ = checkpoint;
+        var required = new Dictionary<string, string>(StringComparer.Ordinal);
+        var current = CurrentInputValues(checkpoint.RunId, taskId);
+        foreach (var pair in current)
+        {
+            if (pair.Key.StartsWith("artifact:", StringComparison.Ordinal))
+            {
+                required[pair.Key["artifact:".Length..]] = pair.Value;
+            }
+        }
+
         return new FreshnessInputs(
-            null,
+            current.GetValueOrDefault("authorityRevision"),
             new Dictionary<string, string>(StringComparer.Ordinal),
             run?.PromptConfigId,
             run?.EffectivePromptDigest,
@@ -1511,11 +1666,97 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             new Dictionary<string, string>(StringComparer.Ordinal),
             run?.ProviderId,
             run?.ModelId,
-            new Dictionary<string, string>(StringComparer.Ordinal),
+            required,
             false,
             false,
             false,
             unknown);
+    }
+
+    private string WriteInputDigestSet(string runId, string? taskId) =>
+        WriteDigestObject(CurrentInputValues(runId, taskId));
+
+    private Dictionary<string, string> CurrentInputValues(string runId, string? taskId)
+    {
+        var run = store.GetRun(runId);
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!string.IsNullOrWhiteSpace(run?.PromptConfigId))
+        {
+            values["promptConfigId"] = run.PromptConfigId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(run?.EffectivePromptDigest))
+        {
+            values["effectivePromptDigest"] = run.EffectivePromptDigest;
+        }
+
+        if (!string.IsNullOrWhiteSpace(run?.ProviderId))
+        {
+            values["providerId"] = run.ProviderId;
+        }
+
+        if (!string.IsNullOrWhiteSpace(run?.ModelId))
+        {
+            values["modelId"] = run.ModelId;
+        }
+
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            return values;
+        }
+
+        foreach (var dependency in store.DependenciesForConsumer(taskId))
+        {
+            if (!ResultDependencyKindCodec.IsRequired(dependency.DependencyKind))
+            {
+                continue;
+            }
+
+            var frozen = FrozenProducerResult(dependency.ProducerTaskId);
+            if (frozen is not null)
+            {
+                values["artifact:" + frozen.ResultArtifactId] = CanonicalJson.Sha256Hex(frozen.FreshnessJson);
+            }
+        }
+
+        foreach (var evidence in store.EvidenceForTask(taskId))
+        {
+            values["artifact:evidence:" + evidence.EvidenceId] = evidence.Stale
+                ? "stale"
+                : evidence.SourceDigest;
+        }
+
+        return values;
+    }
+
+    private bool RequiredInputsFresh(string? taskId)
+    {
+        if (string.IsNullOrWhiteSpace(taskId))
+        {
+            return true;
+        }
+
+        foreach (var dependency in store.DependenciesForConsumer(taskId))
+        {
+            if (!ResultDependencyKindCodec.IsRequired(dependency.DependencyKind))
+            {
+                continue;
+            }
+
+            var frozen = FrozenProducerResult(dependency.ProducerTaskId);
+            if (frozen is null)
+            {
+                return false;
+            }
+
+            var freshness = ResultArtifactCanonicalJson.FromDurable(frozen).Freshness.State;
+            if (freshness != ResultFreshnessState.Current)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private void ReevaluatePendingApprovals(string? runId, string? taskId)
@@ -1538,18 +1779,20 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 applicationDefaults.Current,
                 store.ListOversightOverrides(),
                 BuildActivationContext(null, null, approval.TaskId, approval.RunId));
+            var facts = pendingSafety.Evaluate(approval, oversight);
             var snapshot = new PendingApprovalSnapshot(
                 approval.ApprovalId,
                 approval.ApprovalKind,
                 StringComparer.Ordinal.Equals(approval.ApprovalKind, ApprovalKindCodec.RuntimeGrill),
-                CapabilityAllowed: false,
-                GateValid: true,
-                InputsFresh: true,
-                PlanValid: true,
-                ProjectTrusted: false,
-                HardDenied: false,
+                facts.CapabilityAllowed,
+                facts.GateValid,
+                facts.InputsFresh,
+                facts.PlanValid,
+                facts.ProjectTrusted,
+                facts.HardDenied,
                 oversight);
             var classification = PendingApprovalReevaluator.Reevaluate(snapshot);
+            var now = clock.UtcNow.ToUnixTimeMilliseconds();
             if (classification == PendingApprovalReevaluation.Denied)
             {
                 store.TryCompareAndSetApproval(
@@ -1558,7 +1801,32 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                     approval with
                     {
                         Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Denied),
-                        DecidedAtMs = clock.UtcNow.ToUnixTimeMilliseconds()
+                        DecidedBy = "core:denied",
+                        DecidedAtMs = now
+                    });
+            }
+            else if (classification == PendingApprovalReevaluation.ApprovedDelegated)
+            {
+                store.TryCompareAndSetApproval(
+                    approval.ApprovalId,
+                    ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending),
+                    approval with
+                    {
+                        Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Resolved),
+                        DecidedBy = "core:delegated-reeval",
+                        DecidedAtMs = now
+                    });
+            }
+            else if (classification == PendingApprovalReevaluation.ReplanRequired)
+            {
+                store.TryCompareAndSetApproval(
+                    approval.ApprovalId,
+                    ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Pending),
+                    approval with
+                    {
+                        Status = ApprovalStatusCodec.ToDurableValue(ApprovalStatus.Denied),
+                        DecidedBy = "core:replan_required",
+                        DecidedAtMs = now
                     });
             }
         }
@@ -1574,10 +1842,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 snapshot.Runs.Any(run =>
                     StringComparer.Ordinal.Equals(run.RunId, execution.RunId) &&
                     StringComparer.Ordinal.Equals(run.ParentRunId, record.OwnerRunId)),
-            BackgroundTaskKind.ToolCall =>
-                execution.ToolCallId is not null &&
-                store.GetToolCall(execution.ToolCallId) is { } tool &&
-                StringComparer.Ordinal.Equals(tool.RunId, record.OwnerRunId),
+            BackgroundTaskKind.ToolCall => ToolCallBelongsToOwner(execution, record),
             BackgroundTaskKind.Worker =>
                 execution.WorkerInstanceId is not null &&
                 scheduler.WorkerSnapshot().Any(item =>
@@ -1589,6 +1854,30 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
                 StringComparer.Ordinal.Equals(task.RunId, record.OwnerRunId),
             _ => false
         };
+    }
+
+    private bool ToolCallBelongsToOwner(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
+    {
+        if (string.IsNullOrWhiteSpace(execution.ToolCallId) ||
+            store.GetToolCall(execution.ToolCallId) is not { } tool ||
+            !StringComparer.Ordinal.Equals(tool.RunId, record.OwnerRunId))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(record.OwnerTaskId) &&
+            !StringComparer.Ordinal.Equals(tool.TaskId, record.OwnerTaskId))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(execution.TaskId) &&
+            !StringComparer.Ordinal.Equals(tool.TaskId, execution.TaskId))
+        {
+            return false;
+        }
+
+        return true;
     }
 
     private RuntimeResult<bool> CancelOwnedChildRun(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
@@ -1607,11 +1896,23 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     private RuntimeResult<bool> CancelOwnedToolCall(BackgroundExecutionRef execution, DurableBackgroundTaskRecord record)
     {
         _ = record;
-        if (string.IsNullOrWhiteSpace(execution.ToolCallId) || !store.TryCancelToolCall(execution.ToolCallId))
+        if (string.IsNullOrWhiteSpace(execution.ToolCallId))
         {
-            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "tool-call");
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, "missing-tool-call");
         }
 
+        var outcome = toolCancellation.Cancel(execution.ToolCallId);
+        if (!outcome.Available)
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, outcome.Detail ?? "tool-call-unavailable");
+        }
+
+        if (!outcome.Cancelled)
+        {
+            return RuntimeResults.Fail<bool>(RuntimeError.BackgroundStopUnavailable, outcome.Detail ?? "tool-call-not-cancelled");
+        }
+
+        store.TryCancelToolCall(execution.ToolCallId);
         return RuntimeResults.Success(true);
     }
 
@@ -1657,5 +1958,22 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             record.StartedAtMs,
             record.CompletedAtMs,
             BackgroundTaskLifecycle.DurationMs(record));
+    }
+
+    private static string WriteDigestObject(IReadOnlyDictionary<string, string> values)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { SkipValidation = false }))
+        {
+            writer.WriteStartObject();
+            foreach (var pair in values.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                writer.WriteString(pair.Key, pair.Value);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
 }

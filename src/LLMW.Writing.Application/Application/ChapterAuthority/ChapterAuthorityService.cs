@@ -280,37 +280,14 @@ public sealed class ChapterAuthorityService
                     return recoveryAuthorization;
                 }
 
-                var recoveryFormal = EnsureFormalNarrativeDecision<AcceptChapterCandidateResult>(
-                    command.Principal,
-                    out var recoveryKind,
-                    out var recoveryPolicy);
-                if (recoveryFormal is not null)
-                {
-                    return recoveryFormal;
-                }
-
                 var recovered = store.RecoverAcceptance(context, cancellationToken);
-                if (recoveryKind == DecisionAuthorityKind.AgentDelegated)
-                {
-                    var policy = recoveryPolicy ?? oversightSource.ResolveForPrincipal(command.Principal);
-                    try
-                    {
-                        delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
-                            recovered.AcceptanceId,
-                            recovered.TransactionId,
-                            policy.WinningScope,
-                            policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
-                            command.Principal?.ToString() ?? "agent",
-                            policy,
-                            null,
-                            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
-                    }
-                    catch (Exception)
-                    {
-                    }
-                }
-
-                return ChapterAuthorityResults.Success(recovered);
+                var recoveredProvenance = RepairDelegatedProvenance(
+                    context.AuthorizationSnapshotJson,
+                    recovered.AcceptanceId,
+                    recovered.TransactionId,
+                    command.Principal,
+                    context.ChapterId);
+                return ChapterAuthorityResults.Success(recovered with { ProvenanceConflict = recoveredProvenance == DelegatedProvenanceWriteResult.Conflict });
             }
 
             if (context.TransactionState == AuthorityTransactionState.RecoveryRequired)
@@ -440,28 +417,26 @@ public sealed class ChapterAuthorityService
                     new PrepareAcceptanceRequest(context, decision, acceptedById, relativePath));
             }
 
-            var committed = store.CommitAcceptance(context, cancellationToken);
-            if (authorityKind == DecisionAuthorityKind.AgentDelegated)
+            string? snapshotJson = null;
+            if (authorityKind == DecisionAuthorityKind.AgentDelegated && commitPolicy is not null)
             {
-                var policy = commitPolicy ?? oversightSource.ResolveForPrincipal(command.Principal);
-                try
-                {
-                    delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
-                        committed.AcceptanceId,
-                        committed.TransactionId,
-                        policy.WinningScope,
-                        policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? context.ChapterId,
-                        command.Principal?.ToString() ?? "agent",
-                        policy,
-                        null,
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
-                }
-                catch (Exception)
-                {
-                }
+                snapshotJson = FormalAuthorizationSnapshot.Capture(
+                    context.AcceptanceId ?? command.CandidateId,
+                    context.TransactionId,
+                    commitPolicy,
+                    acceptedById,
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()).WriteCanonical();
+                context = context with { AuthorizationSnapshotJson = snapshotJson };
             }
 
-            return ChapterAuthorityResults.Success(committed);
+            var committed = store.CommitAcceptance(context, cancellationToken);
+            var provenance = RepairDelegatedProvenance(
+                context.AuthorizationSnapshotJson ?? snapshotJson,
+                committed.AcceptanceId,
+                committed.TransactionId,
+                command.Principal,
+                context.ChapterId);
+            return ChapterAuthorityResults.Success(committed with { ProvenanceConflict = provenance == DelegatedProvenanceWriteResult.Conflict });
         }
         catch (Exception exception)
         {
@@ -481,6 +456,42 @@ public sealed class ChapterAuthorityService
             return ChapterAuthorityResults.Fail<AcceptChapterCandidateResult>(
                 ChapterAuthorityError.InfrastructureFailure,
                 exception.Message);
+        }
+    }
+
+    private DelegatedProvenanceWriteResult RepairDelegatedProvenance(
+        string? snapshotJson,
+        string decisionId,
+        string transactionId,
+        CallerPrincipal? principal,
+        string fallbackScopeId)
+    {
+        var snapshot = FormalAuthorizationSnapshot.TryParse(snapshotJson);
+        if (snapshot is null)
+        {
+            return DelegatedProvenanceWriteResult.Written;
+        }
+
+        var record = (snapshot with
+        {
+            DecisionId = decisionId,
+            TransactionId = transactionId,
+            WinningScopeId = string.IsNullOrWhiteSpace(snapshot.WinningScopeId)
+                ? principal?.ProjectScope?.ProjectId.ToString("D") ?? fallbackScopeId
+                : snapshot.WinningScopeId
+        }).ToDelegatedDecision();
+        try
+        {
+            return delegatedDecisionSink.Record(record);
+        }
+        catch (DelegatedDecisionConflictException)
+        {
+            return DelegatedProvenanceWriteResult.Conflict;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _ = exception;
+            return DelegatedProvenanceWriteResult.Unavailable;
         }
     }
 

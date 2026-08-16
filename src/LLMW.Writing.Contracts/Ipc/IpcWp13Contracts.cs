@@ -34,7 +34,7 @@ public sealed record GetResultArtifactResponse(
 public sealed record GetTaskHandoffRequest(string ConsumerTaskId, bool IncludeEvidence);
 
 public sealed record TaskHandoffEdgeDto(
-    string ResultArtifactId,
+    string? ResultArtifactId,
     string DependencyKind,
     string DependencyStatus,
     string FreshnessState,

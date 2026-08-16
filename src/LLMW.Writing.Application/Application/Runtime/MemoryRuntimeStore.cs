@@ -328,6 +328,15 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
         }
     }
 
+    public void ReplaceResultArtifact(DurableResultArtifactRecord artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        lock (gate)
+        {
+            resultArtifacts[artifact.ResultArtifactId] = artifact;
+        }
+    }
+
     public DurableResultArtifactRecord? GetLatestResultArtifact(string taskId)
     {
         lock (gate)
@@ -469,7 +478,7 @@ public sealed class MemoryRuntimeStore : IRuntimePersistence
             {
                 if (!DelegatedDecisionEquality.Equivalent(existing, record))
                 {
-                    throw new InvalidOperationException("delegated-decision-conflict:" + record.DelegatedDecisionId);
+                    throw new DelegatedDecisionConflictException(record.DelegatedDecisionId);
                 }
 
                 return;

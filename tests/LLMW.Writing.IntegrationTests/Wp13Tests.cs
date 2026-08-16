@@ -9,6 +9,7 @@ using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Domain.Security;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
+using RuntimeTaskStatus = LLMW.Writing.Domain.Runtime.TaskStatus;
 
 namespace LLMW.Writing.IntegrationTests;
 
@@ -28,6 +29,11 @@ internal static partial class Program
         RunWp13(nameof(SqliteGrillReloadThenResolve), SqliteGrillReloadThenResolve);
         RunWp13(nameof(SqliteToolCallStopDoesNotCancelOwnerRun), SqliteToolCallStopDoesNotCancelOwnerRun);
         RunWp13(nameof(SqliteDelegatedAuthorityCommitAndProvenanceRetry), SqliteDelegatedAuthorityCommitAndProvenanceRetry);
+        RunWp13(nameof(SqliteProvisionalResultDoesNotSatisfyRequired), SqliteProvisionalResultDoesNotSatisfyRequired);
+        RunWp13(nameof(SqliteNewRunAfterAutoToManualUsesNewPolicy), SqliteNewRunAfterAutoToManualUsesNewPolicy);
+        RunWp13(nameof(SqliteGrillResumeAnchorsToExactCheckpoint), SqliteGrillResumeAnchorsToExactCheckpoint);
+        RunWp13(nameof(SqliteToolCallCancellationUnavailableVsConfirmed), SqliteToolCallCancellationUnavailableVsConfirmed);
+        RunWp13(nameof(SqliteHistoricalDelegatedProvenanceAfterOversightChange), SqliteHistoricalDelegatedProvenanceAfterOversightChange);
         Console.WriteLine($"WP13 integration tests passed ({Wp13PassedTests.Count}).");
         foreach (var test in Wp13PassedTests)
         {
@@ -380,7 +386,11 @@ internal static partial class Program
             clock,
             new FakeRunWorkerSupervisor(),
             new AllowIntegrationAuth { Allow = true });
-        var wp13 = new Wp13RuntimeService(store, scheduler, clock);
+        var wp13 = new Wp13RuntimeService(
+            store,
+            scheduler,
+            clock,
+            toolCancellation: new ConfirmingToolCallCancellationPort(_ => true));
         var workflow = Success(scheduler.CreateWorkflowRun("wf-tool-stop"));
         Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-tool-stop"));
         Success(scheduler.CreateTask("run-tool-stop", "write", 1, null, "task-tool-stop"));
@@ -476,6 +486,303 @@ internal static partial class Program
         AssertTrue(!StringComparer.Ordinal.Equals(acceptedBy, "forged-user"), "Caller AcceptedById must not become audit identity.");
     }
 
+    private static void SqliteProvisionalResultDoesNotSatisfyRequired()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        var databasePath = Path.Combine(root, ".llmw", "project.db");
+        new SqliteMigrationRunner().Migrate(databasePath, "wp13-tests", 1735689600000);
+        var store = new SqliteRuntimeStore(databasePath);
+        var clock = new IntegrationClock(18_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var wp13 = new Wp13RuntimeService(store, scheduler, clock);
+        var workflow = Success(scheduler.CreateWorkflowRun("wf-prov"));
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-prov"));
+        Success(scheduler.CreateTask("run-prov", "write", 1, null, "prod-prov"));
+        Success(scheduler.CreateTask("run-prov", "write", 1, null, "cons-prov"));
+        Success(scheduler.DispatchReadyTask("prod-prov"));
+        Success(scheduler.DispatchReadyTask("cons-prov"));
+        var agent = CreateSqliteAgent(databasePath, "run-prov", "writer");
+        var r1 = SubmitSqliteComplete(wp13, agent, "prod-prov", 18_000);
+        var dependency = Success(wp13.CreateResultDependency("cons-prov", "prod-prov", "required"));
+        AssertWp13Equal("missing", store.GetDependency(dependency.DependencyId)?.Status,
+            "REQUIRED must ignore a provisional Running producer Result.");
+        var consumer = ArtifactAgainst("cons-prov", [r1.ResultArtifactId], 18_000);
+        Success(wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                "cons-prov",
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", consumer),
+                ResultArtifactCanonicalJson.WriteColumn("findings", consumer),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", consumer),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", consumer),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", consumer),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", consumer),
+                null),
+            agent));
+        clock.UnixMs = 18_001;
+        var r2 = SubmitSqliteComplete(wp13, agent, "prod-prov", 18_001);
+        Success(wp13.RequestTaskCompletion("prod-prov", agent));
+        AssertWp13Equal("current", store.GetDependency(dependency.DependencyId)?.Status,
+            "REQUIRED becomes CURRENT only after formal completion.");
+        AssertWp13Equal(r2.ResultArtifactId, store.GetDependency(dependency.DependencyId)?.ResultArtifactId,
+            "REQUIRED must pin the frozen completion Result, not R1.");
+        var restamped = ResultArtifactCanonicalJson.FromDurable(store.GetLatestResultArtifact("cons-prov")!);
+        AssertTrue(restamped.Freshness.State != ResultFreshnessState.Current,
+            "Consumer produced against R1 must not remain CURRENT after frozen R2.");
+    }
+
+    private static void SqliteNewRunAfterAutoToManualUsesNewPolicy()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        var databasePath = Path.Combine(root, ".llmw", "project.db");
+        new SqliteMigrationRunner().Migrate(databasePath, "wp13-tests", 1735689600000);
+        var store = new SqliteRuntimeStore(databasePath);
+        var clock = new IntegrationClock(19_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var wp13 = new Wp13RuntimeService(store, scheduler, clock);
+        var projectId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab").ToString("D");
+        var workflow = Success(scheduler.CreateWorkflowRun("wf-policy"));
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, "agent_delegated", "auto_approve_scoped", null),
+            Wp09UserPrincipal));
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-old-auto"));
+        Success(scheduler.CreateTask("run-old-auto", "write", 1, null, "task-old-auto"));
+        store.UpdateTaskStatus("task-old-auto", TaskStatusCodec.ToDurableValue(RuntimeTaskStatus.Running), 19_000);
+        clock.UnixMs = 20_000;
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, "author_confirmed_required", "ask", null),
+            Wp09UserPrincipal));
+        var runA = Success(wp13.GetEffectiveOversight(projectId, null, "task-old-auto"));
+        AssertWp13Equal("agent_delegated", runA.NarrativeAuthority, "In-flight Run A must keep AUTO until a safe checkpoint.");
+        clock.UnixMs = 21_000;
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-new-manual"));
+        Success(scheduler.CreateTask("run-new-manual", "write", 1, null, "task-new-manual"));
+        var runB = Success(wp13.GetEffectiveOversight(projectId, null, "task-new-manual"));
+        AssertWp13Equal("author_confirmed_required", runB.NarrativeAuthority, "Run B created after AUTO→MANUAL must start MANUAL.");
+        clock.UnixMs = 22_000;
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, "agent_delegated", "auto_approve_scoped", null),
+            Wp09UserPrincipal));
+        clock.UnixMs = 22_001;
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-new-auto"));
+        Success(scheduler.CreateTask("run-new-auto", "write", 1, null, "task-new-auto"));
+        var inverse = Success(wp13.GetEffectiveOversight(projectId, null, "task-new-auto"));
+        AssertWp13Equal("agent_delegated", inverse.NarrativeAuthority, "Run created after MANUAL→AUTO must start AUTO.");
+    }
+
+    private static void SqliteGrillResumeAnchorsToExactCheckpoint()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        var databasePath = Path.Combine(root, ".llmw", "project.db");
+        new SqliteMigrationRunner().Migrate(databasePath, "wp13-tests", 1735689600000);
+        var store = new SqliteRuntimeStore(databasePath);
+        var clock = new IntegrationClock(23_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var wp13 = new Wp13RuntimeService(store, scheduler, clock);
+        var workflow = Success(scheduler.CreateWorkflowRun("wf-grill-cp"));
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-grill-cp"));
+        Success(scheduler.CreateTask("run-grill-cp", "write", 1, null, "task-grill-cp"));
+        Success(scheduler.CreateTask("run-grill-cp", "write", 1, null, "prod-grill-cp"));
+        Success(scheduler.DispatchReadyTask("task-grill-cp"));
+        Success(scheduler.DispatchReadyTask("prod-grill-cp"));
+        var agent = CreateSqliteAgent(databasePath, "run-grill-cp", "writer");
+        SubmitSqliteComplete(wp13, agent, "prod-grill-cp", 23_000);
+        Success(wp13.RequestTaskCompletion("prod-grill-cp", agent));
+        Success(wp13.CreateResultDependency("task-grill-cp", "prod-grill-cp", "required"));
+        var paused = Success(wp13.PauseRuntimeGrill(
+            "run-grill-cp",
+            "task-grill-cp",
+            RuntimeGrillPauseReason.NewCreativeDecisionRequired,
+            new RuntimeGrillQuestionV1("next", ["continue"], "Choose"),
+            "int-grill-cp"));
+        var latest = store.GetLatestResultArtifact("prod-grill-cp")!;
+        var parsed = ResultArtifactCanonicalJson.FromDurable(latest);
+        store.ReplaceResultArtifact(ResultArtifactCanonicalJson.ToDurable(parsed with
+        {
+            Freshness = parsed.Freshness with { State = ResultFreshnessState.Stale }
+        }));
+        Success(wp13.RefreshResultDependencyStatus("prod-grill-cp", "task-grill-cp"));
+        var changed = Success(wp13.ResolveRuntimeGrill(
+            new ResolveRuntimeGrillRequest(paused.ApprovalId, "continue", "continue", null),
+            Wp09UserPrincipal));
+        AssertTrue(!StringComparer.Ordinal.Equals(changed.ResumeDecision, "Continue"),
+            "Required input change at the grill checkpoint must not Continue.");
+    }
+
+    private static void SqliteToolCallCancellationUnavailableVsConfirmed()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        var databasePath = Path.Combine(root, ".llmw", "project.db");
+        new SqliteMigrationRunner().Migrate(databasePath, "wp13-tests", 1735689600000);
+        var store = new SqliteRuntimeStore(databasePath);
+        var clock = new IntegrationClock(24_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var unavailable = new Wp13RuntimeService(store, scheduler, clock);
+        var workflow = Success(scheduler.CreateWorkflowRun("wf-tool-unavail"));
+        Success(scheduler.CreateRun(workflow.WorkflowRunId, "writer", null, "run-tool-unavail"));
+        Success(scheduler.CreateTask("run-tool-unavail", "write", 1, null, "task-tool-unavail"));
+        store.InsertToolCall(new DurableToolCallRecord(
+            "tool-unavail", "run-tool-unavail", "task-tool-unavail", "Shell.Execute", "running", "none"));
+        store.InsertBackgroundTask(new DurableBackgroundTaskRecord(
+            "bg-tool-unavail",
+            "run-tool-unavail",
+            "task-tool-unavail",
+            BackgroundExecutionRefCodec.WriteKindColumn(new BackgroundExecutionRef(
+                BackgroundTaskKind.ToolCall, "run-tool-unavail", "tool-unavail", null, "task-tool-unavail")),
+            "running",
+            null,
+            24_000,
+            null));
+        AssertWp13Equal(RuntimeError.BackgroundStopUnavailable,
+            unavailable.StopBackgroundTask("bg-tool-unavail").Failure?.Code,
+            "Unavailable cancellation must fail closed.");
+        AssertWp13Equal("running", store.GetToolCall("tool-unavail")?.Status, "ToolCall must remain running.");
+        AssertWp13Equal("running", store.GetBackgroundTask("bg-tool-unavail")?.Status, "Background Task must remain running.");
+
+        var confirmed = new Wp13RuntimeService(
+            store,
+            scheduler,
+            clock,
+            toolCancellation: new ConfirmingToolCallCancellationPort(id =>
+                StringComparer.Ordinal.Equals(id, "tool-unavail")));
+        store.InsertToolCall(new DurableToolCallRecord(
+            "tool-other-int", "run-tool-unavail", "task-tool-unavail", "Shell.Execute", "running", "none"));
+        Success(confirmed.StopBackgroundTask("bg-tool-unavail"));
+        AssertWp13Equal("cancelled", store.GetToolCall("tool-unavail")?.Status, "Confirmed cancel must update the exact ToolCall.");
+        AssertWp13Equal("running", store.GetToolCall("tool-other-int")?.Status, "Another ToolCall in the same Run must survive.");
+    }
+
+    private static void SqliteHistoricalDelegatedProvenanceAfterOversightChange()
+    {
+        using var fixture = Wp05Fixture.Create(ChapterReviewOutcome.Pass);
+        var runtimeStore = new SqliteRuntimeStore(fixture.DatabasePath);
+        var clock = new IntegrationClock(25_000);
+        var scheduler = new RuntimeSchedulerService(
+            runtimeStore,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var wp13 = new Wp13RuntimeService(runtimeStore, scheduler, clock);
+        var sink = new OneShotThrowingDelegatedSink(wp13);
+        var authorization = new CoreAuthorizationService(new Wp09TestSecurityPolicySource(), wp13);
+        var service = new ChapterAuthorityService(
+            fixture.BlobStore,
+            fixture.Coordinator,
+            fixture.AuthorityStore,
+            fixture.Reviewer,
+            LLMW.Writing.Application.Reconcile.NoOpAuthoritySurfaceHealthGate.Instance,
+            authorization,
+            wp13,
+            sink);
+        var projectId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab").ToString("D");
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, "agent_delegated", "auto_approve_scoped", null),
+            Wp09UserPrincipal));
+        File.WriteAllText(fixture.DraftPath, "wp13 historical manuscript");
+        var submitted = Success(service.SubmitChapterDraft(
+            new SubmitChapterDraftCommand(fixture.ChapterId, fixture.DraftPath, "wp13-hist", Principal: Wp09UserPrincipal)));
+        Success(service.ReviewChapterCandidate(new ReviewChapterCandidateCommand(submitted.CandidateId, Wp09UserPrincipal)));
+        var pm = CreateAgentPrincipal(
+            fixture.DatabasePath,
+            "wp13-hist-pm",
+            "pm",
+            "worker-wp13-hist-pm",
+            "channel-wp13-hist-pm",
+            RuntimePermissionMode.AutoApproveScoped);
+        var first = Success(service.AcceptChapterCandidate(new AcceptChapterCandidateCommand(
+            submitted.CandidateId,
+            "wp13-hist",
+            "forged-user",
+            Principal: pm)));
+        AssertWp13Equal(AuthorityTransactionState.Complete, first.TransactionState, "AGENT_DELEGATED COMMIT must succeed.");
+        fixture.AssertScalar(0L, "SELECT COUNT(*) FROM delegated_decisions;");
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, "author_confirmed_required", "ask", null),
+            Wp09UserPrincipal));
+        var retry = Success(service.AcceptChapterCandidate(new AcceptChapterCandidateCommand(
+            submitted.CandidateId,
+            "wp13-hist",
+            "forged-user",
+            Principal: pm)));
+        AssertWp13Equal(first.AcceptanceId, retry.AcceptanceId, "Recovery must keep the committed Authority identity.");
+        fixture.AssertScalar(1L, "SELECT COUNT(*) FROM delegated_decisions;");
+        fixture.AssertScalar("project", "SELECT scope_kind FROM delegated_decisions LIMIT 1;");
+        fixture.AssertScalar(projectId, "SELECT scope_id FROM delegated_decisions LIMIT 1;");
+        using var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(fixture.DatabasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT oversight_mode FROM delegated_decisions LIMIT 1;";
+        var mode = command.ExecuteScalar()?.ToString() ?? "";
+        AssertTrue(mode.Contains("agent_delegated", StringComparison.Ordinal),
+            "Current MANUAL policy must not rewrite historical provenance axes.");
+    }
+
+    private static TaskResultArtifactV1 SubmitSqliteComplete(
+        Wp13RuntimeService wp13,
+        CallerPrincipal agent,
+        string taskId,
+        long producedAtMs)
+    {
+        var artifact = ArtifactAgainst(taskId, [], producedAtMs);
+        var submitted = Success(wp13.SubmitResultArtifact(
+            new SubmitResultArtifactRequest(
+                taskId,
+                "complete",
+                ResultArtifactCanonicalJson.WriteColumn("conclusion", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("findings", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("evidence", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("uncertainty", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("diagnostics", artifact),
+                ResultArtifactCanonicalJson.WriteColumn("freshness", artifact),
+                null),
+            agent));
+        return artifact with { ResultArtifactId = submitted.ResultArtifactId };
+    }
+
+    private static TaskResultArtifactV1 ArtifactAgainst(string taskId, IReadOnlyList<string> upstream, long producedAtMs) =>
+        new(
+            Guid.NewGuid().ToString("D"),
+            taskId,
+            ResultArtifactStatus.Complete,
+            "done",
+            [],
+            [],
+            null,
+            [],
+            [],
+            [],
+            new ResultFreshnessV1(
+                1,
+                ResultFreshnessState.Current,
+                new ResultProducedAgainstV1(null, [], null, null, null, null, [], null, null, upstream),
+                new ResultProvenanceV1(null, taskId, null, null, null, null, null, null)),
+            null,
+            producedAtMs);
+
     private static CallerPrincipal CreateSqliteAgent(string databasePath, string runId, string role)
     {
         var channel = new AuthenticatedChannelContext(
@@ -507,7 +814,7 @@ internal static partial class Program
     {
         private int calls;
 
-        public void Record(DelegatedDecisionRecord record)
+        public DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record)
         {
             calls++;
             if (calls == 1)
@@ -515,7 +822,7 @@ internal static partial class Program
                 throw new InvalidOperationException("provenance-fault");
             }
 
-            inner.Record(record);
+            return inner.Record(record);
         }
     }
 
@@ -539,7 +846,9 @@ internal static partial class Program
 
     private sealed class IntegrationClock(long unixMs) : ISecurityClock
     {
-        public DateTimeOffset UtcNow { get; } = DateTimeOffset.FromUnixTimeMilliseconds(unixMs);
+        public long UnixMs { get; set; } = unixMs;
+
+        public DateTimeOffset UtcNow => DateTimeOffset.FromUnixTimeMilliseconds(UnixMs);
     }
 
     private sealed class AllowIntegrationAuth : IAuthorizationService

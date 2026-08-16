@@ -33,4 +33,6 @@ public interface INarrativeChangeStore
     NarrativeStoreResult<NarrativeApplyStoreResult> Apply(
         NarrativeApplyStoreRequest request,
         CancellationToken cancellationToken = default);
+
+    string? LoadAuthorizationSnapshot(string transactionId) => null;
 }

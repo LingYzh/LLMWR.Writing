@@ -132,8 +132,26 @@ public static class ResultDependencyPolicy
         ResultDependencyKind kind,
         string? resultArtifactId,
         ResultFreshnessState? freshness,
-        bool artifactValid)
+        bool artifactValid,
+        bool producerFormallyCompleted = true)
     {
+        if (!producerFormallyCompleted)
+        {
+            if (kind == ResultDependencyKind.Required)
+            {
+                return ResultDependencyStatus.Missing;
+            }
+
+            if (kind == ResultDependencyKind.Advisory)
+            {
+                return ResultDependencyStatus.Warning;
+            }
+
+            return string.IsNullOrWhiteSpace(resultArtifactId)
+                ? ResultDependencyStatus.Missing
+                : ResultDependencyStatus.Stale;
+        }
+
         if (string.IsNullOrWhiteSpace(resultArtifactId))
         {
             return kind == ResultDependencyKind.Advisory ? ResultDependencyStatus.Warning : ResultDependencyStatus.Missing;

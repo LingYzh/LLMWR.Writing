@@ -38,6 +38,29 @@ public sealed partial class SqliteRuntimeStore
         return artifact;
     }
 
+    public void ReplaceResultArtifact(DurableResultArtifactRecord artifact)
+    {
+        ArgumentNullException.ThrowIfNull(artifact);
+        Execute(
+            """
+            UPDATE result_artifacts
+            SET task_id=$task_id, status=$status, conclusion_json=$conclusion, findings_json=$findings,
+                evidence_json=$evidence, uncertainty_json=$uncertainty, diagnostics_json=$diagnostics,
+                freshness_json=$freshness, produced_at_ms=$produced_at_ms
+            WHERE result_artifact_id=$id;
+            """,
+            ("$id", artifact.ResultArtifactId),
+            ("$task_id", artifact.TaskId),
+            ("$status", artifact.Status),
+            ("$conclusion", (object?)artifact.ConclusionJson ?? DBNull.Value),
+            ("$findings", (object?)artifact.FindingsJson ?? DBNull.Value),
+            ("$evidence", (object?)artifact.EvidenceJson ?? DBNull.Value),
+            ("$uncertainty", (object?)artifact.UncertaintyJson ?? DBNull.Value),
+            ("$diagnostics", (object?)artifact.DiagnosticsJson ?? DBNull.Value),
+            ("$freshness", artifact.FreshnessJson),
+            ("$produced_at_ms", artifact.ProducedAtMs));
+    }
+
     public DurableResultArtifactRecord? GetLatestResultArtifact(string taskId)
     {
         lock (gate)
@@ -301,7 +324,7 @@ public sealed partial class SqliteRuntimeStore
         {
             if (!DelegatedDecisionEquality.Equivalent(existing, record))
             {
-                throw new InvalidOperationException("delegated-decision-conflict:" + record.DelegatedDecisionId);
+            throw new DelegatedDecisionConflictException(record.DelegatedDecisionId);
             }
 
             return;

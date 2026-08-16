@@ -95,6 +95,16 @@ internal static class Wp13ContractTests
                 false)),
             IpcJsonContext.Default.GetTaskHandoffResponseEnvelope,
             Payload("getTaskHandoff", "response", "{\"consumerTaskId\":\"task-2\",\"resultArtifactIds\":[\"ra-1\"],\"evidenceIds\":[],\"edges\":[{\"resultArtifactId\":\"ra-1\",\"dependencyKind\":\"advisory\",\"dependencyStatus\":\"warning\",\"freshnessState\":\"stale\",\"blocksDispatch\":false,\"blocksCompletion\":false,\"hasWarning\":true}],\"warnings\":[\"advisory-stale\"],\"includeTranscript\":false}"));
+        AssertGolden(
+            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.GetTaskHandoff, new GetTaskHandoffResponse(
+                "task-3",
+                [],
+                [],
+                [new TaskHandoffEdgeDto(null, "required", "missing", "missing", true, true, false)],
+                [],
+                false)),
+            IpcJsonContext.Default.GetTaskHandoffResponseEnvelope,
+            Payload("getTaskHandoff", "response", "{\"consumerTaskId\":\"task-3\",\"resultArtifactIds\":[],\"evidenceIds\":[],\"edges\":[{\"dependencyKind\":\"required\",\"dependencyStatus\":\"missing\",\"freshnessState\":\"missing\",\"blocksDispatch\":true,\"blocksCompletion\":true,\"hasWarning\":false}],\"warnings\":[],\"includeTranscript\":false}"));
 
         AssertGolden(
             Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.CreateResultDependency, new CreateResultDependencyRequest("c", "p", "required")),

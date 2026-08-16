@@ -6,6 +6,7 @@ using LLMW.Writing.Domain.Authority;
 using LLMW.Writing.Domain.Authority.Candidate;
 using LLMW.Writing.Domain.Authority.Chapter;
 using LLMW.Writing.Domain.Authority.ProjectSubmission;
+using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.Authority;
 using LLMW.Writing.Infrastructure.Persistence;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
@@ -195,7 +196,12 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
                    t.status,t.recovery_state,t.committed_at_ms,a.acceptance_id,m.revision_id,
                    (SELECT json_extract(event_payload_json,'$[0].TargetRelativePath')
                     FROM authority_events WHERE transaction_id=t.transaction_id AND event_type='wp03.materialization_plan'
-                    ORDER BY event_seq DESC LIMIT 1)
+                    ORDER BY event_seq DESC LIMIT 1),
+                   COALESCE(
+                       a.warnings_ack_digest,
+                       (SELECT event_payload_json FROM authority_events
+                        WHERE transaction_id=t.transaction_id AND event_type='wp13.delegated_authorization'
+                        ORDER BY event_seq DESC LIMIT 1))
             FROM candidates c
             JOIN chapters ch ON ch.chapter_id=c.chapter_id
             JOIN authority_transactions t ON t.transaction_id=COALESCE(
@@ -239,7 +245,8 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             AcceptedById = request.AcceptedById,
             AcceptedByKind = request.Decision.AuthorityKind == DecisionAuthorityKind.AgentDelegated
                 ? "AGENT_DELEGATED"
-                : "AUTHOR_CONFIRMED"
+                : "AUTHOR_CONFIRMED",
+            AuthorizationSnapshotJson = request.AuthorizationSnapshotJson ?? request.Context.AuthorizationSnapshotJson
         };
     }
 
@@ -262,7 +269,8 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             [
                 Event("candidate", context.CandidateId, "candidate.accepted", context.TransactionId),
                 Event("chapter", context.ChapterId, "chapter.accepted", context.TransactionId),
-                Event("manuscript_revision", context.ManuscriptRevisionId, "manuscript_revision.created", context.TransactionId)
+                Event("manuscript_revision", context.ManuscriptRevisionId, "manuscript_revision.created", context.TransactionId),
+                ..AuthorizationSnapshotEvents(context)
             ],
             PointerUpdates:
             [
@@ -339,9 +347,9 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             """
             INSERT INTO acceptance_records(
                 acceptance_id,scope_kind,scope_id,candidate_id,manuscript_revision_id,review_attempt_id,
-                accepted_by_kind,accepted_by_id,transaction_id,accepted_at_ms)
+                accepted_by_kind,accepted_by_id,warnings_ack_digest,transaction_id,accepted_at_ms)
             VALUES($acceptance_id,'chapter',$chapter_id,$candidate_id,$revision_id,$review_id,
-                   $accepted_by_kind,$accepted_by_id,$transaction_id,$now);
+                   $accepted_by_kind,$accepted_by_id,$snapshot,$transaction_id,$now);
             """,
             ("$acceptance_id", context.AcceptanceId),
             ("$chapter_id", context.ChapterId),
@@ -350,6 +358,7 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             ("$review_id", context.ReviewAttemptId),
             ("$accepted_by_kind", context.AcceptedByKind),
             ("$accepted_by_id", context.AcceptedById ?? "user-interactive"),
+            ("$snapshot", (object?)context.AuthorizationSnapshotJson ?? DBNull.Value),
             ("$transaction_id", context.TransactionId),
             ("$now", now));
         Execute(
@@ -398,7 +407,9 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             reader.IsDBNull(14) ? null : reader.GetString(14),
             reader.IsDBNull(15) ? null : reader.GetString(15),
             reader.IsDBNull(16) ? null : reader.GetString(16),
-            reader.IsDBNull(14) ? null : "user-interactive");
+            reader.IsDBNull(14) ? null : "user-interactive",
+            "AUTHOR_CONFIRMED",
+            reader.IsDBNull(17) ? null : reader.GetString(17));
     }
 
     private static AcceptChapterCandidateResult Result(
@@ -412,6 +423,24 @@ public sealed class SqliteChapterAuthorityStore : IChapterAuthorityStore
             context.MaterializedRelativePath ?? throw new InvalidOperationException("Materialization path is missing."),
             transaction.State,
             transaction.Existing);
+
+    private static AuthorityEventData[] AuthorizationSnapshotEvents(CandidateAcceptanceContext context)
+    {
+        if (string.IsNullOrWhiteSpace(context.AuthorizationSnapshotJson) || context.AcceptanceId is null)
+        {
+            return [];
+        }
+
+        return
+        [
+            new AuthorityEventData(
+                DurableUuidV7.Create().ToString(),
+                "acceptance",
+                context.AcceptanceId,
+                FormalAuthorizationSnapshot.EventType,
+                context.AuthorizationSnapshotJson)
+        ];
+    }
 
     private static AuthorityEventData Event(string aggregateType, string aggregateId, string eventType, string transactionId) =>
         new(

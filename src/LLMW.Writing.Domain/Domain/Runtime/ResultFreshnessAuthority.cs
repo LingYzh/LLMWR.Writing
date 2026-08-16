@@ -7,7 +7,10 @@ public sealed record ResultFreshnessAuthorityInputs(
     IReadOnlyDictionary<string, DurableResultArtifactRecord> UpstreamResults,
     IReadOnlyDictionary<string, EvidenceRecord> EvidenceById,
     string? KnownAuthorityRevision,
-    IReadOnlySet<string> KnownNarrativeObjectDigests);
+    IReadOnlySet<string> KnownNarrativeObjectDigests,
+    IReadOnlyList<string>? RequiredFrozenResultIds = null,
+    int RequiredEdgeCount = 0,
+    IReadOnlySet<string>? AllowedCrossTaskEvidenceIds = null);
 
 public static class ResultFreshnessAuthority
 {
@@ -86,6 +89,21 @@ public static class ResultFreshnessAuthority
             }
         }
 
+        var requiredFrozen = inputs.RequiredFrozenResultIds ?? [];
+        if (inputs.RequiredEdgeCount > 0 && requiredFrozen.Count == 0)
+        {
+            state = Worse(state, ResultFreshnessState.NeedsRevalidation);
+        }
+
+        foreach (var frozen in requiredFrozen)
+        {
+            if (!producedAgainst.UpstreamRequiredResultRefs.Contains(frozen, StringComparer.Ordinal))
+            {
+                state = Worse(state, ResultFreshnessState.Stale);
+            }
+        }
+
+        var allowedCrossTask = inputs.AllowedCrossTaskEvidenceIds ?? new HashSet<string>(StringComparer.Ordinal);
         foreach (var evidenceId in evidenceIds)
         {
             if (!inputs.EvidenceById.TryGetValue(evidenceId, out var evidence))
@@ -95,7 +113,7 @@ public static class ResultFreshnessAuthority
             }
 
             var owned = StringComparer.Ordinal.Equals(evidence.TaskId, inputs.TaskId) ||
-                        StringComparer.Ordinal.Equals(evidence.RunId, inputs.RunId);
+                        allowedCrossTask.Contains(evidenceId);
             if (!owned)
             {
                 state = Worse(state, ResultFreshnessState.NeedsRevalidation);

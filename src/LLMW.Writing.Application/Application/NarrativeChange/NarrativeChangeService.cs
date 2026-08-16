@@ -134,6 +134,40 @@ public sealed class NarrativeChangeService
         }
 
         var principalKind = command.Principal?.Kind;
+        var existing = store.LoadChangeSet(command.ChangeSetId);
+        if (existing is not null && StringComparer.Ordinal.Equals(existing.Status, "applied"))
+        {
+            var appliedExisting = store.Apply(
+                new NarrativeApplyStoreRequest(
+                    command.ChangeSetId,
+                    command.IdempotencyKey,
+                    command.DeciderKind,
+                    command.Principal?.Kind == PrincipalKind.AgentRun
+                        ? command.Principal.ToString()
+                        : command.Principal?.TrustedInstanceId ?? command.DeciderId,
+                    existing.ImpactAnalysisId),
+                cancellationToken);
+            if (!appliedExisting.Succeeded)
+            {
+                return new NarrativeChangeResult<ApplyNarrativeChangeSetResult>(null, appliedExisting.Failure);
+            }
+
+            var recoveredSnapshot = store.LoadAuthorizationSnapshot(appliedExisting.Value!.TransactionId);
+            var recoveredProvenance = RecordFrozenDelegatedProvenance(
+                recoveredSnapshot,
+                appliedExisting.Value.ChangeSetId,
+                appliedExisting.Value.TransactionId,
+                command.Principal);
+            return NarrativeChangeResults.Success(new ApplyNarrativeChangeSetResult(
+                appliedExisting.Value.ChangeSetId,
+                appliedExisting.Value.TransactionId,
+                appliedExisting.Value.ImpactAnalysisId,
+                appliedExisting.Value.TransactionState,
+                appliedExisting.Value.Existing,
+                [],
+                recoveredProvenance == DelegatedProvenanceWriteResult.Conflict));
+        }
+
         if (principalKind == PrincipalKind.UserInteractive)
         {
             if (command.DeciderKind != NarrativeDecisionKind.AuthorConfirmed)
@@ -228,53 +262,87 @@ public sealed class NarrativeChangeService
             var deciderId = command.Principal?.Kind == PrincipalKind.AgentRun
                 ? command.Principal.ToString()
                 : command.Principal?.TrustedInstanceId ?? command.DeciderId;
+            string? snapshotJson = null;
+            if (command.DeciderKind == NarrativeDecisionKind.AgentDelegated)
+            {
+                var policy = oversightSource.ResolveForPrincipal(command.Principal);
+                snapshotJson = FormalAuthorizationSnapshot.Capture(
+                    command.ChangeSetId,
+                    changeSet.TransactionId,
+                    policy,
+                    deciderId ?? "agent",
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()).WriteCanonical();
+            }
+
             var applied = store.Apply(
                 new NarrativeApplyStoreRequest(
                     command.ChangeSetId,
                     command.IdempotencyKey,
                     command.DeciderKind,
                     deciderId,
-                    analysis?.ImpactAnalysisId ?? changeSet.ImpactAnalysisId),
+                    analysis?.ImpactAnalysisId ?? changeSet.ImpactAnalysisId,
+                    snapshotJson),
                 cancellationToken);
             if (!applied.Succeeded)
             {
                 return new NarrativeChangeResult<ApplyNarrativeChangeSetResult>(null, applied.Failure);
             }
 
-            if (command.DeciderKind == NarrativeDecisionKind.AgentDelegated)
-            {
-                var policy = oversightSource.ResolveForPrincipal(command.Principal);
-                try
-                {
-                    delegatedDecisionSink.Record(NarrativeDecisionProvenance.AgentDelegated(
-                        applied.Value!.ChangeSetId,
-                        applied.Value.TransactionId,
-                        policy.WinningScope,
-                        policy.WinningScopeId ?? command.Principal?.ProjectScope?.ProjectId.ToString("D") ?? applied.Value.ChangeSetId,
-                        command.Principal?.ToString() ?? "agent",
-                        policy,
-                        null,
-                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
-                }
-                catch (Exception)
-                {
-                }
-            }
+            var provenance = RecordFrozenDelegatedProvenance(
+                snapshotJson,
+                applied.Value!.ChangeSetId,
+                applied.Value.TransactionId,
+                command.Principal);
 
             var warnings = analysis?.Warnings ?? [];
             return NarrativeChangeResults.Success(new ApplyNarrativeChangeSetResult(
-                applied.Value!.ChangeSetId,
+                applied.Value.ChangeSetId,
                 applied.Value.TransactionId,
                 applied.Value.ImpactAnalysisId,
                 applied.Value.TransactionState,
                 applied.Value.Existing,
-                warnings));
+                warnings,
+                provenance == DelegatedProvenanceWriteResult.Conflict));
         }
         catch (Exception exception)
         {
             return NarrativeChangeResults.Fail<ApplyNarrativeChangeSetResult>(
                 NarrativeChangeError.InfrastructureFailure,
                 exception.Message);
+        }
+    }
+
+    private DelegatedProvenanceWriteResult RecordFrozenDelegatedProvenance(
+        string? snapshotJson,
+        string decisionId,
+        string transactionId,
+        CallerPrincipal? principal)
+    {
+        var snapshot = FormalAuthorizationSnapshot.TryParse(snapshotJson);
+        if (snapshot is null)
+        {
+            return DelegatedProvenanceWriteResult.Written;
+        }
+
+        try
+        {
+            return delegatedDecisionSink.Record((snapshot with
+            {
+                DecisionId = decisionId,
+                TransactionId = transactionId,
+                WinningScopeId = string.IsNullOrWhiteSpace(snapshot.WinningScopeId)
+                    ? principal?.ProjectScope?.ProjectId.ToString("D") ?? decisionId
+                    : snapshot.WinningScopeId
+            }).ToDelegatedDecision());
+        }
+        catch (DelegatedDecisionConflictException)
+        {
+            return DelegatedProvenanceWriteResult.Conflict;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _ = exception;
+            return DelegatedProvenanceWriteResult.Unavailable;
         }
     }
 

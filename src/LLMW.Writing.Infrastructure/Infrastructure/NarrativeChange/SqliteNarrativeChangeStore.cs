@@ -3,6 +3,7 @@ using System.Text.Json;
 using LLMW.Writing.Application.Authority;
 using LLMW.Writing.Application.NarrativeChange;
 using LLMW.Writing.Domain.Narrative;
+using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.Authority;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Persistence;
@@ -352,7 +353,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                         StringComparer.Ordinal);
             }
 
-            var events = CreateEvents(changeSet);
+            var events = CreateEvents(changeSet, request.AuthorizationSnapshotJson);
             if (prepared is not null)
             {
                 events.Add(prepared.RecoveryEvent);
@@ -396,6 +397,28 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
         {
             return NarrativeStoreResults.Fail<NarrativeApplyStoreResult>(NarrativeChangeError.InfrastructureFailure, exception.Message);
         }
+    }
+
+    public string? LoadAuthorizationSnapshot(string transactionId)
+    {
+        if (string.IsNullOrWhiteSpace(transactionId))
+        {
+            return null;
+        }
+
+        using var connection = connectionFactory.OpenConfigured(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            """
+            SELECT event_payload_json
+            FROM authority_events
+            WHERE transaction_id=$transaction_id AND event_type=$event_type
+            ORDER BY event_seq DESC
+            LIMIT 1;
+            """;
+        Add(command, "$transaction_id", transactionId);
+        Add(command, "$event_type", FormalAuthorizationSnapshot.EventType);
+        return command.ExecuteScalar() as string;
     }
 
     private NarrativeStoreResult<NarrativeApplyStoreResult> RecoverOrReturnApplied(
@@ -666,7 +689,7 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
         return null;
     }
 
-    private static List<AuthorityEventData> CreateEvents(NarrativeChangeSetSnapshot changeSet)
+    private static List<AuthorityEventData> CreateEvents(NarrativeChangeSetSnapshot changeSet, string? authorizationSnapshotJson)
     {
         List<AuthorityEventData> events =
         [
@@ -682,6 +705,15 @@ public sealed class SqliteNarrativeChangeStore : INarrativeChangeStore
                     impactAnalysisId = changeSet.ImpactAnalysisId
                 }))
         ];
+        if (!string.IsNullOrWhiteSpace(authorizationSnapshotJson))
+        {
+            events.Add(new AuthorityEventData(
+                DurableUuidV7.Create().ToString(),
+                "narrative_change_set",
+                changeSet.ChangeSetId,
+                FormalAuthorizationSnapshot.EventType,
+                authorizationSnapshotJson));
+        }
         foreach (var change in changeSet.Changes.OrderBy(change => change.Ordinal))
         {
             events.Add(new AuthorityEventData(

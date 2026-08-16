@@ -187,7 +187,7 @@ public sealed class FailClosedOversightSource : IEffectiveOversightSource
 
 public interface IDelegatedDecisionSink
 {
-    void Record(DelegatedDecisionRecord record);
+    DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record);
 }
 
 public sealed class NullDelegatedDecisionSink : IDelegatedDecisionSink
@@ -198,7 +198,118 @@ public sealed class NullDelegatedDecisionSink : IDelegatedDecisionSink
     {
     }
 
-    public void Record(DelegatedDecisionRecord record) => ArgumentNullException.ThrowIfNull(record);
+    public DelegatedProvenanceWriteResult Record(DelegatedDecisionRecord record)
+    {
+        ArgumentNullException.ThrowIfNull(record);
+        return DelegatedProvenanceWriteResult.Written;
+    }
+}
+
+public sealed record ApprovalSafetyFacts(
+    bool CapabilityAllowed,
+    bool ProjectTrusted,
+    bool HardDenied,
+    bool GateValid,
+    bool PlanValid,
+    bool InputsFresh);
+
+public interface IPendingApprovalSafetyEvaluator
+{
+    ApprovalSafetyFacts Evaluate(DurableApprovalRecord approval, EffectiveOversightPolicy oversight);
+}
+
+public sealed class ProductionPendingApprovalSafetyEvaluator : IPendingApprovalSafetyEvaluator
+{
+    private readonly Func<DurableApprovalRecord, EffectiveOversightPolicy, ApprovalSafetyFacts> evaluate;
+
+    public ProductionPendingApprovalSafetyEvaluator(
+        Func<DurableApprovalRecord, EffectiveOversightPolicy, ApprovalSafetyFacts>? evaluate = null)
+    {
+        this.evaluate = evaluate ?? ((_, _) => new ApprovalSafetyFacts(
+            CapabilityAllowed: false,
+            ProjectTrusted: false,
+            HardDenied: false,
+            GateValid: false,
+            PlanValid: false,
+            InputsFresh: false));
+    }
+
+    public static ProductionPendingApprovalSafetyEvaluator Unavailable { get; } = new();
+
+    public ApprovalSafetyFacts Evaluate(DurableApprovalRecord approval, EffectiveOversightPolicy oversight) =>
+        evaluate(approval, oversight);
+}
+
+public sealed record RuntimeGrillSafetyFacts(
+    bool CapabilityAllowed,
+    bool InsideApprovedPlan,
+    bool TaskScopeUnchanged,
+    bool InputsFresh);
+
+public interface IRuntimeGrillSafetyEvaluator
+{
+    RuntimeGrillSafetyFacts Evaluate(
+        RuntimeGrillDecisionRequestV1 request,
+        CallerPrincipal? principal,
+        EffectiveOversightPolicy oversight);
+}
+
+public sealed class FailClosedRuntimeGrillSafetyEvaluator : IRuntimeGrillSafetyEvaluator
+{
+    public static FailClosedRuntimeGrillSafetyEvaluator Instance { get; } = new();
+
+    private FailClosedRuntimeGrillSafetyEvaluator()
+    {
+    }
+
+    public RuntimeGrillSafetyFacts Evaluate(
+        RuntimeGrillDecisionRequestV1 request,
+        CallerPrincipal? principal,
+        EffectiveOversightPolicy oversight)
+    {
+        _ = request;
+        _ = principal;
+        _ = oversight;
+        return new RuntimeGrillSafetyFacts(false, false, false, false);
+    }
+}
+
+public sealed record ToolCallCancellationOutcome(bool Available, bool Cancelled, string? Detail);
+
+public interface IToolCallCancellationPort
+{
+    ToolCallCancellationOutcome Cancel(string toolCallId);
+}
+
+public sealed class UnavailableToolCallCancellationPort : IToolCallCancellationPort
+{
+    public static UnavailableToolCallCancellationPort Instance { get; } = new();
+
+    private UnavailableToolCallCancellationPort()
+    {
+    }
+
+    public ToolCallCancellationOutcome Cancel(string toolCallId)
+    {
+        _ = toolCallId;
+        return new ToolCallCancellationOutcome(false, false, "unavailable");
+    }
+}
+
+public sealed class ConfirmingToolCallCancellationPort : IToolCallCancellationPort
+{
+    private readonly Func<string, bool> cancel;
+
+    public ConfirmingToolCallCancellationPort(Func<string, bool> cancel) =>
+        this.cancel = cancel ?? throw new ArgumentNullException(nameof(cancel));
+
+    public ToolCallCancellationOutcome Cancel(string toolCallId)
+    {
+        var cancelled = cancel(toolCallId);
+        return cancelled
+            ? new ToolCallCancellationOutcome(true, true, null)
+            : new ToolCallCancellationOutcome(true, false, "not-found");
+    }
 }
 
 public sealed record TaskCompletionOutcome(
