@@ -254,6 +254,11 @@ public sealed record ProviderInvokeResult(
     bool DuplicateExecutionRisk,
     string? NativeContinuationCaptureJson = null);
 
+public sealed record ProviderStreamFrame(ModelRuntimeEvent Event, string? NativeContinuationCaptureJson = null)
+{
+    public static implicit operator ProviderStreamFrame(ModelRuntimeEvent runtimeEvent) => new(runtimeEvent);
+}
+
 public interface IProviderProtocolAdapter
 {
     string AdapterId { get; }
@@ -274,7 +279,7 @@ public interface IProviderProtocolAdapter
         ProviderInvokeRequest request,
         CancellationToken cancellationToken);
 
-    IAsyncEnumerable<ModelRuntimeEvent> StreamAsync(
+    IAsyncEnumerable<ProviderStreamFrame> StreamAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
         ResolvedProviderSecret secret,

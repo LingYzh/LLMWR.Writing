@@ -53,6 +53,8 @@ internal static class Wp14ApplicationTests
         n += Check(nameof(MalformedSnapshotJsonFailsClosedWithoutCheckpoint), MalformedSnapshotJsonFailsClosedWithoutCheckpoint);
         n += Check(nameof(StreamWithoutContinuationCaptureDoesNotExecuteTools), StreamWithoutContinuationCaptureDoesNotExecuteTools);
         n += Check(nameof(UnknownTaskClassCannotSelfCertify), UnknownTaskClassCannotSelfCertify);
+        n += Check(nameof(LaterInvocationDoesNotInheritPriorToolLoopLimit), LaterInvocationDoesNotInheritPriorToolLoopLimit);
+        n += Check(nameof(NullAttemptCannotPersistProviderProvenance), NullAttemptCannotPersistProviderProvenance);
         return n;
     }
 
@@ -1325,6 +1327,84 @@ internal static class Wp14ApplicationTests
         AssertEqual("ROUTE_NO_ELIGIBLE_CANDIDATE", routed.FailureCode, "Unknown task class routing was not fail-closed.");
     }
 
+    private static void LaterInvocationDoesNotInheritPriorToolLoopLimit()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler, new AllowAllAuth());
+        var phase = 1;
+        var adapter = new ScriptedProtocolAdapter(
+            ProtocolKind.OpenAiResponses, "scripted", "v1",
+            _ =>
+            {
+                if (phase >= 2)
+                {
+                    return new ProviderInvokeResult(
+                        InvocationLifecycle.Completed, InvocationFailureClass.None,
+                        [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, "ok", null, null, null, null, NormalizedUsage.Unknown, null, true)],
+                        "req", "resp", "m1", NormalizedUsage.Unknown, [], null, null, null, false);
+                }
+
+                var id = "call-sticky";
+                return new ProviderInvokeResult(
+                    InvocationLifecycle.Completed, InvocationFailureClass.None,
+                    [new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallCompleted, null, id, "lookup", null, "{\"q\":\"a\"}", null, null, false)],
+                    "req", "resp", "m1", NormalizedUsage.Unknown,
+                    [new ToolCallRequest(id, "lookup", "{\"q\":\"a\"}")],
+                    null, null, null, false);
+            });
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        harness.Certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported)));
+        var coordinator = new ProviderInvocationCoordinator(
+            harness.Definitions, harness.Credentials, harness.Certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(handler, harness.Identity),
+            catalog: harness.Catalog,
+            taskCertifications: harness.TaskCertifications);
+        var limited = coordinator.Invoke(Command(harness, "run-loop", "task-loop", tools: true) with
+        {
+            ToolExecutor = new RecordingToolExecutor()
+        });
+        AssertEqual("TOOL_LOOP_LIMIT", limited.Record.RefusalText ?? limited.StructuredOutputError, "Invocation A did not hit ToolLoopLimit.");
+        var historical = ParsedCheckpoints(harness.Store, "run-loop");
+        AssertTrue(historical.Any(item => CoordinatorInference.Has(item, CoordinatorInference.ToolLoopLimit)),
+            "Historical ToolLoopLimit was not durable.");
+        var limitedReload = CanonicalJson.Parse(CanonicalJson.WriteCheckpoint(historical[^1]), CheckpointV1.CurrentSchemaVersion);
+        AssertTrue(CoordinatorInference.Has(limitedReload, CoordinatorInference.ToolLoopLimit),
+            "Historical ToolLoopLimit did not survive reload.");
+        phase = 2;
+        var succeeded = coordinator.Invoke(Command(harness, "run-loop", "task-loop"));
+        AssertEqual(InvocationLifecycle.Completed, succeeded.Record.Lifecycle, "Invocation B did not complete.");
+        var latest = LatestCheckpoint(harness.Store, "run-loop");
+        AssertTrue(!CoordinatorInference.Has(latest, CoordinatorInference.ToolLoopLimit),
+            "Later successful persist inherited A's ToolLoopLimit.");
+        AssertTrue(ParsedCheckpoints(harness.Store, "run-loop").Any(item => CoordinatorInference.Has(item, CoordinatorInference.ToolLoopLimit)),
+            "Historical ToolLoopLimit checkpoint was rewritten away.");
+    }
+
+    private static void NullAttemptCannotPersistProviderProvenance()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-bind")!;
+        var before = harness.Store.CheckpointsForRun("run-bind").Count;
+        var digest = harness.Store.GetRun("run-bind")!.EffectivePromptDigest;
+        var snap = InvocationSnap("inv-noatt", "run-bind", "task-bind", 9_200, "digest-noatt") with { AttemptId = null };
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-noatt", "run-bind", "task-bind", null, snap.CanonicalJson(), null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.IllegalCompletionLifecycle,
+            "Null Attempt persisted provider provenance.");
+        AssertEqual(before, harness.Store.CheckpointsForRun("run-bind").Count, "Null Attempt wrote a checkpoint.");
+        AssertEqual(digest, harness.Store.GetRun("run-bind")!.EffectivePromptDigest, "Null Attempt mutated Run identity.");
+    }
+
     private static void CoordinatorMultiRoundRetainsPriorToolTurns()
     {
         var harness = Harness();
@@ -1506,11 +1586,16 @@ internal static class Wp14ApplicationTests
 
     private static CheckpointV1 LatestCheckpoint(MemoryRuntimeStore store, string runId)
     {
-        var latest = store.CheckpointsForRun(runId)
+        return ParsedCheckpoints(store, runId)[^1];
+    }
+
+    private static CheckpointV1[] ParsedCheckpoints(MemoryRuntimeStore store, string runId)
+    {
+        return store.CheckpointsForRun(runId)
             .OrderBy(item => item.CreatedAtMs)
             .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
-            .Last();
-        return CanonicalJson.Parse(latest.PayloadJson, latest.SchemaVersion);
+            .Select(item => CanonicalJson.Parse(item.PayloadJson, item.SchemaVersion))
+            .ToArray();
     }
 
     private static bool InvocationLogHasLifecycle(CheckpointV1 checkpoint, InvocationLifecycle lifecycle)

@@ -79,7 +79,7 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
         return Parse(http);
     }
 
-    public async IAsyncEnumerable<ModelRuntimeEvent> StreamAsync(
+    public async IAsyncEnumerable<ProviderStreamFrame> StreamAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
         ResolvedProviderSecret secret,
@@ -170,7 +170,9 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
                             null, null, false);
                         break;
                     case "response.incomplete":
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, null, "incomplete", true, capture.CaptureJson());
+                        yield return new ProviderStreamFrame(
+                            new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, null, "incomplete", true),
+                            capture.CaptureJson());
                         terminal = true;
                         yield break;
                     case "response.failed":
@@ -181,12 +183,13 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
                     case "response.completed":
                         capture.OnCompleted(document.RootElement);
                         var usageRoot = document.RootElement.TryGetProperty("response", out var resp) ? resp : document.RootElement;
-                        yield return new ModelRuntimeEvent(
-                            ModelRuntimeEventKind.Completed,
-                            null, null, null, null, null,
-                            UsageNormalizer.FromOpenAi(usageRoot),
-                            null,
-                            true,
+                        yield return new ProviderStreamFrame(
+                            new ModelRuntimeEvent(
+                                ModelRuntimeEventKind.Completed,
+                                null, null, null, null, null,
+                                UsageNormalizer.FromOpenAi(usageRoot),
+                                null,
+                                true),
                             capture.CaptureJson());
                         terminal = true;
                         yield break;

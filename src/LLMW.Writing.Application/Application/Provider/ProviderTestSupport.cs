@@ -119,7 +119,7 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
         return Task.FromResult(invoke(request));
     }
 
-    public async IAsyncEnumerable<ModelRuntimeEvent> StreamAsync(
+    public async IAsyncEnumerable<ProviderStreamFrame> StreamAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
         ResolvedProviderSecret secret,
@@ -129,11 +129,9 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
         var result = await InvokeAsync(definition, endpoint, secret, request, cancellationToken).ConfigureAwait(false);
         foreach (var item in result.Events)
         {
-            if (item.Terminal &&
-                !string.IsNullOrWhiteSpace(result.NativeContinuationCaptureJson) &&
-                string.IsNullOrWhiteSpace(item.ContinuationCaptureJson))
+            if (item.Terminal)
             {
-                yield return item with { ContinuationCaptureJson = result.NativeContinuationCaptureJson };
+                yield return new ProviderStreamFrame(item, result.NativeContinuationCaptureJson);
             }
             else
             {

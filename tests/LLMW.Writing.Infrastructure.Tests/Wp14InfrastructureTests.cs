@@ -39,6 +39,7 @@ internal static partial class Program
         Run(nameof(AnthropicStreamPreservesThinkingWithTools), AnthropicStreamPreservesThinkingWithTools);
         Run(nameof(CompatibleChatStreamReconstructsParallelToolCalls), CompatibleChatStreamReconstructsParallelToolCalls);
         Run(nameof(StreamTextOnlyStillCompletes), StreamTextOnlyStillCompletes);
+        Run(nameof(CompatibleChatStreamFinishReasonsAreTyped), CompatibleChatStreamFinishReasonsAreTyped);
     }
 
     private static PromptIr SampleIr(bool tools = false, int reserved = 64)
@@ -239,7 +240,7 @@ internal static partial class Program
         {
             while (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
             {
-                events.Add(enumerator.Current);
+                events.Add(enumerator.Current.Event);
             }
         }
         finally
@@ -648,11 +649,10 @@ internal static partial class Program
             ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
             secret,
             new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
-            CancellationToken.None));
+            CancellationToken.None), out var capture);
         var completed = events.Last(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted);
         AssertEqual("call_abc", completed.ProviderCallId ?? "", "Streamed function call used item_id as call_id.");
         AssertTrue(completed.ProviderCallId != "fc_item_1", "Streamed function call leaked output item_id as call_id.");
-        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
         AssertTrue(!string.IsNullOrWhiteSpace(capture), "OpenAI stream did not capture output items.");
         var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("call_abc", "lookup", "{\"ok\":true}", null)]);
         var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
@@ -684,9 +684,8 @@ internal static partial class Program
             ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
             secret,
             new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
-            CancellationToken.None));
+            CancellationToken.None), out var capture);
         AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "toolu_a"), "Anthropic stream lost toolu_a.");
-        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
         AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("\"type\":\"tool_use\"", StringComparison.Ordinal),
             "Anthropic stream captured empty synthetic assistant content.");
         var state = adapter.MergeContinuation(null, capture, [
@@ -729,10 +728,11 @@ internal static partial class Program
             ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
             secret,
             new ProviderInvokeRequest(SampleIr(tools: true, reserved: 2048), new ModelId("m"), true, definition.AdapterExtensions, ProtocolProfile: AnthropicThinkingProfile()),
-            CancellationToken.None));
+            CancellationToken.None), out var capture);
         AssertTrue(!events.Any(item => (item.Text ?? "").Contains("secret-plan", StringComparison.Ordinal)),
             "Anthropic thinking leaked as Result text.");
-        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
+        AssertTrue(!events.Any(item => System.Text.Json.JsonSerializer.Serialize(item).Contains("secret-plan", StringComparison.Ordinal)),
+            "Raw thinking leaked into observable ModelRuntimeEvent data.");
         AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("secret-plan", StringComparison.Ordinal),
             "Anthropic thinking block was not preserved for continuation.");
         var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("toolu_t", "lookup", "{}", null)]);
@@ -759,12 +759,11 @@ internal static partial class Program
             ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
             secret,
             new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
-            CancellationToken.None));
+            CancellationToken.None), out var capture);
         AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "call_a"),
             "Chat stream did not reconstruct tool call A.");
         AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "call_b"),
             "Chat stream did not reconstruct tool call B.");
-        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
         AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("\"id\":\"call_a\"", StringComparison.Ordinal) &&
                    capture.Contains("\"id\":\"call_b\"", StringComparison.Ordinal),
             "Chat stream capture lost grouped tool_calls.");
@@ -831,6 +830,60 @@ internal static partial class Program
         AssertTrue(chat.Any(item => item.Kind == ModelRuntimeEventKind.Completed && item.Terminal), "Compatible Chat text-only stream did not complete.");
     }
 
+    private static void CompatibleChatStreamFinishReasonsAreTyped()
+    {
+        using var secret = new ResolvedProviderSecret("token");
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+
+        var stop = Drain(new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                "data: [DONE]\n\n")))
+            .StreamAsync(definition, endpoint, secret, new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()), CancellationToken.None));
+        AssertTrue(stop.Any(item => item.Kind == ModelRuntimeEventKind.Completed && item.Terminal), "finish_reason=stop was not Completed.");
+
+        var tools = Drain(new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+                "data: [DONE]\n\n")))
+            .StreamAsync(definition, endpoint, secret, new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()), CancellationToken.None));
+        AssertTrue(tools.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "call_a"),
+            "finish_reason=tool_calls lost tool proposals.");
+        AssertTrue(tools.Any(item => item.Kind == ModelRuntimeEventKind.Completed && item.Terminal),
+            "finish_reason=tool_calls was not a completed provider round.");
+
+        var length = Drain(new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"cut\"}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+                "data: [DONE]\n\n")))
+            .StreamAsync(definition, endpoint, secret, new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()), CancellationToken.None));
+        AssertTrue(length.Any(item => item.Kind == ModelRuntimeEventKind.Incomplete && item.ErrorCode == "length" && item.Terminal),
+            "finish_reason=length was not Incomplete.");
+        AssertTrue(!length.Any(item => item.Kind == ModelRuntimeEventKind.Completed),
+            "finish_reason=length was silently Completed.");
+
+        var unknown = Drain(new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"mystery_stop\"}]}\n\n" +
+                "data: [DONE]\n\n")))
+            .StreamAsync(definition, endpoint, secret, new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()), CancellationToken.None));
+        AssertTrue(unknown.Any(item => item.Terminal && item.Kind != ModelRuntimeEventKind.Completed),
+            "Unknown finish_reason was silently Completed.");
+        AssertTrue(!unknown.Any(item => item.Kind == ModelRuntimeEventKind.Completed),
+            "Unknown finish_reason mapped to Completed.");
+
+        var lengthHttp = OpenAiCompatibleChatAdapter.Parse(Json(200,
+            "{\"id\":\"c\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"cut\"},\"finish_reason\":\"length\"}]}"));
+        AssertEqual(InvocationLifecycle.Incomplete.ToString(), lengthHttp.Lifecycle.ToString(), "Non-stream length was not Incomplete.");
+        AssertEqual(InvocationFailureClass.IncompleteGeneration.ToString(), lengthHttp.FailureClass.ToString(), "Non-stream length used the wrong failure class.");
+
+        var unknownHttp = OpenAiCompatibleChatAdapter.Parse(Json(200,
+            "{\"id\":\"c\",\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"x\"},\"finish_reason\":\"mystery_stop\"}]}"));
+        AssertTrue(unknownHttp.Lifecycle != InvocationLifecycle.Completed, "Non-stream unknown finish_reason was Completed.");
+        AssertTrue(unknownHttp.FailureClass != InvocationFailureClass.None, "Non-stream unknown finish_reason was treated as success.");
+    }
+
     private static ScriptedHttpMessageHandler SseHandler(string sse) =>
         new(_ =>
         {
@@ -848,15 +901,24 @@ internal static partial class Program
             (ProtocolCapabilityNames.ThinkingAdaptive, CapabilitySupport.Supported),
             (ProtocolCapabilityNames.ThinkingEffort, CapabilitySupport.Supported));
 
-    private static List<ModelRuntimeEvent> Drain(IAsyncEnumerable<ModelRuntimeEvent> stream)
+    private static List<ModelRuntimeEvent> Drain(IAsyncEnumerable<ProviderStreamFrame> stream) =>
+        Drain(stream, out _);
+
+    private static List<ModelRuntimeEvent> Drain(IAsyncEnumerable<ProviderStreamFrame> stream, out string? capture)
     {
         var events = new List<ModelRuntimeEvent>();
+        string? captured = null;
         var enumerator = stream.GetAsyncEnumerator();
         try
         {
             while (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
             {
-                events.Add(enumerator.Current);
+                var frame = enumerator.Current;
+                events.Add(frame.Event);
+                if (!string.IsNullOrWhiteSpace(frame.NativeContinuationCaptureJson))
+                {
+                    captured = frame.NativeContinuationCaptureJson;
+                }
             }
         }
         finally
@@ -864,6 +926,7 @@ internal static partial class Program
             enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
         }
 
+        capture = captured;
         return events;
     }
 

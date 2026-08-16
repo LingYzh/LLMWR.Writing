@@ -172,7 +172,7 @@ public sealed class ProviderInvocationStateHandler
                 "Task does not belong to the authenticated Run.");
         }
 
-        if (!string.IsNullOrWhiteSpace(request.AttemptId) &&
+        if (string.IsNullOrWhiteSpace(request.AttemptId) ||
             !EvaluateAttempt(request.AttemptId, request.TaskId, request.RunId))
         {
             throw new ProviderInvocationDeniedException(
@@ -286,16 +286,27 @@ public sealed class ProviderInvocationStateHandler
 
         var claimedGeneration = request.SnapshotGeneration;
         var inputDigests = (history.LatestCheckpoint?.InputDigestSet ?? []).Where(item =>
-            !item.StartsWith("snapshotGeneration:", StringComparison.Ordinal)).ToList();
+            !item.StartsWith("snapshotGeneration:", StringComparison.Ordinal) &&
+            !item.StartsWith(CoordinatorInference.DigestPrefix, StringComparison.Ordinal)).ToList();
         if (!string.IsNullOrWhiteSpace(claimedGeneration))
         {
             inputDigests.Add("snapshotGeneration:" + claimedGeneration);
         }
 
-        if (!string.IsNullOrWhiteSpace(inferenceKind))
+        var latest = history.LatestCheckpoint;
+        var agentState = StripCoordinatorInference(latest?.AgentStateJson ?? "{}");
+        var effectiveInference = inferenceKind;
+        if (string.IsNullOrWhiteSpace(effectiveInference) &&
+            TryReadCoordinatorInference(latest?.AgentStateJson) is { } prior &&
+            string.Equals(prior.InvocationId, request.InvocationId, StringComparison.Ordinal))
         {
-            inputDigests.RemoveAll(item => item.StartsWith(CoordinatorInference.DigestPrefix, StringComparison.Ordinal));
-            inputDigests.Add(CoordinatorInference.DigestTag(inferenceKind));
+            effectiveInference = prior.Kind;
+        }
+
+        if (!string.IsNullOrWhiteSpace(effectiveInference))
+        {
+            inputDigests.Add(CoordinatorInference.DigestTag(effectiveInference));
+            agentState = MergeCoordinatorInference(agentState, effectiveInference, request.InvocationId);
         }
 
         var digestJson = string.IsNullOrWhiteSpace(request.InputDigestSetJson) ? "{}" : request.InputDigestSetJson;
@@ -303,13 +314,6 @@ public sealed class ProviderInvocationStateHandler
             !digestJson.Contains("\"snapshotGeneration\"", StringComparison.Ordinal))
         {
             digestJson = MergeSnapshotGeneration(digestJson, claimedGeneration);
-        }
-
-        var latest = history.LatestCheckpoint;
-        var agentState = latest?.AgentStateJson ?? "{}";
-        if (!string.IsNullOrWhiteSpace(inferenceKind))
-        {
-            agentState = MergeCoordinatorInference(agentState, inferenceKind, request.InvocationId);
         }
 
         var checkpointV1 = CheckpointV1.Create(
@@ -598,8 +602,15 @@ public sealed class ProviderInvocationStateHandler
                 "Snapshot TaskId does not match the durable Task.");
         }
 
-        if (!string.IsNullOrWhiteSpace(request.AttemptId) &&
-            !string.Equals(request.AttemptId, snapshot.AttemptId, StringComparison.Ordinal))
+        if (string.IsNullOrWhiteSpace(request.AttemptId) ||
+            string.IsNullOrWhiteSpace(snapshot.AttemptId))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.IllegalCompletionLifecycle,
+                "Provider persist requires an active Attempt.");
+        }
+
+        if (!string.Equals(request.AttemptId, snapshot.AttemptId, StringComparison.Ordinal))
         {
             throw new ProviderInvocationDeniedException(
                 IpcErrorCodes.InvocationProvenanceConflict,
@@ -634,6 +645,62 @@ public sealed class ProviderInvocationStateHandler
         catch (JsonException)
         {
             return null;
+        }
+    }
+
+    private static (string Kind, string InvocationId)? TryReadCoordinatorInference(string? agentStateJson)
+    {
+        if (string.IsNullOrWhiteSpace(agentStateJson))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(agentStateJson);
+            if (!document.RootElement.TryGetProperty("coordinatorInference", out var inference) ||
+                !inference.TryGetProperty("kind", out var kind) ||
+                string.IsNullOrWhiteSpace(kind.GetString()))
+            {
+                return null;
+            }
+
+            var invocationId = inference.TryGetProperty("invocationId", out var id) ? id.GetString() : null;
+            return string.IsNullOrWhiteSpace(invocationId) ? null : (kind.GetString()!, invocationId);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string StripCoordinatorInference(string agentStateJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(agentStateJson) ? "{}" : agentStateJson);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (property.NameEquals("coordinatorInference"))
+                    {
+                        continue;
+                    }
+
+                    property.WriteTo(writer);
+                }
+
+                writer.WriteEndObject();
+            }
+
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch (JsonException)
+        {
+            return "{}";
         }
     }
 

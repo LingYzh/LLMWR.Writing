@@ -85,7 +85,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
         return Parse(http);
     }
 
-    public async IAsyncEnumerable<ModelRuntimeEvent> StreamAsync(
+    public async IAsyncEnumerable<ProviderStreamFrame> StreamAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
         ResolvedProviderSecret secret,
@@ -213,7 +213,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                         var captureJson = capture.CaptureJson();
                         foreach (var terminalEvent in AnthropicStop.ToEvents(stopReason, streamUsage, capture.HasToolUse))
                         {
-                            yield return terminalEvent with { ContinuationCaptureJson = captureJson };
+                            yield return new ProviderStreamFrame(terminalEvent, captureJson);
                         }
 
                         terminal = true;

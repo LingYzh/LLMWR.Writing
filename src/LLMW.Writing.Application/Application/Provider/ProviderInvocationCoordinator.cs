@@ -452,6 +452,7 @@ public sealed class ProviderInvocationCoordinator
         var events = new List<ModelRuntimeEvent>();
         var tools = new List<ToolCallRequest>();
         ModelRuntimeEvent? terminal = null;
+        string? mappedCapture = null;
         try
         {
             var enumerator = adapter.StreamAsync(definition, endpoint, secret, request, cancellationToken).GetAsyncEnumerator(cancellationToken);
@@ -467,17 +468,22 @@ public sealed class ProviderInvocationCoordinator
                         break;
                     }
 
-                    events.Add(current);
-                    if (current.Kind == ModelRuntimeEventKind.ToolCallCompleted &&
-                        current.ProviderCallId is not null &&
-                        current.ToolName is not null)
+                    events.Add(current.Event);
+                    if (current.Event.Kind == ModelRuntimeEventKind.ToolCallCompleted &&
+                        current.Event.ProviderCallId is not null &&
+                        current.Event.ToolName is not null)
                     {
-                        tools.Add(new ToolCallRequest(current.ProviderCallId, current.ToolName, current.ArgumentsJson ?? "{}"));
+                        tools.Add(new ToolCallRequest(current.Event.ProviderCallId, current.Event.ToolName, current.Event.ArgumentsJson ?? "{}"));
                     }
 
-                    if (current.Terminal)
+                    if (current.Event.Terminal)
                     {
-                        terminal = current;
+                        terminal = current.Event;
+                        if (!string.IsNullOrWhiteSpace(current.NativeContinuationCaptureJson))
+                        {
+                            mappedCapture = current.NativeContinuationCaptureJson;
+                        }
+
                         break;
                     }
                 }
@@ -537,7 +543,7 @@ public sealed class ProviderInvocationCoordinator
             _ => new ProviderInvokeResult(
                 InvocationLifecycle.Rejected, InvocationFailureClass.MalformedProtocol, events, null, null, null, usage, tools, null, null, terminal.ErrorCode, false)
         };
-        return mapped with { NativeContinuationCaptureJson = terminal.ContinuationCaptureJson ?? mapped.NativeContinuationCaptureJson };
+        return mapped with { NativeContinuationCaptureJson = mappedCapture ?? mapped.NativeContinuationCaptureJson };
     }
 
     private static bool ShouldRetry(InvocationRecord record, ProviderRetryPolicy policy) =>

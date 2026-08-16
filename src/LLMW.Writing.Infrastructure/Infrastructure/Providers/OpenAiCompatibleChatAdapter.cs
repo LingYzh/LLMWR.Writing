@@ -83,7 +83,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         return Parse(http);
     }
 
-    public async IAsyncEnumerable<ModelRuntimeEvent> StreamAsync(
+    public async IAsyncEnumerable<ProviderStreamFrame> StreamAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
         ResolvedProviderSecret secret,
@@ -104,6 +104,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         };
         var terminal = false;
         var capture = new ChatStreamCapture();
+        string? finishReason = null;
         await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
             if (item.Failure is { } failure)
@@ -122,7 +123,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             {
                 if (!terminal)
                 {
-                    foreach (var completed in ChatTerminalEvents(capture))
+                    foreach (var completed in ChatTerminalFrames(capture, finishReason ?? "stop"))
                     {
                         yield return completed;
                     }
@@ -176,7 +177,8 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
                         !string.IsNullOrEmpty(finish.GetString()) &&
                         !terminal)
                     {
-                        foreach (var completed in ChatTerminalEvents(capture))
+                        finishReason = finish.GetString();
+                        foreach (var completed in ChatTerminalFrames(capture, finishReason))
                         {
                             yield return completed;
                         }
@@ -194,17 +196,29 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         }
     }
 
-    private static IEnumerable<ModelRuntimeEvent> ChatTerminalEvents(ChatStreamCapture capture)
+    private static IEnumerable<ProviderStreamFrame> ChatTerminalFrames(ChatStreamCapture capture, string? finishReason)
     {
-        foreach (var tool in capture.CompletedToolEvents())
+        var reason = string.IsNullOrWhiteSpace(finishReason) ? "stop" : finishReason;
+        if (reason is "stop" or "tool_calls")
         {
-            yield return tool;
+            foreach (var tool in capture.CompletedToolEvents())
+            {
+                yield return tool;
+            }
+
+            yield return new ProviderStreamFrame(
+                new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, null, null, true),
+                capture.CaptureJson());
+            yield break;
         }
 
-        yield return new ModelRuntimeEvent(
-            ModelRuntimeEventKind.Completed,
-            null, null, null, null, null, null, null, true,
-            capture.CaptureJson());
+        if (reason == "length")
+        {
+            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, null, "length", true);
+            yield break;
+        }
+
+        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, reason, true);
     }
 
     internal static ProviderInvokeResult Parse(ProviderHttpResult http)
@@ -253,10 +267,21 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             var model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
             var idResp = root.TryGetProperty("id", out var rid) ? rid.GetString() : null;
             var finish = choices[0].TryGetProperty("finish_reason", out var fr) ? fr.GetString() : "stop";
+            if (string.IsNullOrWhiteSpace(finish))
+            {
+                finish = "stop";
+            }
+
             if (finish == "length")
             {
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, content, null, null, null, null, usage, "length", true));
                 return new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, idResp, model, usage, tools, null, null, "length", false);
+            }
+
+            if (finish is not ("stop" or "tool_calls"))
+            {
+                events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Error, content, null, null, null, null, usage, finish, true));
+                return new ProviderInvokeResult(InvocationLifecycle.Rejected, InvocationFailureClass.MalformedProtocol, events, http.ProviderRequestId, idResp, model, usage, tools, null, null, finish, false);
             }
 
             events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, content, null, null, null, null, usage, null, true));
