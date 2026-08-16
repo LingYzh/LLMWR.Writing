@@ -1,3 +1,4 @@
+using System.Threading;
 using LLMW.Writing.Domain.Runtime;
 
 namespace LLMW.Writing.Application.Runtime;
@@ -82,6 +83,78 @@ public sealed class NoSchedulerFaultInjector : ISchedulerFaultInjector
 public sealed class MutableSchedulerFaultInjector : ISchedulerFaultInjector
 {
     public SchedulerFaultPoint Fault { get; set; } = SchedulerFaultPoint.None;
+}
+
+public enum RuntimeLinearizationGate
+{
+    None,
+    BeforeOversightActivationLock,
+    InsideOversightActivationLock
+}
+
+public interface IRuntimeLinearizationBarrier
+{
+    void Enter(RuntimeLinearizationGate gate);
+}
+
+public sealed class NoRuntimeLinearizationBarrier : IRuntimeLinearizationBarrier
+{
+    public static NoRuntimeLinearizationBarrier Instance { get; } = new();
+
+    private NoRuntimeLinearizationBarrier()
+    {
+    }
+
+    public void Enter(RuntimeLinearizationGate gate) => _ = gate;
+}
+
+public sealed class ManualRuntimeLinearizationBarrier : IRuntimeLinearizationBarrier, IDisposable
+{
+    public const int DefaultTimeoutMs = 15_000;
+
+    private readonly RuntimeLinearizationGate waitAt;
+    private readonly ManualResetEventSlim entered = new(false);
+    private readonly ManualResetEventSlim hold = new(false);
+    private readonly int timeoutMs;
+    private volatile bool armed;
+
+    public ManualRuntimeLinearizationBarrier(RuntimeLinearizationGate waitAt, int timeoutMs = DefaultTimeoutMs)
+    {
+        this.waitAt = waitAt;
+        this.timeoutMs = timeoutMs;
+    }
+
+    public void Arm() => armed = true;
+
+    public void Enter(RuntimeLinearizationGate gate)
+    {
+        if (!armed || gate != waitAt)
+        {
+            return;
+        }
+
+        entered.Set();
+        if (!hold.Wait(timeoutMs))
+        {
+            throw new TimeoutException("Runtime linearization barrier was not released.");
+        }
+    }
+
+    public void WaitUntilEntered()
+    {
+        if (!entered.Wait(timeoutMs))
+        {
+            throw new TimeoutException("Runtime linearization barrier was not entered.");
+        }
+    }
+
+    public void Release() => hold.Set();
+
+    public void Dispose()
+    {
+        entered.Dispose();
+        hold.Dispose();
+    }
 }
 
 public sealed class SchedulerFaultInjectedException : Exception

@@ -81,8 +81,9 @@ internal static class Wp13ApplicationTests
         TransitiveRequiredFreshnessPropagatesAndRestores();
         GrillPromptProviderModelChangedSinceExactCheckpoint();
         SameMillisecondOversightOrderingIsDeterministic();
-        Console.WriteLine("Application WP13 tests passed (61).");
-        return 61;
+        OversightActivationLinearizesWithDispatch();
+        Console.WriteLine("Application WP13 tests passed (62).");
+        return 62;
     }
 
     private static void DeterministicCompletionPassesAndIsIdempotent()
@@ -1802,12 +1803,178 @@ internal static class Wp13ApplicationTests
             "Persisted created_at_ms must distinguish Run A from the same-clock MANUAL override.");
     }
 
+    private static void OversightActivationLinearizesWithDispatch()
+    {
+        AssertOversightDispatchRace(
+            dispatchFirst: true,
+            fromAuthority: "agent_delegated",
+            fromPermission: "auto_approve_scoped",
+            toAuthority: "author_confirmed_required",
+            toPermission: "ask",
+            runId: "run-race-d1-am",
+            taskId: "task-race-d1-am");
+        AssertOversightDispatchRace(
+            dispatchFirst: false,
+            fromAuthority: "agent_delegated",
+            fromPermission: "auto_approve_scoped",
+            toAuthority: "author_confirmed_required",
+            toPermission: "ask",
+            runId: "run-race-o1-am",
+            taskId: "task-race-o1-am");
+        AssertOversightDispatchRace(
+            dispatchFirst: true,
+            fromAuthority: "author_confirmed_required",
+            fromPermission: "ask",
+            toAuthority: "agent_delegated",
+            toPermission: "auto_approve_scoped",
+            runId: "run-race-d1-ma",
+            taskId: "task-race-d1-ma");
+        AssertOversightDispatchRace(
+            dispatchFirst: false,
+            fromAuthority: "author_confirmed_required",
+            fromPermission: "ask",
+            toAuthority: "agent_delegated",
+            toPermission: "auto_approve_scoped",
+            runId: "run-race-o1-ma",
+            taskId: "task-race-o1-ma");
+    }
+
+    private static void AssertOversightDispatchRace(
+        bool dispatchFirst,
+        string fromAuthority,
+        string fromPermission,
+        string toAuthority,
+        string toPermission,
+        string runId,
+        string taskId)
+    {
+        var clock = new MutableClock(70_000);
+        var waitAt = dispatchFirst
+            ? RuntimeLinearizationGate.BeforeOversightActivationLock
+            : RuntimeLinearizationGate.InsideOversightActivationLock;
+        using var barrier = new ManualRuntimeLinearizationBarrier(waitAt);
+        var harness = Harness(clock: clock, linearization: barrier);
+        var user = User();
+        var project = ProjectId.ToString("D");
+        var label = dispatchFirst ? "dispatch-first" : "override-first";
+        Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+            "project", project, fromAuthority, fromPermission, null), user));
+        barrier.Arm();
+
+        Exception? overrideError = null;
+        var overrideThread = new Thread(() =>
+        {
+            try
+            {
+                Success(harness.Wp13.SetOversightOverride(new SetOversightOverrideRequest(
+                    "project", project, toAuthority, toPermission, null), user));
+            }
+            catch (Exception ex)
+            {
+                overrideError = ex;
+            }
+        })
+        {
+            IsBackground = true
+        };
+        Exception? dispatchError = null;
+        Thread? dispatchThread = null;
+        try
+        {
+            overrideThread.Start();
+            barrier.WaitUntilEntered();
+            if (dispatchFirst)
+            {
+                StartRunA(harness, runId, taskId);
+                barrier.Release();
+            }
+            else
+            {
+                dispatchThread = new Thread(() =>
+                {
+                    try
+                    {
+                        StartRunA(harness, runId, taskId);
+                    }
+                    catch (Exception ex)
+                    {
+                        dispatchError = ex;
+                    }
+                })
+                {
+                    IsBackground = true
+                };
+                dispatchThread.Start();
+                barrier.Release();
+            }
+
+            if (!overrideThread.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs))
+            {
+                throw new TimeoutException(label + ": override thread did not finish.");
+            }
+
+            if (dispatchThread is not null &&
+                !dispatchThread.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs))
+            {
+                throw new TimeoutException(label + ": dispatch thread did not finish.");
+            }
+        }
+        finally
+        {
+            barrier.Release();
+        }
+
+        if (overrideError is not null)
+        {
+            throw new InvalidOperationException(label + ": override failed.", overrideError);
+        }
+
+        if (dispatchError is not null)
+        {
+            throw new InvalidOperationException(label + ": dispatch failed.", dispatchError);
+        }
+
+        var policy = Success(harness.Wp13.GetEffectiveOversight(project, null, taskId));
+        var runCreated = harness.Store.GetRun(runId)!.CreatedAtMs;
+        var raced = harness.Store.ListOversightOverrides().OrderBy(item => item.CreatedAtMs).Last();
+        AssertEqual(toAuthority, NarrativeDecisionAuthorityCodec.ToDurableValue(raced.NarrativeAuthority),
+            label + ": last override must be the raced policy.");
+        if (dispatchFirst)
+        {
+            AssertEqual(fromAuthority, policy.NarrativeAuthority,
+                label + ": Run A must keep the prior policy until a safe checkpoint.");
+            AssertTrue(runCreated < raced.CreatedAtMs,
+                label + ": Run A must persist before the override.");
+            AssertTrue(OversightActivation.IsPendingBind(raced.EffectiveAfterCheckpointId),
+                label + ": in-flight Run A requires a pending bind, not immediate NULL activation.");
+        }
+        else
+        {
+            AssertEqual(toAuthority, policy.NarrativeAuthority,
+                label + ": Run A must start on the override that linearized first.");
+            AssertTrue(raced.CreatedAtMs < runCreated,
+                label + ": override must persist before Run A.");
+            AssertTrue(raced.EffectiveAfterCheckpointId is null,
+                label + ": override-first must activate immediately.");
+        }
+    }
+
+    private static void StartRunA(HarnessState harness, string runId, string taskId)
+    {
+        var workflow = harness.Store.LoadSnapshot().WorkflowRuns[0].WorkflowRunId;
+        Success(harness.Scheduler.CreateRun(workflow, "writer", null, runId));
+        Success(harness.Scheduler.CreateTask(runId, "write", 1, null, taskId));
+        var dispatched = Success(harness.Scheduler.DispatchReadyTask(taskId));
+        AssertEqual("dispatched", dispatched.Outcome, "Concurrent dispatch must start Run A.");
+    }
+
     private static HarnessState Harness(
         ISemanticCompletionEvaluator? semantic = null,
         IPendingApprovalSafetyEvaluator? pending = null,
         IRuntimeGrillSafetyEvaluator? grill = null,
         IToolCallCancellationPort? toolCancel = null,
-        ISecurityClock? clock = null)
+        ISecurityClock? clock = null,
+        IRuntimeLinearizationBarrier? linearization = null)
     {
         var store = new MemoryRuntimeStore();
         var auth = new AllowAuth { Allow = true };
@@ -1846,7 +2013,8 @@ internal static class Wp13ApplicationTests
             new MutableSchedulerFaultInjector(),
             pending,
             grill,
-            toolCancel);
+            toolCancel,
+            linearization);
         scheduler.OversightActivationListener = wp13;
         return new HarnessState(store, scheduler, wp13, auth, userStore);
     }

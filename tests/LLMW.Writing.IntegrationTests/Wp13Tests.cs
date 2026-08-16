@@ -38,6 +38,7 @@ internal static partial class Program
         RunWp13(nameof(SqliteGrillPromptProviderModelChangedSinceCheckpoint), SqliteGrillPromptProviderModelChangedSinceCheckpoint);
         RunWp13(nameof(SqliteSameMillisecondOversightOrderingReloads), SqliteSameMillisecondOversightOrderingReloads);
         RunWp13(nameof(SqliteDelegatedProvenanceIgnoresWarningsAckDigest), SqliteDelegatedProvenanceIgnoresWarningsAckDigest);
+        RunWp13(nameof(SqliteOversightActivationLinearizesWithDispatchAndReloads), SqliteOversightActivationLinearizesWithDispatchAndReloads);
         Console.WriteLine($"WP13 integration tests passed ({Wp13PassedTests.Count}).");
         foreach (var test in Wp13PassedTests)
         {
@@ -965,6 +966,232 @@ internal static partial class Program
                        .OrderBy(item => item.CreatedAtMs)
                        .First().CreatedAtMs,
             "Persisted created_at_ms must keep Run A before the MANUAL override after reload.");
+    }
+
+    private static void SqliteOversightActivationLinearizesWithDispatchAndReloads()
+    {
+        AssertSqliteOversightDispatchRace(
+            dispatchFirst: true,
+            fromAuthority: "agent_delegated",
+            fromPermission: "auto_approve_scoped",
+            toAuthority: "author_confirmed_required",
+            toPermission: "ask",
+            runId: "run-sql-d1-am",
+            taskId: "task-sql-d1-am");
+        AssertSqliteOversightDispatchRace(
+            dispatchFirst: false,
+            fromAuthority: "agent_delegated",
+            fromPermission: "auto_approve_scoped",
+            toAuthority: "author_confirmed_required",
+            toPermission: "ask",
+            runId: "run-sql-o1-am",
+            taskId: "task-sql-o1-am");
+        AssertSqliteOversightDispatchRace(
+            dispatchFirst: true,
+            fromAuthority: "author_confirmed_required",
+            fromPermission: "ask",
+            toAuthority: "agent_delegated",
+            toPermission: "auto_approve_scoped",
+            runId: "run-sql-d1-ma",
+            taskId: "task-sql-d1-ma");
+        AssertSqliteOversightDispatchRace(
+            dispatchFirst: false,
+            fromAuthority: "author_confirmed_required",
+            fromPermission: "ask",
+            toAuthority: "agent_delegated",
+            toPermission: "auto_approve_scoped",
+            runId: "run-sql-o1-ma",
+            taskId: "task-sql-o1-ma");
+    }
+
+    private static void AssertSqliteOversightDispatchRace(
+        bool dispatchFirst,
+        string fromAuthority,
+        string fromPermission,
+        string toAuthority,
+        string toPermission,
+        string runId,
+        string taskId)
+    {
+        var root = Path.Combine(Path.GetTempPath(), "LLMW.Writing.WP13", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(root, ".llmw"));
+        var databasePath = Path.Combine(root, ".llmw", "project.db");
+        new SqliteMigrationRunner().Migrate(databasePath, "wp13-tests", 1735689600000);
+        var store = new SqliteRuntimeStore(databasePath);
+        var clock = new IntegrationClock(70_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor(),
+            new AllowIntegrationAuth { Allow = true });
+        var waitAt = dispatchFirst
+            ? RuntimeLinearizationGate.BeforeOversightActivationLock
+            : RuntimeLinearizationGate.InsideOversightActivationLock;
+        using var barrier = new ManualRuntimeLinearizationBarrier(waitAt);
+        var wp13 = new Wp13RuntimeService(
+            store,
+            scheduler,
+            clock,
+            linearization: barrier);
+        var projectId = Guid.Parse("018f3e78-1234-7abc-8def-0123456789ab").ToString("D");
+        var workflow = Success(scheduler.CreateWorkflowRun("wf-race"));
+        var label = dispatchFirst ? "dispatch-first" : "override-first";
+        Success(wp13.SetOversightOverride(
+            new SetOversightOverrideRequest("project", projectId, fromAuthority, fromPermission, null),
+            Wp09UserPrincipal));
+        barrier.Arm();
+
+        Exception? overrideError = null;
+        var overrideThread = new Thread(() =>
+        {
+            try
+            {
+                Success(wp13.SetOversightOverride(
+                    new SetOversightOverrideRequest("project", projectId, toAuthority, toPermission, null),
+                    Wp09UserPrincipal));
+            }
+            catch (Exception ex)
+            {
+                overrideError = ex;
+            }
+        })
+        {
+            IsBackground = true
+        };
+        Exception? dispatchError = null;
+        Thread? dispatchThread = null;
+        try
+        {
+            overrideThread.Start();
+            barrier.WaitUntilEntered();
+            if (dispatchFirst)
+            {
+                StartSqliteRunA(scheduler, workflow.WorkflowRunId, runId, taskId);
+                barrier.Release();
+            }
+            else
+            {
+                dispatchThread = new Thread(() =>
+                {
+                    try
+                    {
+                        StartSqliteRunA(scheduler, workflow.WorkflowRunId, runId, taskId);
+                    }
+                    catch (Exception ex)
+                    {
+                        dispatchError = ex;
+                    }
+                })
+                {
+                    IsBackground = true
+                };
+                dispatchThread.Start();
+                barrier.Release();
+            }
+
+            if (!overrideThread.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs))
+            {
+                throw new TimeoutException(label + ": override thread did not finish.");
+            }
+
+            if (dispatchThread is not null &&
+                !dispatchThread.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs))
+            {
+                throw new TimeoutException(label + ": dispatch thread did not finish.");
+            }
+        }
+        finally
+        {
+            barrier.Release();
+        }
+
+        if (overrideError is not null)
+        {
+            throw new InvalidOperationException(label + ": override failed.", overrideError);
+        }
+
+        if (dispatchError is not null)
+        {
+            throw new InvalidOperationException(label + ": dispatch failed.", dispatchError);
+        }
+
+        AssertSqliteRacePolicy(wp13, store, projectId, runId, taskId, dispatchFirst, fromAuthority, toAuthority, label);
+
+        var reloaded = new SqliteRuntimeStore(databasePath);
+        var reloadedWp13 = new Wp13RuntimeService(
+            reloaded,
+            new RuntimeSchedulerService(
+                reloaded,
+                new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+                clock,
+                new FakeRunWorkerSupervisor(),
+                new AllowIntegrationAuth { Allow = true }),
+            clock);
+        AssertSqliteRacePolicy(
+            reloadedWp13,
+            reloaded,
+            projectId,
+            runId,
+            taskId,
+            dispatchFirst,
+            fromAuthority,
+            toAuthority,
+            label + " reload");
+
+        using var connection = new SqliteDatabaseConnectionFactory().OpenConfigured(databasePath);
+        using var version = connection.CreateCommand();
+        version.CommandText = "PRAGMA user_version;";
+        AssertWp13Equal(1L, (long)(version.ExecuteScalar() ?? 0L), "user_version must remain 1.");
+        using var migrations = connection.CreateCommand();
+        migrations.CommandText = "SELECT COUNT(*) FROM schema_migrations;";
+        AssertWp13Equal(1L, (long)(migrations.ExecuteScalar() ?? 0L), "schema_migrations must remain 1.");
+    }
+
+    private static void StartSqliteRunA(
+        RuntimeSchedulerService scheduler,
+        string workflowRunId,
+        string runId,
+        string taskId)
+    {
+        Success(scheduler.CreateRun(workflowRunId, "writer", null, runId));
+        Success(scheduler.CreateTask(runId, "write", 1, null, taskId));
+        var dispatched = Success(scheduler.DispatchReadyTask(taskId));
+        AssertWp13Equal("dispatched", dispatched.Outcome, "Concurrent dispatch must start Run A.");
+    }
+
+    private static void AssertSqliteRacePolicy(
+        Wp13RuntimeService wp13,
+        SqliteRuntimeStore store,
+        string projectId,
+        string runId,
+        string taskId,
+        bool dispatchFirst,
+        string fromAuthority,
+        string toAuthority,
+        string label)
+    {
+        var policy = Success(wp13.GetEffectiveOversight(projectId, null, taskId));
+        var runCreated = store.GetRun(runId)!.CreatedAtMs;
+        var raced = store.ListOversightOverrides().OrderBy(item => item.CreatedAtMs).Last();
+        AssertWp13Equal(toAuthority, NarrativeDecisionAuthorityCodec.ToDurableValue(raced.NarrativeAuthority),
+            label + ": last override must be the raced policy.");
+        if (dispatchFirst)
+        {
+            AssertWp13Equal(fromAuthority, policy.NarrativeAuthority,
+                label + ": Run A must keep the prior policy until a safe checkpoint.");
+            AssertTrue(runCreated < raced.CreatedAtMs, label + ": Run A must persist before the override.");
+            AssertTrue(OversightActivation.IsPendingBind(raced.EffectiveAfterCheckpointId),
+                label + ": in-flight Run A requires a pending bind, not immediate NULL activation.");
+        }
+        else
+        {
+            AssertWp13Equal(toAuthority, policy.NarrativeAuthority,
+                label + ": Run A must start on the override that linearized first.");
+            AssertTrue(raced.CreatedAtMs < runCreated, label + ": override must persist before Run A.");
+            AssertTrue(raced.EffectiveAfterCheckpointId is null,
+                label + ": override-first must activate immediately.");
+        }
     }
 
     private static void SqliteDelegatedProvenanceIgnoresWarningsAckDigest()

@@ -22,6 +22,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     private readonly IPendingApprovalSafetyEvaluator pendingSafety;
     private readonly IRuntimeGrillSafetyEvaluator grillSafety;
     private readonly IToolCallCancellationPort toolCancellation;
+    private readonly IRuntimeLinearizationBarrier linearization;
 
     public Wp13RuntimeService(
         IRuntimePersistence store,
@@ -34,7 +35,8 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         ISchedulerFaultInjector? faults = null,
         IPendingApprovalSafetyEvaluator? pendingSafety = null,
         IRuntimeGrillSafetyEvaluator? grillSafety = null,
-        IToolCallCancellationPort? toolCancellation = null)
+        IToolCallCancellationPort? toolCancellation = null,
+        IRuntimeLinearizationBarrier? linearization = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
@@ -59,6 +61,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         });
         this.grillSafety = grillSafety ?? FailClosedRuntimeGrillSafetyEvaluator.Instance;
         this.toolCancellation = toolCancellation ?? UnavailableToolCallCancellationPort.Instance;
+        this.linearization = linearization ?? NoRuntimeLinearizationBarrier.Instance;
     }
 
     public EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId)
@@ -582,22 +585,28 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         var now = clock.UtcNow.ToUnixTimeMilliseconds();
         var id = Guid.NewGuid().ToString("D");
         _ = request.EffectiveAfterCheckpointId;
-        string? checkpoint = null;
-        if (HasInFlightExecution(scope, request.ScopeId))
+        OversightOverrideRecord? stored = null;
+        linearization.Enter(RuntimeLinearizationGate.BeforeOversightActivationLock);
+        store.InTransaction(() =>
         {
-            checkpoint = OversightActivation.PendingBindToken(id);
-        }
+            linearization.Enter(RuntimeLinearizationGate.InsideOversightActivationLock);
+            string? checkpoint = null;
+            if (HasInFlightExecution(scope, request.ScopeId))
+            {
+                checkpoint = OversightActivation.PendingBindToken(id);
+            }
 
-        var record = new OversightOverrideRecord(
-            id,
-            scope,
-            request.ScopeId,
-            narrative,
-            permission,
-            checkpoint,
-            principal.TrustedInstanceId,
-            now);
-        var stored = store.InsertOversightOverride(record);
+            stored = store.InsertOversightOverride(new OversightOverrideRecord(
+                id,
+                scope,
+                request.ScopeId,
+                narrative,
+                permission,
+                checkpoint,
+                principal.TrustedInstanceId,
+                now));
+        });
+        ArgumentNullException.ThrowIfNull(stored);
         var active = OversightActivation.IsActiveForExecution(
             stored,
             BuildActivationContext(
