@@ -105,9 +105,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
             ["x-api-key"] = secret.Reveal()
         };
         var terminal = false;
-        var toolArgs = new StringBuilder();
-        string? toolId = null;
-        string? toolName = null;
+        var capture = new AnthropicStreamCapture();
         string? stopReason = null;
         NormalizedUsage? streamUsage = null;
         await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
@@ -138,23 +136,30 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                     type = typed.GetString() ?? type;
                 }
 
+                var index = document.RootElement.TryGetProperty("index", out var idx) && idx.TryGetInt32(out var value)
+                    ? value
+                    : 0;
                 switch (type)
                 {
                     case "content_block_start":
-                        if (document.RootElement.TryGetProperty("content_block", out var block) &&
-                            block.TryGetProperty("type", out var bt) && bt.GetString() == "tool_use")
+                        if (document.RootElement.TryGetProperty("content_block", out var block))
                         {
-                            toolId = block.TryGetProperty("id", out var id) ? id.GetString() : null;
-                            toolName = block.TryGetProperty("name", out var nm) ? nm.GetString() : null;
-                            toolArgs.Clear();
-                            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallStarted, null, toolId, toolName, null, null, null, null, false);
+                            capture.Start(index, block);
+                            if (block.TryGetProperty("type", out var bt) && bt.GetString() == "tool_use")
+                            {
+                                var toolId = block.TryGetProperty("id", out var id) ? id.GetString() : null;
+                                var toolName = block.TryGetProperty("name", out var nm) ? nm.GetString() : null;
+                                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallStarted, null, toolId, toolName, null, null, null, null, false);
+                            }
                         }
 
                         break;
                     case "content_block_delta":
                         if (document.RootElement.TryGetProperty("delta", out var delta))
                         {
+                            capture.Delta(index, delta);
                             var dt = delta.TryGetProperty("type", out var dtt) ? dtt.GetString() : "";
+                            var current = capture.Get(index);
                             if (dt == "text_delta")
                             {
                                 yield return new ModelRuntimeEvent(ModelRuntimeEventKind.TextDelta, delta.GetProperty("text").GetString(), null, null, null, null, null, null, false);
@@ -162,19 +167,23 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                             else if (dt == "input_json_delta")
                             {
                                 var partial = delta.TryGetProperty("partial_json", out var pj) ? pj.GetString() ?? "" : "";
-                                toolArgs.Append(partial);
-                                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallArgumentsDelta, null, toolId, toolName, partial, null, null, null, false);
+                                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallArgumentsDelta, null, current?.Id, current?.Name, partial, null, null, null, false);
                             }
                         }
 
                         break;
                     case "content_block_stop":
-                        if (toolId is not null)
+                        var stopped = capture.Get(index);
+                        if (stopped is { Type: "tool_use" } && !string.IsNullOrEmpty(stopped.Id))
                         {
-                            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallCompleted, null, toolId, toolName, null, toolArgs.ToString(), null, null, false);
-                            toolId = null;
-                            toolName = null;
-                            toolArgs.Clear();
+                            yield return new ModelRuntimeEvent(
+                                ModelRuntimeEventKind.ToolCallCompleted,
+                                null,
+                                stopped.Id,
+                                stopped.Name,
+                                null,
+                                stopped.InputJson,
+                                null, null, false);
                         }
 
                         break;
@@ -201,9 +210,10 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 
                         break;
                     case "message_stop":
-                        foreach (var terminalEvent in AnthropicStop.ToEvents(stopReason, streamUsage, toolId is not null))
+                        var captureJson = capture.CaptureJson();
+                        foreach (var terminalEvent in AnthropicStop.ToEvents(stopReason, streamUsage, capture.HasToolUse))
                         {
-                            yield return terminalEvent;
+                            yield return terminalEvent with { ContinuationCaptureJson = captureJson };
                         }
 
                         terminal = true;

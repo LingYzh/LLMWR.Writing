@@ -180,18 +180,33 @@ public sealed class ProviderInvocationStateHandler
                 "Attempt is not legal for this Task.");
         }
 
-        ProviderInvocationSnapshot? snapshot = null;
-        try
+        var snapshot = ParseRequiredSnapshot(request.SnapshotJson);
+        EnsureBoundIdentities(request, snapshot, task);
+
+        if (!string.IsNullOrWhiteSpace(request.RecordJson))
         {
-            snapshot = ProviderInvocationSnapshot.Parse(request.SnapshotJson);
-        }
-        catch (JsonException)
-        {
-            // Persistence still records the opaque safe payload.
+            ProviderInvocationSnapshot recordSnapshot;
+            try
+            {
+                recordSnapshot = ProviderInvocationSnapshot.Parse(request.RecordJson);
+            }
+            catch (Exception exception) when (exception is JsonException or KeyNotFoundException or InvalidOperationException or ArgumentException)
+            {
+                throw new ProviderInvocationDeniedException(
+                    IpcErrorCodes.InvocationProvenanceConflict,
+                    "RecordJson is not a valid invocation snapshot projection.");
+            }
+
+            if (!string.Equals(snapshot.CanonicalJson(), recordSnapshot.CanonicalJson(), StringComparison.Ordinal))
+            {
+                throw new ProviderInvocationDeniedException(
+                    IpcErrorCodes.InvocationProvenanceConflict,
+                    "RecordJson immutable identity does not match SnapshotJson.");
+            }
         }
 
         if (!string.IsNullOrWhiteSpace(request.SnapshotGeneration) &&
-            !string.IsNullOrWhiteSpace(snapshot?.CompiledSnapshotGeneration) &&
+            !string.IsNullOrWhiteSpace(snapshot.CompiledSnapshotGeneration) &&
             !string.Equals(request.SnapshotGeneration, snapshot.CompiledSnapshotGeneration, StringComparison.Ordinal))
         {
             throw new ProviderInvocationDeniedException(
@@ -200,7 +215,7 @@ public sealed class ProviderInvocationStateHandler
         }
 
         var payload = string.IsNullOrWhiteSpace(request.RecordJson) ? request.SnapshotJson : request.RecordJson;
-        var incomingIdentity = snapshot?.CanonicalJson() ?? TrySnapshotIdentity(request.SnapshotJson);
+        var incomingIdentity = snapshot.CanonicalJson();
         var history = ReconstructHistory(request.RunId);
         history.LatestById.TryGetValue(request.InvocationId, out var historical);
         var decision = InvocationPersistClassifier.Classify(
@@ -208,10 +223,16 @@ public sealed class ProviderInvocationStateHandler
             incomingIdentity,
             historical?.Payload,
             payload);
+        var inferenceKind = TryReadDigestString(request.InputDigestSetJson, "coordinatorInference");
         switch (decision)
         {
             case InvocationPersistDecision.IdempotentReplay:
-                return new PersistProviderInvocationResponse(historical?.CheckpointId ?? "", true);
+                if (!ShouldPersistCoordinatorInference(history, inferenceKind))
+                {
+                    return new PersistProviderInvocationResponse(historical?.CheckpointId ?? "", true);
+                }
+
+                break;
             case InvocationPersistDecision.IdentityConflict:
                 throw new ProviderInvocationDeniedException(
                     IpcErrorCodes.InvocationIdentityConflict,
@@ -251,7 +272,6 @@ public sealed class ProviderInvocationStateHandler
         var currentInvocationId = CurrentIdentityInvocationId(history, isNewIdentity ? request.InvocationId : null);
         var run = store.GetRun(request.RunId);
         if (run is not null &&
-            snapshot is not null &&
             string.Equals(currentInvocationId, request.InvocationId, StringComparison.Ordinal))
         {
             store.UpdateRun(run with
@@ -272,6 +292,12 @@ public sealed class ProviderInvocationStateHandler
             inputDigests.Add("snapshotGeneration:" + claimedGeneration);
         }
 
+        if (!string.IsNullOrWhiteSpace(inferenceKind))
+        {
+            inputDigests.RemoveAll(item => item.StartsWith(CoordinatorInference.DigestPrefix, StringComparison.Ordinal));
+            inputDigests.Add(CoordinatorInference.DigestTag(inferenceKind));
+        }
+
         var digestJson = string.IsNullOrWhiteSpace(request.InputDigestSetJson) ? "{}" : request.InputDigestSetJson;
         if (!string.IsNullOrWhiteSpace(claimedGeneration) &&
             !digestJson.Contains("\"snapshotGeneration\"", StringComparison.Ordinal))
@@ -280,11 +306,17 @@ public sealed class ProviderInvocationStateHandler
         }
 
         var latest = history.LatestCheckpoint;
+        var agentState = latest?.AgentStateJson ?? "{}";
+        if (!string.IsNullOrWhiteSpace(inferenceKind))
+        {
+            agentState = MergeCoordinatorInference(agentState, inferenceKind, request.InvocationId);
+        }
+
         var checkpointV1 = CheckpointV1.Create(
             latest?.ApprovedPlanReference ?? "provider-invocation",
             latest?.ApprovedPlanDigest,
             latest?.DagTaskStateJson ?? "{}",
-            latest?.AgentStateJson ?? "{}",
+            agentState,
             "provider_invocation",
             latest?.CriticalMessages ?? [],
             latest?.ToolReferences ?? [],
@@ -529,6 +561,114 @@ public sealed class ProviderInvocationStateHandler
 
         capability = default;
         return false;
+    }
+
+    private static ProviderInvocationSnapshot ParseRequiredSnapshot(string snapshotJson)
+    {
+        try
+        {
+            return ProviderInvocationSnapshot.Parse(snapshotJson);
+        }
+        catch (Exception exception) when (exception is JsonException or KeyNotFoundException or InvalidOperationException or ArgumentException or FormatException)
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvocationProvenanceConflict,
+                "Malformed SnapshotJson is not a typed ProviderInvocationSnapshot.");
+        }
+    }
+
+    private static void EnsureBoundIdentities(
+        PersistProviderInvocationRequest request,
+        ProviderInvocationSnapshot snapshot,
+        DurableTaskRecord? task)
+    {
+        if (!string.Equals(request.InvocationId, snapshot.InvocationId.Value, StringComparison.Ordinal) ||
+            !string.Equals(request.RunId, snapshot.RunId, StringComparison.Ordinal) ||
+            !string.Equals(request.TaskId, snapshot.TaskId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvocationProvenanceConflict,
+                "Persist identities do not match the compiled snapshot.");
+        }
+
+        if (task is not null && !string.Equals(task.TaskId, snapshot.TaskId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvocationProvenanceConflict,
+                "Snapshot TaskId does not match the durable Task.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.AttemptId) &&
+            !string.Equals(request.AttemptId, snapshot.AttemptId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvocationProvenanceConflict,
+                "Persist AttemptId does not match the compiled snapshot.");
+        }
+    }
+
+    private static bool ShouldPersistCoordinatorInference(InvocationHistory history, string? inferenceKind)
+    {
+        if (string.IsNullOrWhiteSpace(inferenceKind) || history.LatestCheckpoint is null)
+        {
+            return !string.IsNullOrWhiteSpace(inferenceKind);
+        }
+
+        return !CoordinatorInference.Has(history.LatestCheckpoint, inferenceKind);
+    }
+
+    private static string? TryReadDigestString(string json, string name)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.String
+                ? property.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static string MergeCoordinatorInference(string agentStateJson, string kind, string invocationId)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            try
+            {
+                using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(agentStateJson) ? "{}" : agentStateJson);
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (property.NameEquals("coordinatorInference"))
+                    {
+                        continue;
+                    }
+
+                    property.WriteTo(writer);
+                }
+            }
+            catch (JsonException)
+            {
+            }
+
+            writer.WritePropertyName("coordinatorInference");
+            writer.WriteStartObject();
+            writer.WriteString("kind", kind);
+            writer.WriteString("invocationId", invocationId);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
 
     private static bool ContainsInvocation(string json, string invocationId) =>

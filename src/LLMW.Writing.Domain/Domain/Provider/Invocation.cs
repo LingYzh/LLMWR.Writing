@@ -267,7 +267,8 @@ public sealed record ModelRuntimeEvent(
     string? ArgumentsJson,
     NormalizedUsage? Usage,
     string? ErrorCode,
-    bool Terminal);
+    bool Terminal,
+    string? ContinuationCaptureJson = null);
 
 public sealed record ToolCallRequest(
     string ProviderCallId,

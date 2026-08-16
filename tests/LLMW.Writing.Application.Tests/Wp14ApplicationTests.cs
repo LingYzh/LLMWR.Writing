@@ -48,6 +48,11 @@ internal static class Wp14ApplicationTests
         n += Check(nameof(ToolLoopLimitIsIncompleteNotCompleted), ToolLoopLimitIsIncompleteNotCompleted);
         n += Check(nameof(CertificationPolicyIgnoresWeakCandidateThresholds), CertificationPolicyIgnoresWeakCandidateThresholds);
         n += Check(nameof(CoordinatorMultiRoundRetainsPriorToolTurns), CoordinatorMultiRoundRetainsPriorToolTurns);
+        n += Check(nameof(PersistBindsRequestSnapshotAndPrincipalIdentities), PersistBindsRequestSnapshotAndPrincipalIdentities);
+        n += Check(nameof(RecordJsonMustMatchSnapshotImmutableIdentity), RecordJsonMustMatchSnapshotImmutableIdentity);
+        n += Check(nameof(MalformedSnapshotJsonFailsClosedWithoutCheckpoint), MalformedSnapshotJsonFailsClosedWithoutCheckpoint);
+        n += Check(nameof(StreamWithoutContinuationCaptureDoesNotExecuteTools), StreamWithoutContinuationCaptureDoesNotExecuteTools);
+        n += Check(nameof(UnknownTaskClassCannotSelfCertify), UnknownTaskClassCannotSelfCertify);
         return n;
     }
 
@@ -351,7 +356,8 @@ internal static class Wp14ApplicationTests
                      "run-cfg", "run-cfg-2", "run-sec", "run-pin", "run-fb", "run-replan", "run-stale", "run-usage",
                      "run-hist", "run-retry", "run-bound", "run-catalog", "run-ceil", "run-idemp", "run-fence",
                      "run-attempt", "run-cert", "run-cross-a", "run-cross-b", "run-gen",
-                     "run-refine", "run-order", "run-race", "run-legal", "run-loop", "run-ms", "run-tools"
+                     "run-refine", "run-order", "run-race", "run-legal", "run-loop", "run-ms", "run-tools",
+                     "run-bind", "run-stream"
                  })
         {
             Success(scheduler.CreateRun("wf-14", "writer", null, run));
@@ -1070,13 +1076,21 @@ internal static class Wp14ApplicationTests
             new DirectProviderInvocationStatePort(handler, harness.Identity),
             catalog: harness.Catalog,
             taskCertifications: harness.TaskCertifications);
+        var executor = new RecordingToolExecutor();
         var outcome = coordinator.Invoke(Command(harness, "run-loop", "task-loop", tools: true) with
         {
-            ToolExecutor = new RecordingToolExecutor()
+            ToolExecutor = executor
         });
         AssertEqual(InvocationLifecycle.Incomplete, outcome.Record.Lifecycle, "Tool loop limit returned ordinary Completed.");
         AssertEqual("TOOL_LOOP_LIMIT", outcome.Record.RefusalText ?? outcome.StructuredOutputError, "Tool loop limit was not typed.");
         AssertTrue(calls > ProviderInvocationCoordinator.MaxToolRounds, "Coordinator stopped before the tool-round ceiling.");
+        AssertEqual(ProviderInvocationCoordinator.MaxToolRounds, executor.Calls, "Local tools executed after the loop limit.");
+        var durable = LatestCheckpoint(harness.Store, "run-loop");
+        AssertTrue(CoordinatorInference.Has(durable, CoordinatorInference.ToolLoopLimit), "Durable checkpoint lost ToolLoopLimit.");
+        AssertTrue(InvocationLogHasLifecycle(durable, InvocationLifecycle.Completed), "Provider Completed was falsified as incomplete.");
+        var reloaded = CanonicalJson.Parse(CanonicalJson.WriteCheckpoint(durable), CheckpointV1.CurrentSchemaVersion);
+        AssertTrue(CoordinatorInference.Has(reloaded, CoordinatorInference.ToolLoopLimit), "Reloaded checkpoint lost ToolLoopLimit.");
+        AssertTrue(InvocationLogHasLifecycle(reloaded, InvocationLifecycle.Completed), "Reloaded provider lifecycle drifted.");
     }
 
     private static void CertificationPolicyIgnoresWeakCandidateThresholds()
@@ -1128,6 +1142,187 @@ internal static class Wp14ApplicationTests
 
         var valid = service.Issue(RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive));
         AssertEqual(CertificationState.Certified, valid.State, "Valid scores against authoritative profile did not certify.");
+    }
+
+    private static void PersistBindsRequestSnapshotAndPrincipalIdentities()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-bind")!;
+        var snap = InvocationSnap("inv-bind", "run-bind", "task-bind", 9_000, "digest-bind");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-other", "run-bind", "task-bind", AttemptId("task-bind"), snap.CanonicalJson(), null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Request InvocationId was allowed to disagree with SnapshotJson.");
+        var otherRun = InvocationSnap("inv-bind", "run-cross-a", "task-bind", 9_000, "digest-bind");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-bind", "run-bind", "task-bind", AttemptId("task-bind"), otherRun.CanonicalJson(), null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Snapshot RunId was allowed to disagree with authenticated request.RunId.");
+        var otherTask = InvocationSnap("inv-bind", "run-bind", "task-loop", 9_000, "digest-bind");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-bind", "run-bind", "task-bind", AttemptId("task-bind"), otherTask.CanonicalJson(), null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Snapshot TaskId was allowed to disagree with request.TaskId.");
+        var otherAttempt = snap with { AttemptId = "task-bind-wrong-att" };
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-bind", "run-bind", "task-bind", AttemptId("task-bind"), otherAttempt.CanonicalJson(), null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Snapshot AttemptId was allowed to disagree with request.AttemptId.");
+    }
+
+    private static void RecordJsonMustMatchSnapshotImmutableIdentity()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-bind")!;
+        var snap = InvocationSnap("inv-rec", "run-bind", "task-bind", 9_100, "digest-a");
+        var other = InvocationSnap("inv-rec", "run-bind", "task-bind", 9_100, "digest-b");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest(
+                    "inv-rec",
+                    "run-bind",
+                    "task-bind",
+                    AttemptId("task-bind"),
+                    snap.CanonicalJson(),
+                    CompletedPayload(other, "req", "resp", 3),
+                    "{}",
+                    "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "RecordJson was allowed to rewrite immutable snapshot identity.");
+    }
+
+    private static void MalformedSnapshotJsonFailsClosedWithoutCheckpoint()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-bind")!;
+        var before = harness.Store.CheckpointsForRun("run-bind").Count;
+        var digest = harness.Store.GetRun("run-bind")!.EffectivePromptDigest;
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-bad", "run-bind", "task-bind", AttemptId("task-bind"), "{}", null, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Malformed SnapshotJson was persisted as opaque provenance.");
+        AssertEqual(before, harness.Store.CheckpointsForRun("run-bind").Count, "Malformed persist wrote a checkpoint.");
+        AssertEqual(digest, harness.Store.GetRun("run-bind")!.EffectivePromptDigest, "Malformed persist mutated Run identity.");
+    }
+
+    private static void StreamWithoutContinuationCaptureDoesNotExecuteTools()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler, new AllowAllAuth());
+        var adapter = new ScriptedProtocolAdapter(
+            ProtocolKind.OpenAiResponses, "scripted", "v1",
+            _ => new ProviderInvokeResult(
+                InvocationLifecycle.Completed, InvocationFailureClass.None,
+                [new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallCompleted, null, "call-stream", "lookup", null, "{\"q\":\"a\"}", null, null, false)],
+                "req", "resp", "m1", NormalizedUsage.Unknown,
+                [new ToolCallRequest("call-stream", "lookup", "{\"q\":\"a\"}")],
+                null, null, null, false));
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        harness.Certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported),
+            (ModelCapabilityNames.Streaming, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported)));
+        var coordinator = new ProviderInvocationCoordinator(
+            harness.Definitions, harness.Credentials, harness.Certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(handler, harness.Identity),
+            catalog: harness.Catalog,
+            taskCertifications: harness.TaskCertifications);
+        var executor = new RecordingToolExecutor();
+        var outcome = coordinator.Invoke(Command(harness, "run-stream", "task-stream", tools: true) with
+        {
+            Stream = true,
+            ToolExecutor = executor
+        });
+        AssertEqual(0, executor.Calls, "Streaming tool loop executed without continuation capture.");
+        AssertEqual("STREAMING_TOOLS_UNSUPPORTED", outcome.StructuredOutputError ?? outcome.Record.RefusalText,
+            "Streaming tools without capture was not fail-closed.");
+    }
+
+    private static void UnknownTaskClassCannotSelfCertify()
+    {
+        var store = new MemoryTaskCertificationStore();
+        var service = new TaskCapabilityCertificationService(store);
+        var attacker = new TaskCapabilityCertification(
+            "task-attacker",
+            1,
+            "ds-attacker",
+            "1",
+            "attacker-suite-v0",
+            [new TaskEvalScore("attacker_metric", 1.0m)],
+            [TaskEvalThreshold.AtMost("attacker_metric", 1.0m)],
+            ["attacker_defined_task"],
+            ReasoningCeiling.Adaptive,
+            new ProviderDefinitionId("prov-a"),
+            new ProviderRevision(1),
+            "http://127.0.0.1:9/",
+            "scripted",
+            "v1",
+            new ModelId("m1"),
+            PromptCompiler.CurrentShippedCertificationBaselineDigest,
+            CertificationState.Certified,
+            1);
+        var issued = service.Issue(attacker);
+        AssertEqual(CertificationState.Uncertified, issued.State, "Unknown task class self-certified.");
+        AssertEqual(ReasoningCeiling.Conservative, issued.MaxReasoningCeiling, "Unknown task class kept Adaptive ceiling.");
+        var protocol = new ModelCertificationRecord(
+            "cert:attacker",
+            1,
+            ModelCertificationRecord.CurrentProbeSuiteVersion,
+            new ProviderDefinitionId("prov-a"),
+            new ProviderRevision(1),
+            "http://127.0.0.1:9/",
+            "scripted",
+            "v1",
+            new ModelId("m1"),
+            CertificationState.Certified,
+            ReasoningCeiling.Adaptive,
+            ProviderDataBehavior.StatelessClientManaged,
+            [new CertifiedCapability(ModelCapabilityNames.BasicText, CapabilitySupport.Supported, MetadataProvenance.CertifiedObserved)],
+            1,
+            null);
+        var routed = ProviderRouter.Route(
+            [new RouteCandidate(
+                new ProviderDefinitionId("prov-a"),
+                new ProviderRevision(1),
+                new ModelId("m1"),
+                ProtocolKind.OpenAiResponses,
+                true,
+                true,
+                protocol,
+                128_000,
+                0,
+                issued)],
+            RouteRequirementProfile.TextOnly with
+            {
+                RequestedReasoning = ReasoningCeiling.Conservative,
+                RequiredTaskClass = "attacker_defined_task"
+            });
+        AssertTrue(routed.Selected is null, "Unregistered attacker_defined_task was selected as Certified.");
+        AssertEqual("ROUTE_NO_ELIGIBLE_CANDIDATE", routed.FailureCode, "Unknown task class routing was not fail-closed.");
     }
 
     private static void CoordinatorMultiRoundRetainsPriorToolTurns()
@@ -1300,8 +1495,35 @@ internal static class Wp14ApplicationTests
 
     private sealed class RecordingToolExecutor : ILocalToolExecutor
     {
-        public LocalToolExecutionResult Execute(string callId, string toolName, string argumentsJson) =>
-            new(callId, toolName, "{\"ok\":true}", null);
+        public int Calls { get; private set; }
+
+        public LocalToolExecutionResult Execute(string callId, string toolName, string argumentsJson)
+        {
+            Calls++;
+            return new(callId, toolName, "{\"ok\":true}", null);
+        }
+    }
+
+    private static CheckpointV1 LatestCheckpoint(MemoryRuntimeStore store, string runId)
+    {
+        var latest = store.CheckpointsForRun(runId)
+            .OrderBy(item => item.CreatedAtMs)
+            .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
+            .Last();
+        return CanonicalJson.Parse(latest.PayloadJson, latest.SchemaVersion);
+    }
+
+    private static bool InvocationLogHasLifecycle(CheckpointV1 checkpoint, InvocationLifecycle lifecycle)
+    {
+        foreach (var item in checkpoint.InvocationLog)
+        {
+            if (InvocationPersistClassifier.ReadLifecycle(item) == lifecycle)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static void AssertDenied(Action action, string code, string message)

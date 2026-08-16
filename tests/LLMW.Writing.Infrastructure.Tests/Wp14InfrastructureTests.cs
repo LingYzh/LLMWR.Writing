@@ -34,6 +34,11 @@ internal static partial class Program
         Run(nameof(AnthropicParallelToolsStayOneAssistantTurn), AnthropicParallelToolsStayOneAssistantTurn);
         Run(nameof(AnthropicToolErrorSetsIsError), AnthropicToolErrorSetsIsError);
         Run(nameof(ChatThinkingContinuationWithoutReasoningContentFailsClosed), ChatThinkingContinuationWithoutReasoningContentFailsClosed);
+        Run(nameof(OpenAiResponsesStreamPreservesFunctionCallIdNotItemId), OpenAiResponsesStreamPreservesFunctionCallIdNotItemId);
+        Run(nameof(AnthropicStreamPreservesAssistantToolUseTurn), AnthropicStreamPreservesAssistantToolUseTurn);
+        Run(nameof(AnthropicStreamPreservesThinkingWithTools), AnthropicStreamPreservesThinkingWithTools);
+        Run(nameof(CompatibleChatStreamReconstructsParallelToolCalls), CompatibleChatStreamReconstructsParallelToolCalls);
+        Run(nameof(StreamTextOnlyStillCompletes), StreamTextOnlyStillCompletes);
     }
 
     private static PromptIr SampleIr(bool tools = false, int reserved = 64)
@@ -627,6 +632,213 @@ internal static partial class Program
         AssertTrue(body.Contains("\"tool_call_id\":\"A\"", StringComparison.Ordinal) && body.Contains("\"tool_call_id\":\"B\"", StringComparison.Ordinal),
             "Chat tool messages lost call ids.");
     }
+
+    private static void OpenAiResponsesStreamPreservesFunctionCallIdNotItemId()
+    {
+        var sse =
+            "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_item_1\",\"call_id\":\"call_abc\",\"name\":\"lookup\",\"arguments\":\"\"}}\n\n" +
+            "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_item_1\",\"delta\":\"{\\\"q\\\":\\\"a\\\"}\"}\n\n" +
+            "event: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_item_1\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"a\\\"}\"}\n\n" +
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"m\",\"output\":[{\"type\":\"function_call\",\"id\":\"fc_item_1\",\"call_id\":\"call_abc\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"a\\\"}\"}]}}\n\n";
+        var adapter = new OpenAiResponsesAdapter(new ProviderHttpTransport(SseHandler(sse)));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        using var secret = new ResolvedProviderSecret("token");
+        var events = Drain(adapter.StreamAsync(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            secret,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
+            CancellationToken.None));
+        var completed = events.Last(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted);
+        AssertEqual("call_abc", completed.ProviderCallId ?? "", "Streamed function call used item_id as call_id.");
+        AssertTrue(completed.ProviderCallId != "fc_item_1", "Streamed function call leaked output item_id as call_id.");
+        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
+        AssertTrue(!string.IsNullOrWhiteSpace(capture), "OpenAI stream did not capture output items.");
+        var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("call_abc", "lookup", "{\"ok\":true}", null)]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state)).Request!.CanonicalSemanticBody;
+        AssertTrue(body.Contains("\"call_id\":\"call_abc\"", StringComparison.Ordinal), "Next request function_call_output lost call_id.");
+        AssertTrue(!body.Contains("\"call_id\":\"fc_item_1\"", StringComparison.Ordinal), "Next request used item_id as call_id.");
+        AssertTrue(!body.Contains("previous_response_id", StringComparison.Ordinal), "OpenAI stream continuation required previous_response_id.");
+    }
+
+    private static void AnthropicStreamPreservesAssistantToolUseTurn()
+    {
+        var sse =
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"lookup\",\"input\":{}}}\n\n" +
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"a\\\"}\"}}\n\n" +
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"lookup\",\"input\":{}}}\n\n" +
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":\\\"b\\\"}\"}}\n\n" +
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n" +
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(SseHandler(sse)));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        using var secret = new ResolvedProviderSecret("token");
+        var events = Drain(adapter.StreamAsync(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            secret,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
+            CancellationToken.None));
+        AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "toolu_a"), "Anthropic stream lost toolu_a.");
+        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
+        AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("\"type\":\"tool_use\"", StringComparison.Ordinal),
+            "Anthropic stream captured empty synthetic assistant content.");
+        var state = adapter.MergeContinuation(null, capture, [
+            new LocalToolExecutionResult("toolu_a", "lookup", "{\"ok\":true}", null),
+            new LocalToolExecutionResult("toolu_b", "lookup", "{\"ok\":true}", null)
+        ]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state)).Request!.CanonicalSemanticBody;
+        var assistantCount = 0;
+        var idx = 0;
+        while ((idx = body.IndexOf("\"role\":\"assistant\"", idx, StringComparison.Ordinal)) >= 0)
+        {
+            assistantCount++;
+            idx += 1;
+        }
+
+        AssertEqual(1, assistantCount, "Streamed parallel tool_use was split into synthetic assistant turns.");
+        AssertTrue(body.Contains("\"tool_use_id\":\"toolu_a\"", StringComparison.Ordinal), "tool_result did not immediately follow preserved assistant turn.");
+        AssertTrue(body.Contains("\"tool_use_id\":\"toolu_b\"", StringComparison.Ordinal), "Parallel streamed tool_result B missing.");
+    }
+
+    private static void AnthropicStreamPreservesThinkingWithTools()
+    {
+        var sse =
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n" +
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"secret-plan\"}}\n\n" +
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_t\",\"name\":\"lookup\",\"input\":{}}}\n\n" +
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" +
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n" +
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n" +
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(SseHandler(sse)));
+        var definition = ProviderDefinitionFactory.Create(
+            "p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m",
+            allowInsecureLocalHttp: false, extensions: new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "1024" });
+        using var secret = new ResolvedProviderSecret("token");
+        var events = Drain(adapter.StreamAsync(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            secret,
+            new ProviderInvokeRequest(SampleIr(tools: true, reserved: 2048), new ModelId("m"), true, definition.AdapterExtensions, ProtocolProfile: AnthropicThinkingProfile()),
+            CancellationToken.None));
+        AssertTrue(!events.Any(item => (item.Text ?? "").Contains("secret-plan", StringComparison.Ordinal)),
+            "Anthropic thinking leaked as Result text.");
+        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
+        AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("secret-plan", StringComparison.Ordinal),
+            "Anthropic thinking block was not preserved for continuation.");
+        var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("toolu_t", "lookup", "{}", null)]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true, reserved: 2048), new ModelId("m"), false, definition.AdapterExtensions, "inv", ProtocolProfile: AnthropicThinkingProfile(), ContinuationState: state)).Request!.CanonicalSemanticBody;
+        AssertTrue(body.Contains("\"type\":\"thinking\"", StringComparison.Ordinal) && body.Contains("secret-plan", StringComparison.Ordinal),
+            "Thinking block was not returned unmodified on the tool-use turn.");
+    }
+
+    private static void CompatibleChatStreamReconstructsParallelToolCalls()
+    {
+        var sse =
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"q\\\":\\\"a\\\"}\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"{\\\"q\\\":\\\"b\\\"}\"}}]}}]}\n\n" +
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+            "data: [DONE]\n\n";
+        var adapter = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(sse)));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        using var secret = new ResolvedProviderSecret("token");
+        var events = Drain(adapter.StreamAsync(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            secret,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), true, new Dictionary<string, string>()),
+            CancellationToken.None));
+        AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "call_a"),
+            "Chat stream did not reconstruct tool call A.");
+        AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.ToolCallCompleted && item.ProviderCallId == "call_b"),
+            "Chat stream did not reconstruct tool call B.");
+        var capture = events.Last(item => item.Terminal).ContinuationCaptureJson;
+        AssertTrue(!string.IsNullOrWhiteSpace(capture) && capture.Contains("\"id\":\"call_a\"", StringComparison.Ordinal) &&
+                   capture.Contains("\"id\":\"call_b\"", StringComparison.Ordinal),
+            "Chat stream capture lost grouped tool_calls.");
+        var state = adapter.MergeContinuation(null, capture, [
+            new LocalToolExecutionResult("call_a", "lookup", "{}", null),
+            new LocalToolExecutionResult("call_b", "lookup", "{}", null)
+        ]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state)).Request!.CanonicalSemanticBody;
+        var assistantCount = 0;
+        var idx = 0;
+        while ((idx = body.IndexOf("\"role\":\"assistant\"", idx, StringComparison.Ordinal)) >= 0)
+        {
+            assistantCount++;
+            idx += 1;
+        }
+
+        AssertEqual(1, assistantCount, "Chat streamed parallel tool_calls were split into synthetic assistant turns.");
+        AssertTrue(body.Contains("\"tool_call_id\":\"call_a\"", StringComparison.Ordinal) &&
+                   body.Contains("\"tool_call_id\":\"call_b\"", StringComparison.Ordinal),
+            "Chat tool messages did not match reconstructed ids.");
+    }
+
+    private static void StreamTextOnlyStillCompletes()
+    {
+        using var openaiSecret = new ResolvedProviderSecret("token");
+        var openai = Drain(new OpenAiResponsesAdapter(new ProviderHttpTransport(SseHandler(
+                "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n" +
+                "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"status\":\"completed\"}}\n\n")))
+            .StreamAsync(
+                ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false),
+                ProviderEndpoint.TryCreate("https://api.example.com", false, out _)!,
+                openaiSecret,
+                new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()),
+                CancellationToken.None));
+        AssertTrue(openai.Any(item => item.Kind == ModelRuntimeEventKind.Completed && item.Terminal), "OpenAI text-only stream did not complete.");
+
+        using var anthropicSecret = new ResolvedProviderSecret("token");
+        var anthropic = Drain(new AnthropicMessagesAdapter(new ProviderHttpTransport(SseHandler(
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" +
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n" +
+                "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n" +
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")))
+            .StreamAsync(
+                ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false),
+                ProviderEndpoint.TryCreate("https://api.anthropic.com", false, out _)!,
+                anthropicSecret,
+                new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()),
+                CancellationToken.None));
+        AssertTrue(anthropic.Any(item => item.Terminal), "Anthropic text-only stream did not complete.");
+
+        using var chatSecret = new ResolvedProviderSecret("token");
+        var chat = Drain(new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(SseHandler(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+                "data: [DONE]\n\n")))
+            .StreamAsync(
+                ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false),
+                ProviderEndpoint.TryCreate("https://api.example.com", false, out _)!,
+                chatSecret,
+                new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()),
+                CancellationToken.None));
+        AssertTrue(chat.Any(item => item.Kind == ModelRuntimeEventKind.Completed && item.Terminal), "Compatible Chat text-only stream did not complete.");
+    }
+
+    private static ScriptedHttpMessageHandler SseHandler(string sse) =>
+        new(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK);
+            response.Content = new StringContent(sse);
+            response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/event-stream");
+            return response;
+        });
 
     private static ModelCertificationRecord AnthropicThinkingProfile() =>
         CertificationFactory.Certified(

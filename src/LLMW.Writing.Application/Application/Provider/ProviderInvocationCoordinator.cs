@@ -190,8 +190,33 @@ public sealed class ProviderInvocationCoordinator
         if (command.ToolExecutor is not null &&
             outcome.ToolProposals.Any(item => item.MayExecute && item.Request is not null))
         {
+            if (command.Stream && string.IsNullOrWhiteSpace(outcome.ContinuationCaptureJson))
+            {
+                return outcome with
+                {
+                    Record = outcome.Record with
+                    {
+                        Lifecycle = InvocationLifecycle.Incomplete,
+                        FailureClass = InvocationFailureClass.IncompleteGeneration,
+                        RefusalText = "STREAMING_TOOLS_UNSUPPORTED"
+                    },
+                    StructuredOutputError = "STREAMING_TOOLS_UNSUPPORTED"
+                };
+            }
+
             if (command.ToolRound >= MaxToolRounds)
             {
+                if (outcome.Prompt is not null)
+                {
+                    Persist(
+                        command,
+                        outcome.Record.Snapshot,
+                        outcome.Prompt,
+                        outcome.Record,
+                        outcome.Record.Snapshot.CompiledSnapshotGeneration,
+                        CoordinatorInference.ToolLoopLimit);
+                }
+
                 return outcome with
                 {
                     Record = outcome.Record with
@@ -491,7 +516,7 @@ public sealed class ProviderInvocationCoordinator
         var usage = events.Aggregate(
             NormalizedUsage.Unknown,
             (prior, item) => item.Usage is null ? prior : NormalizedUsage.Merge(prior, item.Usage));
-        return terminal.Kind switch
+        var mapped = terminal.Kind switch
         {
             ModelRuntimeEventKind.Completed when tools.Count > 0 =>
                 new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, null, null, null, usage, tools, null, null, null, false),
@@ -512,6 +537,7 @@ public sealed class ProviderInvocationCoordinator
             _ => new ProviderInvokeResult(
                 InvocationLifecycle.Rejected, InvocationFailureClass.MalformedProtocol, events, null, null, null, usage, tools, null, null, terminal.ErrorCode, false)
         };
+        return mapped with { NativeContinuationCaptureJson = terminal.ContinuationCaptureJson ?? mapped.NativeContinuationCaptureJson };
     }
 
     private static bool ShouldRetry(InvocationRecord record, ProviderRetryPolicy policy) =>
@@ -874,7 +900,8 @@ public sealed class ProviderInvocationCoordinator
         ProviderInvocationSnapshot snapshot,
         PromptIr ir,
         InvocationRecord? record = null,
-        string? compiledSnapshotGeneration = null)
+        string? compiledSnapshotGeneration = null,
+        string? coordinatorInference = null)
     {
         var payload = snapshot.CanonicalJson();
         string? recordJson = null;
@@ -895,7 +922,7 @@ public sealed class ProviderInvocationCoordinator
                 command.AttemptId,
                 payload,
                 recordJson,
-                WriteRunIdentityDigest(snapshot, ir, generation),
+                WriteRunIdentityDigest(snapshot, ir, generation, coordinatorInference),
                 generation));
         }
         catch (IpcProtocolException)
@@ -908,7 +935,11 @@ public sealed class ProviderInvocationCoordinator
         }
     }
 
-    private static string WriteRunIdentityDigest(ProviderInvocationSnapshot snapshot, PromptIr ir, string snapshotGeneration)
+    private static string WriteRunIdentityDigest(
+        ProviderInvocationSnapshot snapshot,
+        PromptIr ir,
+        string snapshotGeneration,
+        string? coordinatorInference = null)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
@@ -920,6 +951,11 @@ public sealed class ProviderInvocationCoordinator
             writer.WriteString("providerId", snapshot.ProviderDefinitionId.Value);
             writer.WriteString("wireRequestDigest", snapshot.WireRequestDigest);
             writer.WriteString("snapshotGeneration", snapshotGeneration);
+            if (!string.IsNullOrWhiteSpace(coordinatorInference))
+            {
+                writer.WriteString("coordinatorInference", coordinatorInference);
+            }
+
             writer.WriteEndObject();
         }
 

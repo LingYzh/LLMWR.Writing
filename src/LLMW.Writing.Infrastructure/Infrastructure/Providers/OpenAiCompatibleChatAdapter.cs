@@ -103,6 +103,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             ["Authorization"] = "Bearer " + secret.Reveal()
         };
         var terminal = false;
+        var capture = new ChatStreamCapture();
         await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
             if (item.Failure is { } failure)
@@ -119,8 +120,16 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             var frame = item.Frame;
             if (string.Equals(frame.Data, "[DONE]", StringComparison.Ordinal))
             {
-                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, null, null, true);
-                terminal = true;
+                if (!terminal)
+                {
+                    foreach (var completed in ChatTerminalEvents(capture))
+                    {
+                        yield return completed;
+                    }
+
+                    terminal = true;
+                }
+
                 yield break;
             }
 
@@ -139,14 +148,41 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
 
                 foreach (var choice in choices.EnumerateArray())
                 {
-                    if (choice.TryGetProperty("delta", out var delta) && delta.TryGetProperty("content", out var content))
+                    if (choice.TryGetProperty("delta", out var delta))
                     {
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.TextDelta, content.GetString(), null, null, null, null, null, null, false);
+                        if (delta.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.String)
+                        {
+                            var text = content.GetString();
+                            capture.ContentDelta(text);
+                            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.TextDelta, text, null, null, null, null, null, null, false);
+                        }
+
+                        if (delta.TryGetProperty("reasoning_content", out var reasoning) && reasoning.ValueKind == JsonValueKind.String)
+                        {
+                            capture.ReasoningDelta(reasoning.GetString());
+                        }
+
+                        if (delta.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.ValueKind == JsonValueKind.Array)
+                        {
+                            foreach (var call in toolCalls.EnumerateArray())
+                            {
+                                capture.ToolDelta(call);
+                            }
+                        }
                     }
 
-                    if (choice.TryGetProperty("finish_reason", out var finish) && finish.ValueKind == JsonValueKind.String)
+                    if (choice.TryGetProperty("finish_reason", out var finish) &&
+                        finish.ValueKind == JsonValueKind.String &&
+                        !string.IsNullOrEmpty(finish.GetString()) &&
+                        !terminal)
                     {
+                        foreach (var completed in ChatTerminalEvents(capture))
+                        {
+                            yield return completed;
+                        }
+
                         terminal = true;
+                        yield break;
                     }
                 }
             }
@@ -156,6 +192,19 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         {
             yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, NormalizedUsage.Unknown, "eof-before-terminal", true);
         }
+    }
+
+    private static IEnumerable<ModelRuntimeEvent> ChatTerminalEvents(ChatStreamCapture capture)
+    {
+        foreach (var tool in capture.CompletedToolEvents())
+        {
+            yield return tool;
+        }
+
+        yield return new ModelRuntimeEvent(
+            ModelRuntimeEventKind.Completed,
+            null, null, null, null, null, null, null, true,
+            capture.CaptureJson());
     }
 
     internal static ProviderInvokeResult Parse(ProviderHttpResult http)

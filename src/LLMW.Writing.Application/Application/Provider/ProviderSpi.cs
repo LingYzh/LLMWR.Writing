@@ -629,15 +629,11 @@ public sealed class TaskCapabilityCertificationService
             var missingIdentity = string.IsNullOrWhiteSpace(candidate.DatasetId) ||
                                   string.IsNullOrWhiteSpace(candidate.DatasetVersion) ||
                                   string.IsNullOrWhiteSpace(candidate.EvaluationSuiteVersion);
-            var policyRejected = profile is not null &&
-                                 (!profile.CandidatePolicyMatches(candidate.Thresholds) ||
-                                  !profile.HasRequiredScores(candidate.Scores) ||
-                                  !profile.ScoresPass(candidate.Scores) ||
-                                  candidate.MaxReasoningCeiling > profile.MaxAllowedCeiling);
-            if (profile is null)
-            {
-                policyRejected = !candidate.PassesThresholds() || !candidate.HasCompleteRequiredMetrics();
-            }
+            var policyRejected = profile is null ||
+                                 !profile.CandidatePolicyMatches(candidate.Thresholds) ||
+                                 !profile.HasRequiredScores(candidate.Scores) ||
+                                 !profile.ScoresPass(candidate.Scores) ||
+                                 candidate.MaxReasoningCeiling > profile.MaxAllowedCeiling;
 
             if (policyRejected || missingIdentity || missingBaseline)
             {

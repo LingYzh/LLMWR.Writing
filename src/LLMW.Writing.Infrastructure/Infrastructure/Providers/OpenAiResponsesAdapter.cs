@@ -99,6 +99,7 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             ["Authorization"] = "Bearer " + secret.Reveal()
         };
         var terminal = false;
+        var capture = new OpenAiStreamCapture();
         await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
             if (item.Failure is { } failure)
@@ -137,21 +138,39 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
                     case "response.output_text.delta":
                         yield return new ModelRuntimeEvent(ModelRuntimeEventKind.TextDelta, Delta(document.RootElement), null, null, null, null, null, null, false);
                         break;
+                    case "response.output_item.added":
+                    case "response.output_item.done":
+                        if (document.RootElement.TryGetProperty("item", out var outputItem))
+                        {
+                            capture.OnOutputItem(outputItem);
+                        }
+
+                        break;
                     case "response.function_call_arguments.delta":
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallArgumentsDelta, null, Id(document.RootElement, "item_id"), null, Delta(document.RootElement), null, null, null, false);
+                        var deltaItemId = Id(document.RootElement, "item_id");
+                        var deltaText = Delta(document.RootElement);
+                        capture.ArgumentsDelta(deltaItemId, deltaText);
+                        yield return new ModelRuntimeEvent(
+                            ModelRuntimeEventKind.ToolCallArgumentsDelta,
+                            null,
+                            capture.CallIdFor(deltaItemId, document.RootElement),
+                            null,
+                            deltaText,
+                            null, null, null, false);
                         break;
                     case "response.function_call_arguments.done":
+                        var doneItemId = Id(document.RootElement, "item_id");
                         yield return new ModelRuntimeEvent(
                             ModelRuntimeEventKind.ToolCallCompleted,
                             null,
-                            Id(document.RootElement, "item_id"),
-                            document.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null,
+                            capture.CallIdFor(doneItemId, document.RootElement),
+                            capture.NameFor(doneItemId, document.RootElement),
                             null,
                             document.RootElement.TryGetProperty("arguments", out var a) ? a.GetString() : "{}",
                             null, null, false);
                         break;
                     case "response.incomplete":
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, null, "incomplete", true);
+                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, null, "incomplete", true, capture.CaptureJson());
                         terminal = true;
                         yield break;
                     case "response.failed":
@@ -160,7 +179,15 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
                         terminal = true;
                         yield break;
                     case "response.completed":
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, UsageNormalizer.FromOpenAi(document.RootElement.TryGetProperty("response", out var resp) ? resp : document.RootElement), null, true);
+                        capture.OnCompleted(document.RootElement);
+                        var usageRoot = document.RootElement.TryGetProperty("response", out var resp) ? resp : document.RootElement;
+                        yield return new ModelRuntimeEvent(
+                            ModelRuntimeEventKind.Completed,
+                            null, null, null, null, null,
+                            UsageNormalizer.FromOpenAi(usageRoot),
+                            null,
+                            true,
+                            capture.CaptureJson());
                         terminal = true;
                         yield break;
                     default:

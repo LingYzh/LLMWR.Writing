@@ -129,7 +129,16 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
         var result = await InvokeAsync(definition, endpoint, secret, request, cancellationToken).ConfigureAwait(false);
         foreach (var item in result.Events)
         {
-            yield return item;
+            if (item.Terminal &&
+                !string.IsNullOrWhiteSpace(result.NativeContinuationCaptureJson) &&
+                string.IsNullOrWhiteSpace(item.ContinuationCaptureJson))
+            {
+                yield return item with { ContinuationCaptureJson = result.NativeContinuationCaptureJson };
+            }
+            else
+            {
+                yield return item;
+            }
         }
     }
 }
