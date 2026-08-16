@@ -28,6 +28,7 @@ internal static class Program
             Wp11ContractTests.Run();
             Wp12ContractTests.Run();
             Wp13ContractTests.Run();
+            Wp14ContractTests.Run();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }

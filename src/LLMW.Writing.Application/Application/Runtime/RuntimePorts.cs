@@ -89,7 +89,8 @@ public enum RuntimeLinearizationGate
 {
     None,
     BeforeOversightActivationLock,
-    InsideOversightActivationLock
+    InsideOversightActivationLock,
+    BeforeProviderInvocationPersist
 }
 
 public interface IRuntimeLinearizationBarrier
