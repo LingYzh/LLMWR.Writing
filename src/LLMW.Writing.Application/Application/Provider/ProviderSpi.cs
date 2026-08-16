@@ -214,7 +214,8 @@ public sealed record ProviderNativeToolTurn(
     string CallId,
     string ToolName,
     string ArgumentsJson,
-    string ResultJson);
+    string ResultJson,
+    string? ErrorCode = null);
 
 public sealed record ProviderInvokeRequest(
     PromptIr Prompt,
@@ -223,7 +224,8 @@ public sealed record ProviderInvokeRequest(
     IReadOnlyDictionary<string, string> AdapterExtensions,
     string ClientRequestId = "",
     IReadOnlyList<ProviderNativeToolTurn>? ToolContinuation = null,
-    ModelCertificationRecord? ProtocolProfile = null);
+    ModelCertificationRecord? ProtocolProfile = null,
+    ProviderContinuationState? ContinuationState = null);
 
 public sealed record PreparedProviderRequest(
     string Method,
@@ -249,7 +251,8 @@ public sealed record ProviderInvokeResult(
     string? StructuredOutputJson,
     string? RefusalText,
     string? ErrorCode,
-    bool DuplicateExecutionRisk);
+    bool DuplicateExecutionRisk,
+    string? NativeContinuationCaptureJson = null);
 
 public interface IProviderProtocolAdapter
 {
@@ -277,6 +280,12 @@ public interface IProviderProtocolAdapter
         ResolvedProviderSecret secret,
         ProviderInvokeRequest request,
         CancellationToken cancellationToken);
+
+    ProviderContinuationState MergeContinuation(
+        ProviderContinuationState? prior,
+        string? captureJson,
+        IReadOnlyList<LocalToolExecutionResult> toolResults)
+        => ProviderContinuationState.AppendLegacyTurns(AdapterId, AdapterVersion, prior, toolResults);
 }
 
 public interface IProviderAdapterResolver
@@ -574,10 +583,7 @@ public sealed class MemoryTaskCertificationStore : ITaskCertificationStore
         }
     }
 
-    public void UpsertUncheckedForTests(TaskCapabilityCertification record)
-    {
-        Write(record);
-    }
+    internal void UpsertUncheckedForTests(TaskCapabilityCertification record) => Write(record);
 
     internal void Write(TaskCapabilityCertification record)
     {
@@ -599,36 +605,56 @@ public sealed class MemoryTaskCertificationStore : ITaskCertificationStore
 
 public sealed class TaskCapabilityCertificationService
 {
-    private readonly MemoryTaskCertificationStore store;
+    private readonly ITaskCertificationStore store;
+    private readonly MemoryTaskCertificationStore? writer;
 
-    public TaskCapabilityCertificationService(MemoryTaskCertificationStore store)
+    public TaskCapabilityCertificationService(ITaskCertificationStore store)
     {
-        this.store = store;
+        this.store = store ?? throw new ArgumentNullException(nameof(store));
+        writer = store as MemoryTaskCertificationStore;
     }
 
     public TaskCapabilityCertification Issue(TaskCapabilityCertification candidate)
     {
         ArgumentNullException.ThrowIfNull(candidate);
+        if (writer is null)
+        {
+            throw new InvalidOperationException("Certification Issue requires the application certification writer.");
+        }
+
         if (candidate.State == CertificationState.Certified)
         {
+            var profile = TaskCertificationPolicies.For(candidate.CertifiedTaskClasses, candidate.EvaluationSuiteVersion);
             var missingBaseline = string.IsNullOrWhiteSpace(candidate.PromptBaselineDigest);
             var missingIdentity = string.IsNullOrWhiteSpace(candidate.DatasetId) ||
                                   string.IsNullOrWhiteSpace(candidate.DatasetVersion) ||
                                   string.IsNullOrWhiteSpace(candidate.EvaluationSuiteVersion);
-            if (!candidate.PassesThresholds() ||
-                missingIdentity ||
-                missingBaseline ||
-                !candidate.HasCompleteRequiredMetrics())
+            var policyRejected = profile is not null &&
+                                 (!profile.CandidatePolicyMatches(candidate.Thresholds) ||
+                                  !profile.HasRequiredScores(candidate.Scores) ||
+                                  !profile.ScoresPass(candidate.Scores) ||
+                                  candidate.MaxReasoningCeiling > profile.MaxAllowedCeiling);
+            if (profile is null)
+            {
+                policyRejected = !candidate.PassesThresholds() || !candidate.HasCompleteRequiredMetrics();
+            }
+
+            if (policyRejected || missingIdentity || missingBaseline)
             {
                 candidate = candidate with
                 {
                     State = CertificationState.Uncertified,
-                    MaxReasoningCeiling = ReasoningCeiling.Conservative
+                    MaxReasoningCeiling = ReasoningCeiling.Conservative,
+                    Thresholds = profile?.Thresholds ?? candidate.Thresholds
                 };
+            }
+            else if (profile is not null)
+            {
+                candidate = candidate with { Thresholds = profile.Thresholds };
             }
         }
 
-        store.Write(candidate);
+        writer.Write(candidate);
         return candidate;
     }
 

@@ -40,6 +40,11 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
             return thinkingError;
         }
 
+        if (ValidateContinuation(request) is { } continuationError)
+        {
+            return continuationError;
+        }
+
         var path = Combine(endpoint.CanonicalUri, "/v1/messages").AbsolutePath;
         var body = BuildRequest(request, request.Stream);
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -278,7 +283,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 
             events.AddRange(AnthropicStop.ToEvents(stop, usage, tools.Count > 0));
             var mapped = AnthropicStop.ToResult(stop, usage, http, idResp, model, events, tools, completed);
-            return mapped;
+            return mapped with { NativeContinuationCaptureJson = content.GetRawText() };
         }
     }
 
@@ -308,34 +313,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
-            foreach (var turn in request.ToolContinuation ?? [])
-            {
-                writer.WriteStartObject();
-                writer.WriteString("role", "assistant");
-                writer.WritePropertyName("content");
-                writer.WriteStartArray();
-                writer.WriteStartObject();
-                writer.WriteString("type", "tool_use");
-                writer.WriteString("id", turn.CallId);
-                writer.WriteString("name", turn.ToolName);
-                writer.WritePropertyName("input");
-                WriteJsonOrString(writer, turn.ArgumentsJson);
-                writer.WriteEndObject();
-                writer.WriteEndArray();
-                writer.WriteEndObject();
-                writer.WriteStartObject();
-                writer.WriteString("role", "user");
-                writer.WritePropertyName("content");
-                writer.WriteStartArray();
-                writer.WriteStartObject();
-                writer.WriteString("type", "tool_result");
-                writer.WriteString("tool_use_id", turn.CallId);
-                writer.WriteString("content", turn.ResultJson);
-                writer.WriteEndObject();
-                writer.WriteEndArray();
-                writer.WriteEndObject();
-            }
-
+            WriteContinuation(writer, request);
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {
@@ -384,6 +362,139 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
         }
 
         return Encoding.UTF8.GetString(streamOut.ToArray());
+    }
+
+    public ProviderContinuationState MergeContinuation(
+        ProviderContinuationState? prior,
+        string? captureJson,
+        IReadOnlyList<LocalToolExecutionResult> toolResults)
+    {
+        return AdapterContinuation.Append(
+            AdapterId,
+            AdapterVersion,
+            prior,
+            writer =>
+            {
+                writer.WritePropertyName("content");
+                if (!string.IsNullOrWhiteSpace(captureJson))
+                {
+                    using var document = JsonDocument.Parse(captureJson);
+                    document.RootElement.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartArray();
+                    writer.WriteEndArray();
+                }
+
+                AdapterContinuation.WriteResults(writer, toolResults, "tool_use_id", "content");
+            },
+            toolResults.Select(item => item.CallId));
+    }
+
+    private ProviderPrepareResult? ValidateContinuation(ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state &&
+            (!string.Equals(state.AdapterId, AdapterId, StringComparison.Ordinal) ||
+             !string.Equals(state.AdapterVersion, AdapterVersion, StringComparison.Ordinal)))
+        {
+            return new ProviderPrepareResult(null, "CONTINUATION_ADAPTER_MISMATCH");
+        }
+
+        if (request.AdapterExtensions.ContainsKey("thinking") &&
+            request.Prompt.Tools.Count > 0 &&
+            request.ContinuationState is { } continuation &&
+            AdapterContinuation.HasTurns(continuation.OpaqueJson) &&
+            !AdapterContinuation.HasItemType(continuation.OpaqueJson, "content", "thinking") &&
+            !AdapterContinuation.HasItemType(continuation.OpaqueJson, "content", "redacted_thinking"))
+        {
+            return new ProviderPrepareResult(null, "THINKING_WITH_TOOLS_UNSUPPORTED");
+        }
+
+        return null;
+    }
+
+    private static void WriteContinuation(Utf8JsonWriter writer, ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state && AdapterContinuation.HasTurns(state.OpaqueJson))
+        {
+            using var document = JsonDocument.Parse(state.OpaqueJson);
+            foreach (var turn in document.RootElement.GetProperty("turns").EnumerateArray())
+            {
+                writer.WriteStartObject();
+                writer.WriteString("role", "assistant");
+                writer.WritePropertyName("content");
+                if (turn.TryGetProperty("content", out var content))
+                {
+                    content.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartArray();
+                    writer.WriteEndArray();
+                }
+
+                writer.WriteEndObject();
+                writer.WriteStartObject();
+                writer.WriteString("role", "user");
+                writer.WritePropertyName("content");
+                writer.WriteStartArray();
+                if (turn.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var result in results.EnumerateArray())
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteString("type", "tool_result");
+                        writer.WriteString("tool_use_id", result.GetProperty("tool_use_id").GetString() ?? "");
+                        writer.WriteString("content", result.TryGetProperty("content", out var text) ? text.GetString() ?? "" : "");
+                        if (result.TryGetProperty("is_error", out var error) && error.ValueKind == JsonValueKind.True)
+                        {
+                            writer.WriteBoolean("is_error", true);
+                        }
+
+                        writer.WriteEndObject();
+                    }
+                }
+
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+
+            return;
+        }
+
+        foreach (var turn in request.ToolContinuation ?? [])
+        {
+            writer.WriteStartObject();
+            writer.WriteString("role", "assistant");
+            writer.WritePropertyName("content");
+            writer.WriteStartArray();
+            writer.WriteStartObject();
+            writer.WriteString("type", "tool_use");
+            writer.WriteString("id", turn.CallId);
+            writer.WriteString("name", turn.ToolName);
+            writer.WritePropertyName("input");
+            WriteJsonOrString(writer, turn.ArgumentsJson);
+            writer.WriteEndObject();
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.WriteStartObject();
+            writer.WriteString("role", "user");
+            writer.WritePropertyName("content");
+            writer.WriteStartArray();
+            writer.WriteStartObject();
+            writer.WriteString("type", "tool_result");
+            writer.WriteString("tool_use_id", turn.CallId);
+            writer.WriteString("content", turn.ResultJson);
+            if (!string.IsNullOrEmpty(turn.ErrorCode))
+            {
+                writer.WriteBoolean("is_error", true);
+            }
+
+            writer.WriteEndObject();
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
     }
 
     private static ProviderPrepareResult? ValidateThinking(ProviderInvokeRequest request)

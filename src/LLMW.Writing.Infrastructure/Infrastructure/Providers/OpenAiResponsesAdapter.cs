@@ -28,6 +28,11 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request)
     {
         _ = definition;
+        if (ValidateContinuation(request) is { } continuationError)
+        {
+            return continuationError;
+        }
+
         var path = Combine(endpoint.CanonicalUri, "/v1/responses").AbsolutePath;
         var body = BuildRequest(request, request.Stream);
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -237,20 +242,21 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             var usage = UsageNormalizer.FromOpenAi(root);
             var model = root.TryGetProperty("model", out var m) ? m.GetString() : null;
             var id = root.TryGetProperty("id", out var rid) ? rid.GetString() : null;
+            var capture = root.TryGetProperty("output", out var captured) ? captured.GetRawText() : null;
             if (status == "incomplete")
             {
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, text, null, null, null, null, usage, "incomplete", true));
-                return new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, id, model, usage, tools, null, refusal, "incomplete", false);
+                return new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, id, model, usage, tools, null, refusal, "incomplete", false, capture);
             }
 
             if (refusal is not null)
             {
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Refusal, refusal, null, null, null, null, usage, "refusal", true));
-                return new ProviderInvokeResult(InvocationLifecycle.Rejected, InvocationFailureClass.ProviderRefusal, events, http.ProviderRequestId, id, model, usage, tools, null, refusal, "refusal", false);
+                return new ProviderInvokeResult(InvocationLifecycle.Rejected, InvocationFailureClass.ProviderRefusal, events, http.ProviderRequestId, id, model, usage, tools, null, refusal, "refusal", false, capture);
             }
 
             events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, text, null, null, null, null, usage, null, true));
-            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, id, model, usage, tools, null, null, null, false);
+            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, id, model, usage, tools, null, null, null, false, capture);
         }
     }
 
@@ -274,21 +280,7 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
-            foreach (var turn in request.ToolContinuation ?? [])
-            {
-                writer.WriteStartObject();
-                writer.WriteString("type", "function_call");
-                writer.WriteString("call_id", turn.CallId);
-                writer.WriteString("name", turn.ToolName);
-                writer.WriteString("arguments", turn.ArgumentsJson);
-                writer.WriteEndObject();
-                writer.WriteStartObject();
-                writer.WriteString("type", "function_call_output");
-                writer.WriteString("call_id", turn.CallId);
-                writer.WriteString("output", turn.ResultJson);
-                writer.WriteEndObject();
-            }
-
+            WriteContinuation(writer, request);
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {
@@ -343,6 +335,102 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
         }
 
         return Encoding.UTF8.GetString(streamOut.ToArray());
+    }
+
+    public ProviderContinuationState MergeContinuation(
+        ProviderContinuationState? prior,
+        string? captureJson,
+        IReadOnlyList<LocalToolExecutionResult> toolResults)
+    {
+        return AdapterContinuation.Append(
+            AdapterId,
+            AdapterVersion,
+            prior,
+            writer =>
+            {
+                writer.WritePropertyName("items");
+                if (!string.IsNullOrWhiteSpace(captureJson))
+                {
+                    using var document = JsonDocument.Parse(captureJson);
+                    document.RootElement.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartArray();
+                    writer.WriteEndArray();
+                }
+
+                AdapterContinuation.WriteResults(writer, toolResults, "call_id", "output");
+            },
+            toolResults.Select(item => item.CallId));
+    }
+
+    private ProviderPrepareResult? ValidateContinuation(ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state &&
+            (!string.Equals(state.AdapterId, AdapterId, StringComparison.Ordinal) ||
+             !string.Equals(state.AdapterVersion, AdapterVersion, StringComparison.Ordinal)))
+        {
+            return new ProviderPrepareResult(null, "CONTINUATION_ADAPTER_MISMATCH");
+        }
+
+        if (request.AdapterExtensions.ContainsKey("reasoningEffort") &&
+            request.Prompt.Tools.Count > 0 &&
+            request.ContinuationState is { } continuation &&
+            AdapterContinuation.HasTurns(continuation.OpaqueJson) &&
+            !AdapterContinuation.HasItemType(continuation.OpaqueJson, "items", "reasoning"))
+        {
+            return new ProviderPrepareResult(null, "THINKING_WITH_TOOLS_UNSUPPORTED");
+        }
+
+        return null;
+    }
+
+    private static void WriteContinuation(Utf8JsonWriter writer, ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state && AdapterContinuation.HasTurns(state.OpaqueJson))
+        {
+            using var document = JsonDocument.Parse(state.OpaqueJson);
+            foreach (var turn in document.RootElement.GetProperty("turns").EnumerateArray())
+            {
+                if (turn.TryGetProperty("items", out var items) && items.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in items.EnumerateArray())
+                    {
+                        item.WriteTo(writer);
+                    }
+                }
+
+                if (turn.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var result in results.EnumerateArray())
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteString("type", "function_call_output");
+                        writer.WriteString("call_id", result.GetProperty("call_id").GetString() ?? "");
+                        writer.WriteString("output", result.TryGetProperty("output", out var output) ? output.GetString() ?? "" : "");
+                        writer.WriteEndObject();
+                    }
+                }
+            }
+
+            return;
+        }
+
+        foreach (var turn in request.ToolContinuation ?? [])
+        {
+            writer.WriteStartObject();
+            writer.WriteString("type", "function_call");
+            writer.WriteString("call_id", turn.CallId);
+            writer.WriteString("name", turn.ToolName);
+            writer.WriteString("arguments", turn.ArgumentsJson);
+            writer.WriteEndObject();
+            writer.WriteStartObject();
+            writer.WriteString("type", "function_call_output");
+            writer.WriteString("call_id", turn.CallId);
+            writer.WriteString("output", string.IsNullOrEmpty(turn.ErrorCode) ? turn.ResultJson : "{\"error\":true,\"code\":\"" + turn.ErrorCode + "\"}");
+            writer.WriteEndObject();
+        }
     }
 
     private static ProviderInvokeResult Empty(ProviderHttpResult http) =>

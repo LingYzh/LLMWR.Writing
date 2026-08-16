@@ -36,6 +36,8 @@ internal static partial class Program
         Run(nameof(FalseMergeRateUsesMaximumComparator), FalseMergeRateUsesMaximumComparator);
         Run(nameof(MissingRootConflictMetricCannotPass), MissingRootConflictMetricCannotPass);
         Run(nameof(MissingPromptBaselineDigestIsIncompleteForCertifiedIssue), MissingPromptBaselineDigestIsIncompleteForCertifiedIssue);
+        Run(nameof(UsageTokenCountsSurviveSecretRedaction), UsageTokenCountsSurviveSecretRedaction);
+        Run(nameof(CompletedInvocationReplayIgnoresUsageKeyOrder), CompletedInvocationReplayIgnoresUsageKeyOrder);
     }
 
     private static PromptCompileRequest CompileRequest(
@@ -440,6 +442,47 @@ internal static partial class Program
                 missing.EvaluationSuiteVersion,
                 PromptCompiler.CurrentShippedCertificationBaselineDigest),
             "Certified task capability without a required PromptBaselineDigest must not match the shipped baseline.");
+    }
+
+    private static void UsageTokenCountsSurviveSecretRedaction()
+    {
+        var usage = new NormalizedUsage(
+            UsageStatus.Reported,
+            OptionalTokenCount.Reported(1),
+            OptionalTokenCount.Unknown,
+            OptionalTokenCount.Unknown,
+            OptionalTokenCount.Reported(11),
+            OptionalTokenCount.Unknown,
+            new Dictionary<string, long>(),
+            null).CanonicalJson();
+        var redacted = SecretRedaction.RedactObjectJson(usage);
+        AssertTrue(redacted.Contains("outputTokens", StringComparison.Ordinal), "Usage outputTokens was treated as a secret.");
+        AssertTrue(redacted.Contains("\"value\":11", StringComparison.Ordinal), "Reported output token count was lost.");
+        AssertTrue(!SecretRedaction.IsSecretPropertyName("outputTokens"), "outputTokens must not be treated as a secret property name.");
+        AssertTrue(SecretRedaction.IsSecretPropertyName("accessToken"), "accessToken must remain a secret property name.");
+    }
+
+    private static void CompletedInvocationReplayIgnoresUsageKeyOrder()
+    {
+        var usage = new NormalizedUsage(
+            UsageStatus.Reported,
+            OptionalTokenCount.Reported(1),
+            OptionalTokenCount.Unknown,
+            OptionalTokenCount.Unknown,
+            OptionalTokenCount.Reported(11),
+            OptionalTokenCount.Unknown,
+            new Dictionary<string, long>(),
+            null).CanonicalJson();
+        using var document = System.Text.Json.JsonDocument.Parse(usage);
+        var sortedUsage = CanonicalJson.Write(document.RootElement, redactSecrets: false);
+        var historical = "{\"lifecycle\":\"Completed\",\"failureClass\":\"None\",\"providerRequestId\":\"req-1\",\"usage\":" +
+                         sortedUsage + ",\"duplicateExecutionRisk\":false}";
+        var incoming = "{\"lifecycle\":\"Completed\",\"failureClass\":\"None\",\"providerRequestId\":\"req-1\",\"usage\":" +
+                       usage + ",\"duplicateExecutionRisk\":false}";
+        AssertEqual(
+            InvocationPersistDecision.IdempotentReplay,
+            InvocationPersistClassifier.Classify(null, null, historical, incoming),
+            "Canonical usage key order must not block exact terminal replay.");
     }
 
     private static TaskCapabilityCertification RootConflictCertification(decimal falseMergeRate) =>

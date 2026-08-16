@@ -22,7 +22,8 @@ public sealed record ModelInvocationCommand(
     int ToolRound = 0,
     string? ParentInvocationId = null,
     string? ContinuationKind = null,
-    IReadOnlyList<ProviderNativeToolTurn>? NativeToolTurns = null);
+    IReadOnlyList<ProviderNativeToolTurn>? NativeToolTurns = null,
+    ProviderContinuationState? ContinuationState = null);
 
 public sealed record ModelInvocationOutcome(
     InvocationRecord Record,
@@ -30,7 +31,8 @@ public sealed record ModelInvocationOutcome(
     IReadOnlyList<ModelRuntimeEvent> Events,
     IReadOnlyList<ToolProposalDecision> ToolProposals,
     string? StructuredOutputJson,
-    string? StructuredOutputError);
+    string? StructuredOutputError,
+    string? ContinuationCaptureJson = null);
 
 public sealed class ProviderInvocationCoordinator
 {
@@ -40,7 +42,7 @@ public sealed class ProviderInvocationCoordinator
     private readonly IProviderDefinitionStore definitions;
     private readonly IProviderCredentialResolver credentials;
     private readonly IModelCertificationStore protocolProfiles;
-    private readonly MemoryTaskCertificationStore taskCertifications;
+    private readonly ITaskCertificationStore taskCertifications;
     private readonly TaskCapabilityCertificationService taskCertService;
     private readonly IPriceSnapshotStore prices;
     private readonly IProviderAdapterResolver adapters;
@@ -58,7 +60,7 @@ public sealed class ProviderInvocationCoordinator
         IProviderAdapterResolver adapters,
         IProviderInvocationStatePort core,
         IModelCatalogStore? catalog = null,
-        MemoryTaskCertificationStore? taskCertifications = null,
+        ITaskCertificationStore? taskCertifications = null,
         TimeProvider? clock = null)
     {
         this.definitions = definitions;
@@ -186,25 +188,50 @@ public sealed class ProviderInvocationCoordinator
         }
 
         if (command.ToolExecutor is not null &&
-            command.ToolRound < MaxToolRounds &&
             outcome.ToolProposals.Any(item => item.MayExecute && item.Request is not null))
         {
-            var results = new List<(string CallId, string ToolName, string ResultJson)>();
+            if (command.ToolRound >= MaxToolRounds)
+            {
+                return outcome with
+                {
+                    Record = outcome.Record with
+                    {
+                        Lifecycle = InvocationLifecycle.Incomplete,
+                        FailureClass = InvocationFailureClass.IncompleteGeneration,
+                        RefusalText = "TOOL_LOOP_LIMIT"
+                    },
+                    StructuredOutputError = "TOOL_LOOP_LIMIT"
+                };
+            }
+
+            var executed = new List<LocalToolExecutionResult>();
             var turns = new List<ProviderNativeToolTurn>();
+            var results = new List<(string CallId, string ToolName, string ResultJson)>();
             foreach (var proposal in outcome.ToolProposals.Where(item => item.MayExecute && item.Request is not null))
             {
-                var executed = command.ToolExecutor.Execute(
+                var item = command.ToolExecutor.Execute(
                     proposal.Request!.ProviderCallId,
                     proposal.Request.ToolName,
                     proposal.Request.ArgumentsJson);
-                results.Add((executed.CallId, executed.ToolName, executed.ResultJson));
+                executed.Add(item);
+                results.Add((item.CallId, item.ToolName, item.ResultJson));
                 turns.Add(new ProviderNativeToolTurn(
-                    executed.CallId,
-                    executed.ToolName,
+                    item.CallId,
+                    item.ToolName,
                     proposal.Request.ArgumentsJson,
-                    executed.ResultJson));
+                    item.ResultJson,
+                    item.ErrorCode));
             }
 
+            var definition = definitions.FindById(outcome.Record.Snapshot.ProviderDefinitionId);
+            var adapter = definition is null ? null : adapters.Resolve(definition.ProtocolKind);
+            var continuation = adapter?.MergeContinuation(command.ContinuationState, outcome.ContinuationCaptureJson, executed)
+                               ?? ProviderContinuationState.AppendLegacyTurns(
+                                   outcome.Record.Snapshot.ProtocolAdapterId,
+                                   outcome.Record.Snapshot.ProtocolAdapterVersion,
+                                   command.ContinuationState,
+                                   executed);
+            var accumulatedTurns = (command.NativeToolTurns ?? []).Concat(turns).ToArray();
             var nextCompile = compileRequest with { ToolResults = results };
             var next = command with
             {
@@ -212,7 +239,8 @@ public sealed class ProviderInvocationCoordinator
                 ToolRound = command.ToolRound + 1,
                 ParentInvocationId = outcome.Record.Snapshot.InvocationId.Value,
                 ContinuationKind = InvocationContinuationKinds.ToolContinuation,
-                NativeToolTurns = turns,
+                NativeToolTurns = accumulatedTurns,
+                ContinuationState = continuation,
                 FallbackFromInvocationId = null,
                 FallbackReason = null
             };
@@ -263,7 +291,8 @@ public sealed class ProviderInvocationCoordinator
             ext,
             invocationId.Value,
             command.NativeToolTurns,
-            selected.Certification);
+            selected.Certification,
+            command.ContinuationState);
         var prepared = adapter.Prepare(definition, endpoint, invokeRequest);
         if (!prepared.Succeeded || prepared.Request is null)
         {
@@ -383,7 +412,7 @@ public sealed class ProviderInvocationCoordinator
                 invoked.RefusalText ?? invoked.ErrorCode,
                 hostedRejected);
             Persist(command, snapshot, ir, record);
-            return new ModelInvocationOutcome(record, ir, invoked.Events, tools, structured, structuredError);
+            return new ModelInvocationOutcome(record, ir, invoked.Events, tools, structured, structuredError, invoked.NativeContinuationCaptureJson);
         }
     }
 

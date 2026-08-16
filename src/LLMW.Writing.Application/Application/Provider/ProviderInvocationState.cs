@@ -5,6 +5,7 @@ using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Provider;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Domain.Security;
+using RuntimeTaskStatus = LLMW.Writing.Domain.Runtime.TaskStatus;
 
 namespace LLMW.Writing.Application.Provider;
 
@@ -58,17 +59,20 @@ public sealed class ProviderInvocationStateHandler
     private readonly RuntimeSchedulerService scheduler;
     private readonly IAuthorizationService? authorization;
     private readonly TimeProvider clock;
+    private readonly IRuntimeLinearizationBarrier linearization;
 
     public ProviderInvocationStateHandler(
         IRuntimePersistence store,
         RuntimeSchedulerService scheduler,
         IAuthorizationService? authorization = null,
-        TimeProvider? clock = null)
+        TimeProvider? clock = null,
+        IRuntimeLinearizationBarrier? linearization = null)
     {
         this.store = store;
         this.scheduler = scheduler;
         this.authorization = authorization;
         this.clock = clock ?? TimeProvider.System;
+        this.linearization = linearization ?? NoRuntimeLinearizationBarrier.Instance;
     }
 
     public GetTaskExecutionSnapshotResponse GetSnapshot(
@@ -144,6 +148,14 @@ public sealed class ProviderInvocationStateHandler
     {
         ArgumentNullException.ThrowIfNull(request);
         EnsureAgentBinding(request.RunId, principal, channel);
+        linearization.Enter(RuntimeLinearizationGate.BeforeProviderInvocationPersist);
+        PersistProviderInvocationResponse? response = null;
+        store.InTransaction(() => response = PersistLocked(request));
+        return response ?? throw new InvalidOperationException("checkpoint-persist-failed");
+    }
+
+    private PersistProviderInvocationResponse PersistLocked(PersistProviderInvocationRequest request)
+    {
         if (SecretRedaction.ContainsSecretMaterial(request.SnapshotJson) ||
             (!string.IsNullOrWhiteSpace(request.RecordJson) && SecretRedaction.ContainsSecretMaterial(request.RecordJson)))
         {
@@ -168,69 +180,52 @@ public sealed class ProviderInvocationStateHandler
                 "Attempt is not legal for this Task.");
         }
 
-        var payload = string.IsNullOrWhiteSpace(request.RecordJson) ? request.SnapshotJson : request.RecordJson;
-        var incomingIdentity = TrySnapshotIdentity(request.SnapshotJson);
-        var existingCheckpoints = store.CheckpointsForRun(request.RunId)
-            .OrderBy(item => item.CreatedAtMs)
-            .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
-            .ToArray();
-        CheckpointV1? latest = null;
-        string? historicalCheckpointId = null;
-        string? historicalIdentity = null;
-        string? historicalPayload = null;
-        var maxCreatedAtMs = long.MinValue;
-        foreach (var checkpoint in existingCheckpoints)
+        ProviderInvocationSnapshot? snapshot = null;
+        try
         {
-            try
-            {
-                var parsed = CanonicalJson.Parse(checkpoint.PayloadJson, checkpoint.SchemaVersion);
-                latest = parsed;
-                foreach (var item in parsed.InvocationLog)
-                {
-                    var parsedSnapshot = TryParseSnapshot(item);
-                    if (parsedSnapshot is not null && parsedSnapshot.CreatedAtMs > maxCreatedAtMs)
-                    {
-                        maxCreatedAtMs = parsedSnapshot.CreatedAtMs;
-                    }
-
-                    if (!ContainsInvocation(item, request.InvocationId))
-                    {
-                        continue;
-                    }
-
-                    historicalCheckpointId = checkpoint.CheckpointId;
-                    historicalPayload = item;
-                    historicalIdentity = parsedSnapshot?.CanonicalJson() ?? TrySnapshotIdentity(item);
-                }
-            }
-            catch (CheckpointSchemaException)
-            {
-                // Skip corrupt historical rows; Core remains the writer of a new bounded checkpoint.
-            }
+            snapshot = ProviderInvocationSnapshot.Parse(request.SnapshotJson);
+        }
+        catch (JsonException)
+        {
+            // Persistence still records the opaque safe payload.
         }
 
-        if (historicalIdentity is not null)
+        if (!string.IsNullOrWhiteSpace(request.SnapshotGeneration) &&
+            !string.IsNullOrWhiteSpace(snapshot?.CompiledSnapshotGeneration) &&
+            !string.Equals(request.SnapshotGeneration, snapshot.CompiledSnapshotGeneration, StringComparison.Ordinal))
         {
-            if (incomingIdentity is not null &&
-                !string.Equals(historicalIdentity, incomingIdentity, StringComparison.Ordinal))
-            {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvocationProvenanceConflict,
+                "Persist SnapshotGeneration does not match the compiled snapshot generation.");
+        }
+
+        var payload = string.IsNullOrWhiteSpace(request.RecordJson) ? request.SnapshotJson : request.RecordJson;
+        var incomingIdentity = snapshot?.CanonicalJson() ?? TrySnapshotIdentity(request.SnapshotJson);
+        var history = ReconstructHistory(request.RunId);
+        history.LatestById.TryGetValue(request.InvocationId, out var historical);
+        var decision = InvocationPersistClassifier.Classify(
+            historical?.Identity,
+            incomingIdentity,
+            historical?.Payload,
+            payload);
+        switch (decision)
+        {
+            case InvocationPersistDecision.IdempotentReplay:
+                return new PersistProviderInvocationResponse(historical?.CheckpointId ?? "", true);
+            case InvocationPersistDecision.IdentityConflict:
                 throw new ProviderInvocationDeniedException(
                     IpcErrorCodes.InvocationIdentityConflict,
                     "InvocationId was reused with a different immutable snapshot identity.");
-            }
-
-            var inWindow = latest is not null &&
-                           latest.InvocationLog.Any(item => ContainsInvocation(item, request.InvocationId));
-            if (!inWindow || string.Equals(historicalPayload, payload, StringComparison.Ordinal))
-            {
-                return new PersistProviderInvocationResponse(historicalCheckpointId ?? "", true);
-            }
+            case InvocationPersistDecision.LifecycleConflict:
+                throw new ProviderInvocationDeniedException(
+                    IpcErrorCodes.InvocationLifecycleConflict,
+                    "Invocation record refinement is not a legal forward lifecycle/provenance update.");
         }
 
         var log = new List<string>();
-        if (latest is not null)
+        if (history.LatestCheckpoint is not null)
         {
-            log.AddRange(latest.InvocationLog);
+            log.AddRange(history.LatestCheckpoint.InvocationLog);
         }
 
         var replaced = false;
@@ -252,20 +247,12 @@ public sealed class ProviderInvocationStateHandler
         }
 
         log = CheckpointV1.RetainLatestInvocations(log).ToList();
-        ProviderInvocationSnapshot? snapshot = null;
-        try
-        {
-            snapshot = ProviderInvocationSnapshot.Parse(request.SnapshotJson);
-        }
-        catch (JsonException)
-        {
-            // Persistence still records the opaque safe payload.
-        }
-
+        var isNewIdentity = decision == InvocationPersistDecision.NewIdentity;
+        var currentInvocationId = CurrentIdentityInvocationId(history, isNewIdentity ? request.InvocationId : null);
         var run = store.GetRun(request.RunId);
-        var incomingCreated = snapshot?.CreatedAtMs ?? long.MinValue;
-        var isCurrentIdentity = incomingCreated >= maxCreatedAtMs;
-        if (run is not null && snapshot is not null && isCurrentIdentity)
+        if (run is not null &&
+            snapshot is not null &&
+            string.Equals(currentInvocationId, request.InvocationId, StringComparison.Ordinal))
         {
             store.UpdateRun(run with
             {
@@ -278,7 +265,7 @@ public sealed class ProviderInvocationStateHandler
         }
 
         var claimedGeneration = request.SnapshotGeneration;
-        var inputDigests = (latest?.InputDigestSet ?? []).Where(item =>
+        var inputDigests = (history.LatestCheckpoint?.InputDigestSet ?? []).Where(item =>
             !item.StartsWith("snapshotGeneration:", StringComparison.Ordinal)).ToList();
         if (!string.IsNullOrWhiteSpace(claimedGeneration))
         {
@@ -292,6 +279,7 @@ public sealed class ProviderInvocationStateHandler
             digestJson = MergeSnapshotGeneration(digestJson, claimedGeneration);
         }
 
+        var latest = history.LatestCheckpoint;
         var checkpointV1 = CheckpointV1.Create(
             latest?.ApprovedPlanReference ?? "provider-invocation",
             latest?.ApprovedPlanDigest,
@@ -322,6 +310,94 @@ public sealed class ProviderInvocationStateHandler
 
         return new PersistProviderInvocationResponse(persisted.Value, false);
     }
+
+    private InvocationHistory ReconstructHistory(string runId)
+    {
+        var ordered = store.CheckpointsForRun(runId)
+            .OrderBy(item => item.CreatedAtMs)
+            .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
+            .ToArray();
+        var latestById = new Dictionary<string, HistoricalInvocation>(StringComparer.Ordinal);
+        var firstSeen = new Dictionary<string, (long CreatedAtMs, string CheckpointId)>(StringComparer.Ordinal);
+        CheckpointV1? latest = null;
+        foreach (var checkpoint in ordered)
+        {
+            try
+            {
+                var parsed = CanonicalJson.Parse(checkpoint.PayloadJson, checkpoint.SchemaVersion);
+                latest = parsed;
+                foreach (var item in parsed.InvocationLog)
+                {
+                    var invocationId = TryReadInvocationId(item);
+                    if (invocationId is null)
+                    {
+                        continue;
+                    }
+
+                    if (!firstSeen.ContainsKey(invocationId))
+                    {
+                        firstSeen[invocationId] = (checkpoint.CreatedAtMs, checkpoint.CheckpointId);
+                    }
+
+                    latestById[invocationId] = new HistoricalInvocation(
+                        invocationId,
+                        TryParseSnapshot(item)?.CanonicalJson() ?? TrySnapshotIdentity(item),
+                        item,
+                        checkpoint.CheckpointId);
+                }
+            }
+            catch (CheckpointSchemaException)
+            {
+                // Skip corrupt historical rows; Core remains the writer of a new bounded checkpoint.
+            }
+        }
+
+        return new InvocationHistory(latest, latestById, firstSeen);
+    }
+
+    private static string? CurrentIdentityInvocationId(InvocationHistory history, string? incomingNewInvocationId)
+    {
+        string? current = null;
+        var best = (CreatedAtMs: long.MinValue, CheckpointId: "");
+        foreach (var pair in history.FirstSeen)
+        {
+            if (pair.Value.CreatedAtMs > best.CreatedAtMs ||
+                (pair.Value.CreatedAtMs == best.CreatedAtMs &&
+                 string.CompareOrdinal(pair.Value.CheckpointId, best.CheckpointId) > 0))
+            {
+                best = pair.Value;
+                current = pair.Key;
+            }
+        }
+
+        return incomingNewInvocationId ?? current;
+    }
+
+    private static string? TryReadInvocationId(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return document.RootElement.TryGetProperty("invocationId", out var property)
+                ? property.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private sealed record HistoricalInvocation(
+        string InvocationId,
+        string? Identity,
+        string Payload,
+        string CheckpointId);
+
+    private sealed record InvocationHistory(
+        CheckpointV1? LatestCheckpoint,
+        Dictionary<string, HistoricalInvocation> LatestById,
+        Dictionary<string, (long CreatedAtMs, string CheckpointId)> FirstSeen);
 
     public AuthorizeToolProposalResponse Authorize(
         AuthorizeToolProposalRequest request,
@@ -399,6 +475,13 @@ public sealed class ProviderInvocationStateHandler
             return false;
         }
 
+        if (!TaskStatusCodec.TryParse(task.Status, out var taskStatus) ||
+            RuntimeLifecycle.IsTerminal(taskStatus) ||
+            taskStatus == RuntimeTaskStatus.Failed)
+        {
+            return false;
+        }
+
         if (!AttemptStatusCodec.TryParse(attempt.Status, out var status) ||
             status is not (AttemptStatus.Starting or AttemptStatus.Running))
         {
@@ -449,7 +532,7 @@ public sealed class ProviderInvocationStateHandler
     }
 
     private static bool ContainsInvocation(string json, string invocationId) =>
-        json.Contains("\"invocationId\":\"" + invocationId + "\"", StringComparison.Ordinal);
+        string.Equals(TryReadInvocationId(json), invocationId, StringComparison.Ordinal);
 
     private static ProviderInvocationSnapshot? TryParseSnapshot(string json)
     {

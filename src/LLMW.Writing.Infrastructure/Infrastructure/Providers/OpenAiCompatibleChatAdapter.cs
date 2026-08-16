@@ -36,6 +36,11 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             return new ProviderPrepareResult(null, "THINKING_WITH_TOOLS_UNSUPPORTED");
         }
 
+        if (ValidateContinuation(request) is { } continuationError)
+        {
+            return continuationError;
+        }
+
         var path = Combine(endpoint.CanonicalUri, "/v1/chat/completions").AbsolutePath;
         var body = BuildRequest(request, request.Stream);
         var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -206,7 +211,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             }
 
             events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, content, null, null, null, null, usage, null, true));
-            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, idResp, model, usage, tools, null, null, null, false);
+            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, idResp, model, usage, tools, null, null, null, false, message.GetRawText());
         }
     }
 
@@ -233,31 +238,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
-            foreach (var turn in request.ToolContinuation ?? [])
-            {
-                writer.WriteStartObject();
-                writer.WriteString("role", "assistant");
-                writer.WriteNull("content");
-                writer.WritePropertyName("tool_calls");
-                writer.WriteStartArray();
-                writer.WriteStartObject();
-                writer.WriteString("id", turn.CallId);
-                writer.WriteString("type", "function");
-                writer.WritePropertyName("function");
-                writer.WriteStartObject();
-                writer.WriteString("name", turn.ToolName);
-                writer.WriteString("arguments", turn.ArgumentsJson);
-                writer.WriteEndObject();
-                writer.WriteEndObject();
-                writer.WriteEndArray();
-                writer.WriteEndObject();
-                writer.WriteStartObject();
-                writer.WriteString("role", "tool");
-                writer.WriteString("tool_call_id", turn.CallId);
-                writer.WriteString("content", turn.ResultJson);
-                writer.WriteEndObject();
-            }
-
+            WriteContinuation(writer, request);
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {
@@ -298,6 +279,131 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         }
 
         return Encoding.UTF8.GetString(streamOut.ToArray());
+    }
+
+    public ProviderContinuationState MergeContinuation(
+        ProviderContinuationState? prior,
+        string? captureJson,
+        IReadOnlyList<LocalToolExecutionResult> toolResults)
+    {
+        return AdapterContinuation.Append(
+            AdapterId,
+            AdapterVersion,
+            prior,
+            writer =>
+            {
+                writer.WritePropertyName("message");
+                if (!string.IsNullOrWhiteSpace(captureJson))
+                {
+                    using var document = JsonDocument.Parse(captureJson);
+                    document.RootElement.WriteTo(writer);
+                }
+                else
+                {
+                    writer.WriteStartObject();
+                    writer.WriteEndObject();
+                }
+
+                AdapterContinuation.WriteResults(writer, toolResults, "tool_call_id", "content");
+            },
+            toolResults.Select(item => item.CallId));
+    }
+
+    private ProviderPrepareResult? ValidateContinuation(ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state &&
+            (!string.Equals(state.AdapterId, AdapterId, StringComparison.Ordinal) ||
+             !string.Equals(state.AdapterVersion, AdapterVersion, StringComparison.Ordinal)))
+        {
+            return new ProviderPrepareResult(null, "CONTINUATION_ADAPTER_MISMATCH");
+        }
+
+        if (request.AdapterExtensions.ContainsKey("thinking") &&
+            request.Prompt.Tools.Count > 0 &&
+            request.ContinuationState is { } continuation &&
+            AdapterContinuation.HasTurns(continuation.OpaqueJson) &&
+            !AdapterContinuation.HasMessageProperty(continuation.OpaqueJson, "reasoning_content"))
+        {
+            return new ProviderPrepareResult(null, "THINKING_WITH_TOOLS_UNSUPPORTED");
+        }
+
+        return null;
+    }
+
+    private static void WriteContinuation(Utf8JsonWriter writer, ProviderInvokeRequest request)
+    {
+        if (request.ContinuationState is { } state && AdapterContinuation.HasTurns(state.OpaqueJson))
+        {
+            using var document = JsonDocument.Parse(state.OpaqueJson);
+            foreach (var turn in document.RootElement.GetProperty("turns").EnumerateArray())
+            {
+                if (turn.TryGetProperty("message", out var message))
+                {
+                    message.WriteTo(writer);
+                }
+
+                if (turn.TryGetProperty("results", out var results) && results.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var result in results.EnumerateArray())
+                    {
+                        writer.WriteStartObject();
+                        writer.WriteString("role", "tool");
+                        writer.WriteString("tool_call_id", result.GetProperty("tool_call_id").GetString() ?? "");
+                        var content = result.TryGetProperty("content", out var text) ? text.GetString() ?? "" : "";
+                        if (result.TryGetProperty("is_error", out var error) && error.ValueKind == JsonValueKind.True)
+                        {
+                            var code = result.TryGetProperty("errorCode", out var err) ? err.GetString() : "error";
+                            writer.WriteString("content", "{\"error\":true,\"code\":\"" + (code ?? "error") + "\"}");
+                        }
+                        else
+                        {
+                            writer.WriteString("content", content);
+                        }
+
+                        writer.WriteEndObject();
+                    }
+                }
+            }
+
+            return;
+        }
+
+        var grouped = (request.ToolContinuation ?? []).ToArray();
+        if (grouped.Length == 0)
+        {
+            return;
+        }
+
+        writer.WriteStartObject();
+        writer.WriteString("role", "assistant");
+        writer.WriteNull("content");
+        writer.WritePropertyName("tool_calls");
+        writer.WriteStartArray();
+        foreach (var turn in grouped)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("id", turn.CallId);
+            writer.WriteString("type", "function");
+            writer.WritePropertyName("function");
+            writer.WriteStartObject();
+            writer.WriteString("name", turn.ToolName);
+            writer.WriteString("arguments", turn.ArgumentsJson);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+        foreach (var turn in grouped)
+        {
+            writer.WriteStartObject();
+            writer.WriteString("role", "tool");
+            writer.WriteString("tool_call_id", turn.CallId);
+            writer.WriteString("content", string.IsNullOrEmpty(turn.ErrorCode)
+                ? turn.ResultJson
+                : "{\"error\":true,\"code\":\"" + turn.ErrorCode + "\"}");
+            writer.WriteEndObject();
+        }
     }
 
     private static Uri Combine(string endpoint, string path)

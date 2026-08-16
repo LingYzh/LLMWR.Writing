@@ -41,7 +41,7 @@ internal static class Program
         IPriceSnapshotStore prices,
         IProviderAdapterResolver adapters,
         IModelCatalogStore? catalog = null,
-        MemoryTaskCertificationStore? taskCertifications = null) =>
+        ITaskCertificationStore? taskCertifications = null) =>
         ProviderInvocationRuntimeSeam.Create(
             session,
             proof,

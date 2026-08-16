@@ -85,6 +85,13 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
             }
 
             writer.WriteEndArray();
+            if (request.ContinuationState is not null)
+            {
+                writer.WriteString("continuationAdapter", request.ContinuationState.AdapterId);
+                writer.WriteString("continuationOpaqueDigest", Utf8Digest.Sha256Hex(request.ContinuationState.OpaqueJson));
+                writer.WriteNumber("continuationToolCalls", request.ContinuationState.NormalizedToolCallIds.Count);
+            }
+
             writer.WriteEndObject();
         }
 

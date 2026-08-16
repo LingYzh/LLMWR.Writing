@@ -30,6 +30,10 @@ internal static partial class Program
         Run(nameof(NativeToolContinuationIsProviderOwned), NativeToolContinuationIsProviderOwned);
         Run(nameof(AnthropicStreamMergesMessageStartUsage), AnthropicStreamMergesMessageStartUsage);
         Run(nameof(CompatibleChatThinkingWithToolsHonorsCapability), CompatibleChatThinkingWithToolsHonorsCapability);
+        Run(nameof(MultiRoundNativeContinuationRetainsPriorSubturns), MultiRoundNativeContinuationRetainsPriorSubturns);
+        Run(nameof(AnthropicParallelToolsStayOneAssistantTurn), AnthropicParallelToolsStayOneAssistantTurn);
+        Run(nameof(AnthropicToolErrorSetsIsError), AnthropicToolErrorSetsIsError);
+        Run(nameof(ChatThinkingContinuationWithoutReasoningContentFailsClosed), ChatThinkingContinuationWithoutReasoningContentFailsClosed);
     }
 
     private static PromptIr SampleIr(bool tools = false, int reserved = 64)
@@ -529,6 +533,99 @@ internal static partial class Program
         var allowed = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
             SampleIr(tools: true), new ModelId("m"), false, definition.AdapterExtensions, "inv", ProtocolProfile: certified));
         AssertTrue(allowed.Succeeded, "Certified thinking+tools continuation was hard-denied.");
+    }
+
+    private static void MultiRoundNativeContinuationRetainsPriorSubturns()
+    {
+        var adapter = new OpenAiResponsesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var capture1 = "[{\"type\":\"function_call\",\"call_id\":\"tool-a\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"a\\\"}\"}]";
+        var state1 = adapter.MergeContinuation(null, capture1, [new LocalToolExecutionResult("tool-a", "lookup", "{\"ok\":1}", null)]);
+        var capture2 = "[{\"type\":\"function_call\",\"call_id\":\"tool-b\",\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"b\\\"}\"}]";
+        var state2 = adapter.MergeContinuation(state1, capture2, [new LocalToolExecutionResult("tool-b", "lookup", "{\"ok\":2}", null)]);
+        var body = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
+            SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state2)).Request!.CanonicalSemanticBody;
+        AssertTrue(body.Contains("\"call_id\":\"tool-a\"", StringComparison.Ordinal), "OpenAI round 3 lost tool A.");
+        AssertTrue(body.Contains("\"call_id\":\"tool-b\"", StringComparison.Ordinal), "OpenAI round 3 lost tool B.");
+        AssertTrue(body.Contains("\"type\":\"function_call_output\"", StringComparison.Ordinal), "OpenAI function_call_output missing.");
+        AssertTrue(!body.Contains("previous_response_id", StringComparison.Ordinal), "OpenAI required previous_response_id.");
+        AssertTrue(!body.Contains("tool lookup result:", StringComparison.Ordinal), "Generic tool-result text injected.");
+    }
+
+    private static void AnthropicParallelToolsStayOneAssistantTurn()
+    {
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var capture = "[{\"type\":\"thinking\",\"thinking\":\"hidden\"},{\"type\":\"tool_use\",\"id\":\"A\",\"name\":\"lookup\",\"input\":{\"q\":\"a\"}},{\"type\":\"tool_use\",\"id\":\"B\",\"name\":\"lookup\",\"input\":{\"q\":\"b\"}}]";
+        var state = adapter.MergeContinuation(null, capture, [
+            new LocalToolExecutionResult("A", "lookup", "{\"ok\":true}", null),
+            new LocalToolExecutionResult("B", "lookup", "{\"ok\":true}", null)
+        ]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state)).Request!.CanonicalSemanticBody;
+        AssertTrue(body.Contains("\"type\":\"thinking\"", StringComparison.Ordinal), "Anthropic thinking block was not replayed.");
+        var assistantCount = 0;
+        var idx = 0;
+        while ((idx = body.IndexOf("\"role\":\"assistant\"", idx, StringComparison.Ordinal)) >= 0)
+        {
+            assistantCount++;
+            idx += 1;
+        }
+
+        AssertEqual(1, assistantCount, "Parallel tool_use was split into synthetic assistant turns.");
+        AssertTrue(body.Contains("\"tool_use_id\":\"A\"", StringComparison.Ordinal) && body.Contains("\"tool_use_id\":\"B\"", StringComparison.Ordinal),
+            "Anthropic tool_result ids did not match tool_use ids.");
+    }
+
+    private static void AnthropicToolErrorSetsIsError()
+    {
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var capture = "[{\"type\":\"tool_use\",\"id\":\"A\",\"name\":\"lookup\",\"input\":{}}]";
+        var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("A", "lookup", "{\"ok\":false}", "TOOL_FAILED")]);
+        var body = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: state)).Request!.CanonicalSemanticBody;
+        AssertTrue(body.Contains("\"is_error\":true", StringComparison.Ordinal), "Anthropic tool error was serialized as success text.");
+    }
+
+    private static void ChatThinkingContinuationWithoutReasoningContentFailsClosed()
+    {
+        var adapter = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create(
+            "p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m",
+            allowInsecureLocalHttp: false, extensions: new Dictionary<string, string> { ["thinking"] = "enabled" });
+        var certified = CertificationFactory.Certified(
+            definition.ProviderDefinitionId, definition.Revision, definition.Endpoint,
+            adapter.AdapterId, adapter.AdapterVersion, new ModelId("m"),
+            (ProtocolCapabilityNames.ThinkingWithTools, CapabilitySupport.Supported));
+        var capture = "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"A\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}";
+        var state = adapter.MergeContinuation(null, capture, [new LocalToolExecutionResult("A", "lookup", "{}", null)]);
+        var denied = adapter.Prepare(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, definition.AdapterExtensions, "inv", ProtocolProfile: certified, ContinuationState: state));
+        AssertTrue(!denied.Succeeded, "Chat thinking+tools continuation without reasoning_content was sent.");
+        AssertEqual("THINKING_WITH_TOOLS_UNSUPPORTED", denied.ErrorCode ?? "", "Chat thinking continuation fail-closed drifted.");
+
+        var chat = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var parallelCapture = "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"A\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"a\\\"}\"}},{\"id\":\"B\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\\\"b\\\"}\"}}]}";
+        var parallel = chat.MergeContinuation(null, parallelCapture, [
+            new LocalToolExecutionResult("A", "lookup", "{}", null),
+            new LocalToolExecutionResult("B", "lookup", "{}", null)
+        ]);
+        var chatDef = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var body = chat.Prepare(chatDef, ProviderEndpoint.TryCreate(chatDef.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", ContinuationState: parallel)).Request!.CanonicalSemanticBody;
+        var assistantCount = 0;
+        var idx = 0;
+        while ((idx = body.IndexOf("\"role\":\"assistant\"", idx, StringComparison.Ordinal)) >= 0)
+        {
+            assistantCount++;
+            idx += 1;
+        }
+
+        AssertEqual(1, assistantCount, "Parallel chat tool_calls were split into synthetic assistant turns.");
+        AssertTrue(body.Contains("\"tool_call_id\":\"A\"", StringComparison.Ordinal) && body.Contains("\"tool_call_id\":\"B\"", StringComparison.Ordinal),
+            "Chat tool messages lost call ids.");
     }
 
     private static ModelCertificationRecord AnthropicThinkingProfile() =>

@@ -40,6 +40,14 @@ internal static class Wp14ApplicationTests
         n += Check(nameof(PersistedSnapshotGenerationIsCoreGenerationNotInvocationId), PersistedSnapshotGenerationIsCoreGenerationNotInvocationId);
         n += Check(nameof(MissingPromptBaselineCannotCertifyAndMatchingBaselineRoutes), MissingPromptBaselineCannotCertifyAndMatchingBaselineRoutes);
         n += Check(nameof(AuthenticatedIpcTransportBindsRunSession), AuthenticatedIpcTransportBindsRunSession);
+        n += Check(nameof(RetentionRacePersistsI1TerminalRefinement), RetentionRacePersistsI1TerminalRefinement);
+        n += Check(nameof(SameMillisecondLaterI1DoesNotRollBackI2Identity), SameMillisecondLaterI1DoesNotRollBackI2Identity);
+        n += Check(nameof(ConcurrentPersistLinearizesCurrentIdentity), ConcurrentPersistLinearizesCurrentIdentity);
+        n += Check(nameof(SnapshotGenerationMismatchIsProvenanceConflict), SnapshotGenerationMismatchIsProvenanceConflict);
+        n += Check(nameof(TerminalTaskWithRunningAttemptIsIllegal), TerminalTaskWithRunningAttemptIsIllegal);
+        n += Check(nameof(ToolLoopLimitIsIncompleteNotCompleted), ToolLoopLimitIsIncompleteNotCompleted);
+        n += Check(nameof(CertificationPolicyIgnoresWeakCandidateThresholds), CertificationPolicyIgnoresWeakCandidateThresholds);
+        n += Check(nameof(CoordinatorMultiRoundRetainsPriorToolTurns), CoordinatorMultiRoundRetainsPriorToolTurns);
         return n;
     }
 
@@ -342,7 +350,8 @@ internal static class Wp14ApplicationTests
                  {
                      "run-cfg", "run-cfg-2", "run-sec", "run-pin", "run-fb", "run-replan", "run-stale", "run-usage",
                      "run-hist", "run-retry", "run-bound", "run-catalog", "run-ceil", "run-idemp", "run-fence",
-                     "run-attempt", "run-cert", "run-cross-a", "run-cross-b", "run-gen"
+                     "run-attempt", "run-cert", "run-cross-a", "run-cross-b", "run-gen",
+                     "run-refine", "run-order", "run-race", "run-legal", "run-loop", "run-ms", "run-tools"
                  })
         {
             Success(scheduler.CreateRun("wf-14", "writer", null, run));
@@ -856,6 +865,444 @@ internal static class Wp14ApplicationTests
             baseline,
             CertificationState.Certified,
             1);
+
+    private static void RetentionRacePersistsI1TerminalRefinement()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-refine")!;
+        const string run = "run-refine";
+        const string task = "task-refine";
+        var first = InvocationSnap("inv-1", run, task, 1_000, "old-digest");
+        _ = handler.Persist(
+            new PersistProviderInvocationRequest("inv-1", run, task, AttemptId(task), first.CanonicalJson(), null, "{}", "g1"),
+            principal,
+            harness.Identity.Channel);
+        for (var i = 2; i <= 10; i++)
+        {
+            var snap = InvocationSnap("inv-" + i, run, task, 1_000 + i, "new-digest");
+            _ = handler.Persist(
+                new PersistProviderInvocationRequest(snap.InvocationId.Value, run, task, AttemptId(task), snap.CanonicalJson(), null, "{}", "g" + i),
+                principal,
+                harness.Identity.Channel);
+        }
+
+        AssertEqual("new-digest", harness.Store.GetRun(run)!.EffectivePromptDigest, "Current identity was not I10.");
+        var before = harness.Store.CheckpointsForRun(run).Count;
+        var completed = CompletedPayload(first, "req-1", "resp-1", 11);
+        var refined = handler.Persist(
+            new PersistProviderInvocationRequest("inv-1", run, task, AttemptId(task), first.CanonicalJson(), completed, "{}", "g1"),
+            principal,
+            harness.Identity.Channel);
+        AssertTrue(!refined.IdempotentReplay, "I1 terminal refinement was mistaken for replay.");
+        AssertTrue(harness.Store.CheckpointsForRun(run).Count > before, "I1 terminal refinement was not persisted.");
+        AssertEqual("new-digest", harness.Store.GetRun(run)!.EffectivePromptDigest, "I1 refinement rolled back Run identity.");
+        var discovered = DiscoverInvocations(harness.Store, run);
+        AssertTrue(discovered.Contains("inv-1"), "I1 provenance was lost.");
+        AssertTrue(discovered.Contains("inv-10"), "I10 provenance was overwritten by I1 prefix match.");
+        AssertTrue(LatestLogHasInvocation(harness.Store, run, "inv-10"), "I1 refinement replaced I10 in the working window.");
+        AssertTrue(LatestLogHasInvocation(harness.Store, run, "inv-1"), "I1 terminal record was not in the working window.");
+        var replayBefore = harness.Store.CheckpointsForRun(run).Count;
+        var replay = handler.Persist(
+            new PersistProviderInvocationRequest("inv-1", run, task, AttemptId(task), first.CanonicalJson(), completed, "{}", "g1"),
+            principal,
+            harness.Identity.Channel);
+        AssertTrue(replay.IdempotentReplay, "Exact terminal I1 replay was not idempotent.");
+        AssertEqual(replayBefore, harness.Store.CheckpointsForRun(run).Count, "Exact terminal I1 replay wrote a checkpoint.");
+        var conflicting = CompletedPayload(first, "req-1", "resp-1", 11, "Incomplete");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-1", run, task, AttemptId(task), first.CanonicalJson(), conflicting, "{}", "g1"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationLifecycleConflict,
+            "Conflicting terminal I1 truth was accepted.");
+    }
+
+    private static void SameMillisecondLaterI1DoesNotRollBackI2Identity()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-ms")!;
+        const string run = "run-ms";
+        const string task = "task-ms";
+        var i1 = InvocationSnap("inv-ms-1", run, task, 5_000, "digest-1");
+        var i2 = InvocationSnap("inv-ms-2", run, task, 5_000, "digest-2");
+        _ = handler.Persist(
+            new PersistProviderInvocationRequest("inv-ms-1", run, task, AttemptId(task), i1.CanonicalJson(), null, "{}", "g1"),
+            principal,
+            harness.Identity.Channel);
+        _ = handler.Persist(
+            new PersistProviderInvocationRequest("inv-ms-2", run, task, AttemptId(task), i2.CanonicalJson(), null, "{}", "g2"),
+            principal,
+            harness.Identity.Channel);
+        AssertEqual("digest-2", harness.Store.GetRun(run)!.EffectivePromptDigest, "I2 was not current after same-ms create.");
+        _ = handler.Persist(
+            new PersistProviderInvocationRequest("inv-ms-2", run, task, AttemptId(task), i2.CanonicalJson(), CompletedPayload(i2, "r2", "s2", 7), "{}", "g2"),
+            principal,
+            harness.Identity.Channel);
+        _ = handler.Persist(
+            new PersistProviderInvocationRequest("inv-ms-1", run, task, AttemptId(task), i1.CanonicalJson(), CompletedPayload(i1, "r1", "s1", 3), "{}", "g1"),
+            principal,
+            harness.Identity.Channel);
+        AssertEqual("digest-2", harness.Store.GetRun(run)!.EffectivePromptDigest, "Completing I1 after I2 rolled back identity.");
+        var ids = DiscoverInvocations(harness.Store, run);
+        AssertTrue(ids.Contains("inv-ms-1") && ids.Contains("inv-ms-2"), "Same-ms history was not discoverable.");
+    }
+
+    private static void ConcurrentPersistLinearizesCurrentIdentity()
+    {
+        var harness = Harness();
+        using var barrier = new ManualRuntimeLinearizationBarrier(RuntimeLinearizationGate.BeforeProviderInvocationPersist);
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler, linearization: barrier);
+        var principal = harness.Identity.PrincipalFor("run-race")!;
+        const string run = "run-race";
+        const string task = "task-race";
+        var i1 = InvocationSnap("inv-race-1", run, task, 9_000, "digest-a");
+        var i2 = InvocationSnap("inv-race-2", run, task, 9_000, "digest-b");
+        Exception? error1 = null;
+        Exception? error2 = null;
+        barrier.Arm();
+        var thread1 = new Thread(() =>
+        {
+            try
+            {
+                _ = handler.Persist(
+                    new PersistProviderInvocationRequest("inv-race-1", run, task, AttemptId(task), i1.CanonicalJson(), null, "{}", "g1"),
+                    principal,
+                    harness.Identity.Channel);
+            }
+            catch (Exception exception)
+            {
+                error1 = exception;
+            }
+        })
+        { IsBackground = true };
+        thread1.Start();
+        barrier.WaitUntilEntered();
+        var thread2 = new Thread(() =>
+        {
+            try
+            {
+                _ = handler.Persist(
+                    new PersistProviderInvocationRequest("inv-race-2", run, task, AttemptId(task), i2.CanonicalJson(), null, "{}", "g2"),
+                    principal,
+                    harness.Identity.Channel);
+            }
+            catch (Exception exception)
+            {
+                error2 = exception;
+            }
+        })
+        { IsBackground = true };
+        thread2.Start();
+        barrier.Release();
+        if (!thread1.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs) ||
+            !thread2.Join(ManualRuntimeLinearizationBarrier.DefaultTimeoutMs))
+        {
+            throw new TimeoutException("Concurrent persist threads did not finish.");
+        }
+
+        AssertTrue(error1 is null && error2 is null, "Concurrent persist failed: " + (error1 ?? error2));
+        var current = harness.Store.GetRun(run)!.EffectivePromptDigest;
+        AssertTrue(current is "digest-a" or "digest-b", "Current identity was lost.");
+        var ids = DiscoverInvocations(harness.Store, run);
+        AssertTrue(ids.Contains("inv-race-1") && ids.Contains("inv-race-2"), "Raced invocations were not both discoverable.");
+        var reloaded = harness.Store.GetRun(run)!.EffectivePromptDigest;
+        AssertEqual(current, reloaded, "Reloaded current identity drifted.");
+    }
+
+    private static void SnapshotGenerationMismatchIsProvenanceConflict()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        var principal = harness.Identity.PrincipalFor("run-gen")!;
+        var snap = InvocationSnap("inv-gfake", "run-gen", "task-gen", 4_000, "digest", "G1");
+        AssertDenied(
+            () => handler.Persist(
+                new PersistProviderInvocationRequest("inv-gfake", "run-gen", "task-gen", AttemptId("task-gen"), snap.CanonicalJson(), null, "{}", "Gfake"),
+                principal,
+                harness.Identity.Channel),
+            IpcErrorCodes.InvocationProvenanceConflict,
+            "Mismatched SnapshotGeneration was accepted.");
+    }
+
+    private static void TerminalTaskWithRunningAttemptIsIllegal()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler);
+        harness.Store.UpdateTaskStatus("task-legal", TaskStatusCodec.ToDurableValue(LLMW.Writing.Domain.Runtime.TaskStatus.Cancelled), 11_000);
+        var snapshot = handler.GetSnapshot(
+            new GetTaskExecutionSnapshotRequest("run-legal", "task-legal", AttemptId("task-legal")),
+            harness.Identity.PrincipalFor("run-legal"),
+            harness.Identity.Channel);
+        AssertTrue(!snapshot.AttemptLegal, "Cancelled Task with Starting Attempt was treated as legal.");
+    }
+
+    private static void ToolLoopLimitIsIncompleteNotCompleted()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler, new AllowAllAuth());
+        var calls = 0;
+        var adapter = new ScriptedProtocolAdapter(
+            ProtocolKind.OpenAiResponses, "scripted", "v1",
+            _ =>
+            {
+                calls++;
+                var id = "call-" + calls;
+                return new ProviderInvokeResult(
+                    InvocationLifecycle.Completed, InvocationFailureClass.None,
+                    [new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallCompleted, null, id, "lookup", null, "{\"q\":\"a\"}", null, null, false)],
+                    "req", "resp", "m1", NormalizedUsage.Unknown,
+                    [new ToolCallRequest(id, "lookup", "{\"q\":\"a\"}")],
+                    null, null, null, false);
+            });
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        harness.Certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported)));
+        var coordinator = new ProviderInvocationCoordinator(
+            harness.Definitions, harness.Credentials, harness.Certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(handler, harness.Identity),
+            catalog: harness.Catalog,
+            taskCertifications: harness.TaskCertifications);
+        var outcome = coordinator.Invoke(Command(harness, "run-loop", "task-loop", tools: true) with
+        {
+            ToolExecutor = new RecordingToolExecutor()
+        });
+        AssertEqual(InvocationLifecycle.Incomplete, outcome.Record.Lifecycle, "Tool loop limit returned ordinary Completed.");
+        AssertEqual("TOOL_LOOP_LIMIT", outcome.Record.RefusalText ?? outcome.StructuredOutputError, "Tool loop limit was not typed.");
+        AssertTrue(calls > ProviderInvocationCoordinator.MaxToolRounds, "Coordinator stopped before the tool-round ceiling.");
+    }
+
+    private static void CertificationPolicyIgnoresWeakCandidateThresholds()
+    {
+        var service = new TaskCapabilityCertificationService(new MemoryTaskCertificationStore());
+        var weak = RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive) with
+        {
+            Scores =
+            [
+                new TaskEvalScore(RootConflictMetrics.RootRecall, 0.95m),
+                new TaskEvalScore(RootConflictMetrics.FalseMergeRate, 0.50m),
+                new TaskEvalScore(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ],
+            Thresholds =
+            [
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RootRecall, 0.9m),
+                TaskEvalThreshold.AtMost(RootConflictMetrics.FalseMergeRate, 1.00m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ]
+        };
+        AssertEqual(CertificationState.Uncertified, service.Issue(weak).State, "Candidate bound=1.00 certified FalseMergeRate=0.50.");
+
+        var wrongComparator = RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive) with
+        {
+            Thresholds =
+            [
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RootRecall, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.FalseMergeRate, 0.05m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ]
+        };
+        AssertEqual(CertificationState.Uncertified, service.Issue(wrongComparator).State, "Wrong FalseMergeRate comparator certified.");
+
+        var missing = RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive) with
+        {
+            Scores = RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive)
+                .Scores.Where(item => item.MetricName != RootConflictMetrics.EvidenceFidelity).ToArray()
+        };
+        AssertEqual(CertificationState.Uncertified, service.Issue(missing).State, "Missing required metric certified.");
+
+        var valid = service.Issue(RootConflictCert(PromptCompiler.CurrentShippedCertificationBaselineDigest, ReasoningCeiling.Adaptive));
+        AssertEqual(CertificationState.Certified, valid.State, "Valid scores against authoritative profile did not certify.");
+    }
+
+    private static void CoordinatorMultiRoundRetainsPriorToolTurns()
+    {
+        var harness = Harness();
+        var handler = new ProviderInvocationStateHandler(harness.Store, harness.Scheduler, new AllowAllAuth());
+        ProviderInvokeRequest? last = null;
+        var round = 0;
+        var adapter = new ScriptedProtocolAdapter(
+            ProtocolKind.OpenAiResponses, "scripted", "v1",
+            request =>
+            {
+                last = request;
+                round++;
+                if (round >= 3)
+                {
+                    return new ProviderInvokeResult(
+                        InvocationLifecycle.Completed, InvocationFailureClass.None,
+                        [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, "done", null, null, null, null, NormalizedUsage.Unknown, null, true)],
+                        "req", "resp", "m1", NormalizedUsage.Unknown, [], null, null, null, false);
+                }
+
+                var id = round == 1 ? "tool-a" : "tool-b";
+                return new ProviderInvokeResult(
+                    InvocationLifecycle.Completed, InvocationFailureClass.None,
+                    [new ModelRuntimeEvent(ModelRuntimeEventKind.ToolCallCompleted, null, id, "lookup", null, "{\"q\":\"" + id + "\"}", null, null, false)],
+                    "req", "resp", "m1", NormalizedUsage.Unknown,
+                    [new ToolCallRequest(id, "lookup", "{\"q\":\"" + id + "\"}")],
+                    null, null, null, false);
+            });
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        harness.Certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported)));
+        var coordinator = new ProviderInvocationCoordinator(
+            harness.Definitions, harness.Credentials, harness.Certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(handler, harness.Identity),
+            catalog: harness.Catalog,
+            taskCertifications: harness.TaskCertifications);
+        var outcome = coordinator.Invoke(Command(harness, "run-tools", "task-tools", tools: true) with
+        {
+            ToolExecutor = new RecordingToolExecutor()
+        });
+        AssertEqual(InvocationLifecycle.Completed, outcome.Record.Lifecycle, "Three-round tool loop failed.");
+        AssertTrue(last is not null, "Final request was missing.");
+        AssertTrue(last!.ContinuationState is not null && last.ContinuationState.NormalizedToolCallIds.Contains("tool-a") &&
+                   last.ContinuationState.NormalizedToolCallIds.Contains("tool-b"),
+            "Round 3 continuation lost tool A or B.");
+        AssertTrue((last.ToolContinuation?.Count ?? 0) >= 2 || last.ContinuationState!.NormalizedToolCallIds.Count >= 2,
+            "Round 3 dropped prior tool history.");
+    }
+
+    private static bool LatestLogHasInvocation(MemoryRuntimeStore store, string runId, string invocationId)
+    {
+        var latest = store.CheckpointsForRun(runId)
+            .OrderBy(item => item.CreatedAtMs)
+            .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
+            .LastOrDefault();
+        if (latest is null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var parsed = CanonicalJson.Parse(latest.PayloadJson, latest.SchemaVersion);
+            foreach (var item in parsed.InvocationLog)
+            {
+                using var document = System.Text.Json.JsonDocument.Parse(item);
+                if (document.RootElement.TryGetProperty("invocationId", out var id) &&
+                    string.Equals(id.GetString(), invocationId, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+        catch (CheckpointSchemaException)
+        {
+        }
+
+        return false;
+    }
+
+    private static HashSet<string> DiscoverInvocations(MemoryRuntimeStore store, string runId)
+    {
+        var ids = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var checkpoint in store.CheckpointsForRun(runId))
+        {
+            try
+            {
+                var parsed = CanonicalJson.Parse(checkpoint.PayloadJson, checkpoint.SchemaVersion);
+                foreach (var item in parsed.InvocationLog)
+                {
+                    using var document = System.Text.Json.JsonDocument.Parse(item);
+                    if (document.RootElement.TryGetProperty("invocationId", out var id) && id.GetString() is { } value)
+                    {
+                        ids.Add(value);
+                    }
+                }
+            }
+            catch (CheckpointSchemaException)
+            {
+            }
+        }
+
+        return ids;
+    }
+
+    private static string CompletedPayload(
+        ProviderInvocationSnapshot snapshot,
+        string requestId,
+        string responseId,
+        long outputTokens,
+        string lifecycle = "Completed")
+    {
+        using var document = System.Text.Json.JsonDocument.Parse(snapshot.CanonicalJson());
+        using var stream = new MemoryStream();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                property.WriteTo(writer);
+            }
+
+            writer.WriteString("lifecycle", lifecycle);
+            writer.WriteString("failureClass", lifecycle == "Completed" ? "None" : "IncompleteGeneration");
+            writer.WriteString("providerRequestId", requestId);
+            writer.WriteString("providerResponseId", responseId);
+            writer.WriteString("providerReportedModel", snapshot.EffectiveModelId.Value);
+            writer.WritePropertyName("usage");
+            using (var usage = System.Text.Json.JsonDocument.Parse(
+                       new NormalizedUsage(
+                           UsageStatus.Reported,
+                           OptionalTokenCount.Reported(1),
+                           OptionalTokenCount.Unknown,
+                           OptionalTokenCount.Unknown,
+                           OptionalTokenCount.Reported(outputTokens),
+                           OptionalTokenCount.Unknown,
+                           new Dictionary<string, long>(),
+                           null).CanonicalJson()))
+            {
+                usage.RootElement.WriteTo(writer);
+            }
+
+            writer.WriteBoolean("duplicateExecutionRisk", false);
+            writer.WriteEndObject();
+        }
+
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+    }
+
+    private sealed class AllowAllAuth : IAuthorizationService
+    {
+        public CapabilityDecision Authorize(CallerPrincipal? principal, AuthorizationRequest request) =>
+            new(
+                request.Capability,
+                principal?.Kind ?? PrincipalKind.AgentRun,
+                CapabilityDecisionKind.Allowed,
+                [CapabilityDecisionReason.Allowed],
+                principal?.Role,
+                RoleCapabilityLevel.Allowed,
+                SecurityScopeClassification.InScope,
+                HardDenied: false);
+    }
+
+    private sealed class RecordingToolExecutor : ILocalToolExecutor
+    {
+        public LocalToolExecutionResult Execute(string callId, string toolName, string argumentsJson) =>
+            new(callId, toolName, "{\"ok\":true}", null);
+    }
 
     private static void AssertDenied(Action action, string code, string message)
     {

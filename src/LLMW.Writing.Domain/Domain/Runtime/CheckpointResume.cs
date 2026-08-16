@@ -177,6 +177,11 @@ public static class SecretRedaction
             return true;
         }
 
+        if (IsUsageCountPropertyName(name))
+        {
+            return false;
+        }
+
         return name.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("token", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("password", StringComparison.OrdinalIgnoreCase) ||
@@ -184,6 +189,10 @@ public static class SecretRedaction
                name.Contains("apiKey", StringComparison.OrdinalIgnoreCase) ||
                name.Contains("opaque", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsUsageCountPropertyName(string name) =>
+        name.EndsWith("Tokens", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(name, "max_tokens", StringComparison.OrdinalIgnoreCase);
 }
 
 public static class CanonicalJson

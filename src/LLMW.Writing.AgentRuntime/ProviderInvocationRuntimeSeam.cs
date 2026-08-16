@@ -20,7 +20,7 @@ internal static class ProviderInvocationRuntimeSeam
         IPriceSnapshotStore prices,
         IProviderAdapterResolver adapters,
         IModelCatalogStore? catalog = null,
-        MemoryTaskCertificationStore? taskCertifications = null) =>
+        ITaskCertificationStore? taskCertifications = null) =>
         ProviderRuntimeComposition.Create(
             session,
             proof,

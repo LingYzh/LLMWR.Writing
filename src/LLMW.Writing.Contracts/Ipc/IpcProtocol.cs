@@ -218,6 +218,8 @@ public static class IpcErrorCodes
     public const string SpecialistIdentityMismatch = "SPECIALIST_IDENTITY_MISMATCH";
     public const string ProviderSecretForbidden = "PROVIDER_SECRET_FORBIDDEN";
     public const string InvocationIdentityConflict = "INVOCATION_IDENTITY_CONFLICT";
+    public const string InvocationLifecycleConflict = "INVOCATION_LIFECYCLE_CONFLICT";
+    public const string InvocationProvenanceConflict = "INVOCATION_PROVENANCE_CONFLICT";
 }
 
 public static class IpcServerCapabilities

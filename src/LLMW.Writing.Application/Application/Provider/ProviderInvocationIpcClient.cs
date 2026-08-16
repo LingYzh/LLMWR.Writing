@@ -202,7 +202,7 @@ public static class ProviderRuntimeComposition
         IPriceSnapshotStore prices,
         IProviderAdapterResolver adapters,
         IModelCatalogStore? catalog = null,
-        MemoryTaskCertificationStore? taskCertifications = null,
+        ITaskCertificationStore? taskCertifications = null,
         TimeProvider? clock = null) =>
         new(
             definitions,
