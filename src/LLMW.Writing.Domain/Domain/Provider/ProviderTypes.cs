@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
 
 namespace LLMW.Writing.Domain.Provider;
 
@@ -217,6 +218,25 @@ public sealed record ProviderEndpoint
 
         return new ProviderEndpoint(builder.Uri.AbsoluteUri, scheme == HttpScheme);
     }
+
+    public static bool IdentitiesMatch(string? left, string? right)
+    {
+        if (string.Equals(left, right, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right))
+        {
+            return false;
+        }
+
+        var a = TryCreate(left, allowInsecureLocalHttp: true, out _);
+        var b = TryCreate(right, allowInsecureLocalHttp: true, out _);
+        return a is not null &&
+               b is not null &&
+               string.Equals(a.CanonicalUri, b.CanonicalUri, StringComparison.Ordinal);
+    }
 }
 
 public sealed record ModelCatalogEntry(
@@ -238,6 +258,48 @@ public static class ProviderIdentity
 
     public static string StableTieBreak(ProviderDefinitionId provider, ModelId model) =>
         provider.Value + "\u001f" + model.Value;
+
+    public static string EndpointProfileDigest(
+        ProtocolKind protocolKind,
+        string canonicalEndpoint,
+        string adapterId,
+        string adapterVersion,
+        ProviderDataBehavior dataPolicy,
+        string? defaultModelId,
+        IReadOnlyDictionary<string, string> modelAliases,
+        IReadOnlyDictionary<string, string> adapterExtensions)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("protocolKind", ProtocolKindCodec.ToDurableValue(protocolKind));
+            writer.WriteString("endpoint", canonicalEndpoint);
+            writer.WriteString("adapterId", adapterId);
+            writer.WriteString("adapterVersion", adapterVersion);
+            writer.WriteString("dataPolicy", ProviderDataBehaviorCodec.ToDurableValue(dataPolicy));
+            writer.WriteString("defaultModelId", defaultModelId ?? "");
+            writer.WritePropertyName("modelAliases");
+            writer.WriteStartObject();
+            foreach (var alias in modelAliases.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                writer.WriteString(alias.Key, alias.Value);
+            }
+
+            writer.WriteEndObject();
+            writer.WritePropertyName("adapterExtensions");
+            writer.WriteStartObject();
+            foreach (var ext in adapterExtensions.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                writer.WriteString(ext.Key, ext.Value);
+            }
+
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return Utf8Digest.Sha256Hex(Encoding.UTF8.GetString(stream.ToArray()));
+    }
 }
 
 public static class Utf8Digest

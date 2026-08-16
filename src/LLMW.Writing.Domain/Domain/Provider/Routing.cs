@@ -12,7 +12,8 @@ public sealed record RouteRequirementProfile(
     string? PinnedModelId,
     string? SpecialistPreferredProviderId,
     string? SpecialistPreferredModelId,
-    bool AllowFallback)
+    bool AllowFallback,
+    string? RequiredTaskClass = null)
 {
     public static RouteRequirementProfile TextOnly { get; } = new(
         false, false, false, true, ReasoningCeiling.Conservative,
@@ -28,7 +29,8 @@ public sealed record RouteCandidate(
     bool CredentialAvailable,
     ModelCertificationRecord Certification,
     int? ContextLimit,
-    int Priority)
+    int Priority,
+    TaskCapabilityCertification? TaskCertification = null)
 {
     public string StableId => ProviderIdentity.StableTieBreak(ProviderDefinitionId, ModelId);
 }
@@ -111,8 +113,29 @@ public static class ProviderRouter
             return false;
         }
 
-        if (!ReasoningCeilingCodec.CanDowngradeTo(candidate.Certification.Ceiling, requirement.RequestedReasoning) &&
-            RankCeiling(requirement.RequestedReasoning) > RankCeiling(candidate.Certification.Ceiling))
+        var taskCert = candidate.TaskCertification ??
+                       TaskCapabilityCertification.Uncertified(
+                           candidate.ProviderDefinitionId,
+                           candidate.Revision,
+                           "",
+                           "",
+                           "",
+                           candidate.ModelId);
+        if (taskCert.State == CertificationState.Stale)
+        {
+            return false;
+        }
+
+        var ceiling = taskCert.EffectiveCeiling;
+        if (!ReasoningCeilingCodec.CanDowngradeTo(ceiling, requirement.RequestedReasoning) &&
+            RankCeiling(requirement.RequestedReasoning) > RankCeiling(ceiling))
+        {
+            return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(requirement.RequiredTaskClass) &&
+            (taskCert.State != CertificationState.Certified ||
+             !taskCert.CertifiedTaskClasses.Contains(requirement.RequiredTaskClass, StringComparer.Ordinal)))
         {
             return false;
         }

@@ -216,6 +216,7 @@ public static class IpcErrorCodes
     public const string RuntimeGrillOwnershipDenied = "RUNTIME_GRILL_OWNERSHIP_DENIED";
     public const string BackgroundStopUnavailable = "BACKGROUND_STOP_UNAVAILABLE";
     public const string SpecialistIdentityMismatch = "SPECIALIST_IDENTITY_MISMATCH";
+    public const string ProviderSecretForbidden = "PROVIDER_SECRET_FORBIDDEN";
 }
 
 public static class IpcServerCapabilities

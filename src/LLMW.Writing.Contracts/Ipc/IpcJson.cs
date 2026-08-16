@@ -195,6 +195,12 @@ public static class IpcJson
 [JsonSerializable(typeof(IpcEnvelope<GetBackgroundTaskResponse>), TypeInfoPropertyName = "GetBackgroundTaskResponseEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<StopBackgroundTaskRequest>), TypeInfoPropertyName = "StopBackgroundTaskRequestEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<StopBackgroundTaskResponse>), TypeInfoPropertyName = "StopBackgroundTaskResponseEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<GetTaskExecutionSnapshotRequest>), TypeInfoPropertyName = "GetTaskExecutionSnapshotRequestEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<GetTaskExecutionSnapshotResponse>), TypeInfoPropertyName = "GetTaskExecutionSnapshotResponseEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<PersistProviderInvocationRequest>), TypeInfoPropertyName = "PersistProviderInvocationRequestEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<PersistProviderInvocationResponse>), TypeInfoPropertyName = "PersistProviderInvocationResponseEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<AuthorizeToolProposalRequest>), TypeInfoPropertyName = "AuthorizeToolProposalRequestEnvelope")]
+[JsonSerializable(typeof(IpcEnvelope<AuthorizeToolProposalResponse>), TypeInfoPropertyName = "AuthorizeToolProposalResponseEnvelope")]
 [JsonSerializable(typeof(HelloRequest))]
 [JsonSerializable(typeof(HelloAck))]
 [JsonSerializable(typeof(Heartbeat))]
@@ -253,6 +259,13 @@ public static class IpcJson
 [JsonSerializable(typeof(ListBackgroundTasksRequest))]
 [JsonSerializable(typeof(GetBackgroundTaskRequest))]
 [JsonSerializable(typeof(StopBackgroundTaskRequest))]
+[JsonSerializable(typeof(GetTaskExecutionSnapshotRequest))]
+[JsonSerializable(typeof(GetTaskExecutionSnapshotResponse))]
+[JsonSerializable(typeof(PersistProviderInvocationRequest))]
+[JsonSerializable(typeof(PersistProviderInvocationResponse))]
+[JsonSerializable(typeof(AuthorizeToolProposalRequest))]
+[JsonSerializable(typeof(AuthorizeToolProposalResponse))]
+[JsonSerializable(typeof(FrozenRequiredResultDto))]
 public sealed partial class IpcJsonContext : JsonSerializerContext;
 
 public sealed class IpcMessageTypeJsonConverter : JsonStringEnumConverter<IpcMessageType>

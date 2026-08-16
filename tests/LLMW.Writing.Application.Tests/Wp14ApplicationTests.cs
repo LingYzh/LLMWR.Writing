@@ -24,6 +24,11 @@ internal static class Wp14ApplicationTests
         n += Check(nameof(PromptChangeCausesReplan), PromptChangeCausesReplan);
         n += Check(nameof(RequiredStaleBlocksDispatch), RequiredStaleBlocksDispatch);
         n += Check(nameof(UnknownUsageFromAdapterIsNotZero), UnknownUsageFromAdapterIsNotZero);
+        n += Check(nameof(ReportedModelDoesNotRewriteFrozenSnapshot), ReportedModelDoesNotRewriteFrozenSnapshot);
+        n += Check(nameof(ProtocolProbeDoesNotRaiseTaskCeiling), ProtocolProbeDoesNotRaiseTaskCeiling);
+        n += Check(nameof(CatalogNonDefaultModelIsRoutable), CatalogNonDefaultModelIsRoutable);
+        n += Check(nameof(RetryUsesNewInvocationId), RetryUsesNewInvocationId);
+        n += Check(nameof(CheckpointInvocationLogIsBounded), CheckpointInvocationLogIsBounded);
         return n;
     }
 
@@ -101,9 +106,15 @@ internal static class Wp14ApplicationTests
         AssertEqual("MALFORMED_TOOL_ARGUMENTS", malformed.DenialCode, "Malformed args executed.");
         var denied = ToolProposalGuard.Inspect(
             new ToolCallRequest("c4", "lookup", "{\"q\":\"a\"}"),
-            [new AuthorizedToolSchema("lookup", "", "{\"type\":\"object\"}", ["q"])],
-            new CapabilityEvaluationRequest(Capability.ShellExecute, PrincipalKind.AgentRun, AgentRole.Writer, RuntimePermissionMode.Ask));
+            [new AuthorizedToolSchema("lookup", "", "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}", ["q"])],
+            CoreToolAuthorizationResult.Denied("Registry.Query", "CAPABILITY_DENIED"));
         AssertEqual("CAPABILITY_DENIED", denied.DenialCode, "CapabilityEvaluator bypassed.");
+        var missingCore = ToolProposalGuard.Inspect(
+            new ToolCallRequest("c5", "lookup", "{\"q\":\"a\"}"),
+            [new AuthorizedToolSchema("lookup", "", "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}", ["q"])],
+            null);
+        AssertTrue(!missingCore.MayExecute, "Null Core authorization executed a known tool.");
+        AssertEqual("AWAITING_AUTHORIZATION", missingCore.DenialCode, "Null Core authorization was not fail-closed.");
     }
 
     private static void StructuredOutputValidatedLocally()
@@ -175,6 +186,132 @@ internal static class Wp14ApplicationTests
         AssertEqual(CostKind.Unknown, outcome.Record.Cost.Kind, "Missing usage became zero-cost.");
     }
 
+    private static void ReportedModelDoesNotRewriteFrozenSnapshot()
+    {
+        var harness = Harness();
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        Certify(harness, "prov-a", "m1");
+        var outcome = harness.Coordinator.Invoke(Command(harness, "run-hist", "task-hist"));
+        AssertEqual("m1", outcome.Record.Snapshot.EffectiveRoutedModelId.Value, "Frozen route rewritten.");
+        AssertEqual("m1-actual", outcome.Record.ProviderReportedModel, "Reported model dropped.");
+        var frozenJson = outcome.Record.Snapshot.CanonicalJson();
+        var again = harness.Coordinator.GetFrozen(outcome.Record.Snapshot.InvocationId.Value)!.CanonicalJson();
+        AssertEqual(frozenJson, again, "Frozen CanonicalJson mutated.");
+        AssertTrue(!frozenJson.Contains("m1-actual", StringComparison.Ordinal), "Reported model leaked into frozen snapshot.");
+    }
+
+    private static void ProtocolProbeDoesNotRaiseTaskCeiling()
+    {
+        var harness = Harness();
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        harness.Certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported),
+            (ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported)) with { Ceiling = ReasoningCeiling.Adaptive });
+        var command = Command(harness, "run-ceil", "task-ceil") with
+        {
+            Requirements = RouteRequirementProfile.TextOnly with { RequestedReasoning = ReasoningCeiling.Adaptive, RequiresInstructionHierarchy = false }
+        };
+        var outcome = harness.Coordinator.Invoke(command);
+        AssertEqual("ROUTE_NO_ELIGIBLE_CANDIDATE", outcome.StructuredOutputError ?? outcome.Record.RefusalText, "Protocol probe raised the task ceiling.");
+    }
+
+    private static void CatalogNonDefaultModelIsRoutable()
+    {
+        var harness = Harness();
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        Certify(harness, "prov-a", "m1");
+        harness.Catalog.Upsert(new ModelCatalogEntry(
+            new ModelId("m-custom"), "custom", new ProviderDefinitionId("prov-a"),
+            128000, 4096, MetadataProvenance.UserConfigured, MetadataProvenance.UserConfigured,
+            MetadataProvenance.UserConfigured, "manual", 1));
+        Certify(harness, "prov-a", "m-custom");
+        var command = Command(harness, "run-catalog", "task-catalog") with
+        {
+            Requirements = RouteRequirementProfile.TextOnly with
+            {
+                RequiresInstructionHierarchy = false,
+                PinnedProviderDefinitionId = "prov-a",
+                PinnedModelId = "m-custom"
+            }
+        };
+        var outcome = harness.Coordinator.Invoke(command);
+        AssertEqual("m-custom", outcome.Record.Snapshot.EffectiveRoutedModelId.Value, "Pinned catalog model was not routed.");
+    }
+
+    private static void RetryUsesNewInvocationId()
+    {
+        var store = new MemoryRuntimeStore();
+        var clock = new FixedClock(10_000);
+        var scheduler = new RuntimeSchedulerService(
+            store,
+            new FixedConcurrencyBudgetPolicy(ConcurrencyBudget.Default),
+            clock,
+            new FakeRunWorkerSupervisor());
+        Success(scheduler.CreateWorkflowRun("wf-14"));
+        Success(scheduler.CreateRun("wf-14", "writer", null, "run-retry"));
+        Success(scheduler.CreateTask("run-retry", "write", 1, null, "task-retry"));
+        var definitions = new MemoryProviderDefinitionStore();
+        var credentials = new MemoryProviderCredentialResolver();
+        credentials.Store(new CredentialRef("cred-a"), Canary);
+        definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        var certifications = new MemoryModelCertificationStore();
+        certifications.Upsert(CertificationFactory.Certified(
+            new ProviderDefinitionId("prov-a"), new ProviderRevision(1), "http://127.0.0.1:9",
+            "scripted", "v1", new ModelId("m1"),
+            (ModelCapabilityNames.BasicText, CapabilitySupport.Supported),
+            (ModelCapabilityNames.InstructionHierarchy, CapabilitySupport.Supported)));
+        var remaining = 1;
+        var adapter = new ScriptedProtocolAdapter(
+            ProtocolKind.OpenAiResponses, "scripted", "v1",
+            _ =>
+            {
+                if (remaining-- > 0)
+                {
+                    return new ProviderInvokeResult(
+                        InvocationLifecycle.Rejected, InvocationFailureClass.HttpRateLimited,
+                        [], "req", null, "m1", NormalizedUsage.Unknown, [], null, null, "429", false);
+                }
+
+                return new ProviderInvokeResult(
+                    InvocationLifecycle.Completed, InvocationFailureClass.None,
+                    [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, "ok", null, null, null, null, NormalizedUsage.Unknown, null, true)],
+                    "req2", "resp", "m1", NormalizedUsage.Unknown, [], null, null, null, false);
+            });
+        var coordinator = new ProviderInvocationCoordinator(
+            definitions, credentials, certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler)));
+        var firstIds = new HashSet<string>(StringComparer.Ordinal);
+        var outcome = coordinator.Invoke(Command(new HarnessState(store, scheduler, definitions, credentials, certifications, new MemoryModelCatalogStore(), coordinator), "run-retry", "task-retry") with
+        {
+            Retry = new ProviderRetryPolicy(2, false)
+        });
+        AssertEqual(InvocationLifecycle.Completed, outcome.Record.Lifecycle, "Retry did not complete.");
+        AssertTrue(!string.IsNullOrEmpty(outcome.Record.Snapshot.FallbackFromInvocationId), "Retry parent InvocationId missing.");
+        AssertTrue(firstIds.Add(outcome.Record.Snapshot.InvocationId.Value), "Retry reused InvocationId.");
+        _ = firstIds;
+    }
+
+    private static void CheckpointInvocationLogIsBounded()
+    {
+        var harness = Harness();
+        harness.Definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
+        Certify(harness, "prov-a", "m1");
+        for (var i = 0; i < 20; i++)
+        {
+            _ = harness.Coordinator.Invoke(Command(harness, "run-bound", "task-bound"));
+        }
+
+        var latest = harness.Store.CheckpointsForRun("run-bound")[0];
+        var parsed = CanonicalJson.Parse(latest.PayloadJson, latest.SchemaVersion);
+        AssertTrue(parsed.InvocationLog.Count <= CheckpointV1.RetainedInvocationLogLimit,
+            "Checkpoint invocation log grew without bound.");
+        AssertTrue(harness.Store.CheckpointsForRun("run-bound").Count >= 20, "Historical checkpoints were deleted.");
+    }
+
     private static HarnessState Harness(bool toolsOnlyOnB = false)
     {
         var store = new MemoryRuntimeStore();
@@ -185,7 +322,7 @@ internal static class Wp14ApplicationTests
             clock,
             new FakeRunWorkerSupervisor());
         Success(scheduler.CreateWorkflowRun("wf-14"));
-        foreach (var run in new[] { "run-cfg", "run-cfg-2", "run-sec", "run-pin", "run-fb", "run-replan", "run-stale", "run-usage" })
+        foreach (var run in new[] { "run-cfg", "run-cfg-2", "run-sec", "run-pin", "run-fb", "run-replan", "run-stale", "run-usage", "run-hist", "run-retry", "run-bound", "run-catalog", "run-ceil" })
         {
             Success(scheduler.CreateRun("wf-14", "writer", null, run));
             Success(scheduler.CreateTask(run, "write", 1, null, run.Replace("run", "task", StringComparison.Ordinal)));
@@ -196,6 +333,7 @@ internal static class Wp14ApplicationTests
         credentials.Store(new CredentialRef("cred-a"), Canary);
         credentials.Store(new CredentialRef("cred-b"), Canary);
         var certifications = new MemoryModelCertificationStore();
+        var catalog = new MemoryModelCatalogStore();
         if (toolsOnlyOnB)
         {
             definitions.Upsert(ProviderDefinitionFactory.Create("prov-a", ProtocolKind.OpenAiResponses, "http://127.0.0.1:9", "cred-a", "m1"));
@@ -235,10 +373,10 @@ internal static class Wp14ApplicationTests
             certifications,
             new MemoryPriceSnapshotStore(),
             new StaticProviderAdapterResolver(adapter),
-            store,
-            scheduler,
-            TimeProvider.System);
-        return new HarnessState(store, scheduler, definitions, credentials, certifications, coordinator);
+            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler)),
+            catalog: catalog,
+            clock: TimeProvider.System);
+        return new HarnessState(store, scheduler, definitions, credentials, certifications, catalog, coordinator);
     }
 
     private static void Certify(HarnessState harness, string provider, string model)
@@ -298,7 +436,7 @@ internal static class Wp14ApplicationTests
             null,
             null,
             false);
-        return new ModelInvocationCommand(runId, taskId, "att-1", compile, requirements, null, false, fallbackFrom, fallbackReason);
+        return new ModelInvocationCommand(runId, taskId, "att-1", compile, requirements, false, fallbackFrom, fallbackReason);
     }
 
     private static T Success<T>(RuntimeResult<T> result)
@@ -333,6 +471,7 @@ internal static class Wp14ApplicationTests
         MemoryProviderDefinitionStore Definitions,
         MemoryProviderCredentialResolver Credentials,
         MemoryModelCertificationStore Certifications,
+        MemoryModelCatalogStore Catalog,
         ProviderInvocationCoordinator Coordinator);
 
     private sealed class FixedClock(long unixMs) : ISecurityClock

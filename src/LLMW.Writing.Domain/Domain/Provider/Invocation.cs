@@ -61,8 +61,13 @@ public sealed record ProviderInvocationSnapshot(
     CredentialRef? CredentialRevisionRef,
     long CreatedAtMs,
     string? FallbackFromInvocationId,
-    string? FallbackReason)
+    string? FallbackReason,
+    string? EndpointIdentity = null,
+    string? EndpointProfileDigest = null,
+    int AuthBindingGeneration = 0)
 {
+    public ModelId EffectiveRoutedModelId => EffectiveModelId;
+
     public string CanonicalJson()
     {
         using var stream = new MemoryStream();
@@ -92,6 +97,12 @@ public sealed record ProviderInvocationSnapshot(
             writer.WriteNumber("createdAtMs", CreatedAtMs);
             WriteOptional(writer, "fallbackFromInvocationId", FallbackFromInvocationId);
             WriteOptional(writer, "fallbackReason", FallbackReason);
+            WriteOptional(writer, "endpointIdentity", EndpointIdentity);
+            WriteOptional(writer, "endpointProfileDigest", EndpointProfileDigest);
+            if (AuthBindingGeneration > 0)
+            {
+                writer.WriteNumber("authBindingGeneration", AuthBindingGeneration);
+            }
             writer.WriteEndObject();
         }
 
@@ -125,7 +136,12 @@ public sealed record ProviderInvocationSnapshot(
             Optional(root, "authBindingId") is { } cred ? new CredentialRef(cred) : null,
             root.GetProperty("createdAtMs").GetInt64(),
             Optional(root, "fallbackFromInvocationId"),
-            Optional(root, "fallbackReason"));
+            Optional(root, "fallbackReason"),
+            Optional(root, "endpointIdentity"),
+            Optional(root, "endpointProfileDigest"),
+            root.TryGetProperty("authBindingGeneration", out var gen) && gen.TryGetInt32(out var generation)
+                ? generation
+                : 0);
     }
 
     private static ProviderDataBehavior ParseData(string? value) => value switch

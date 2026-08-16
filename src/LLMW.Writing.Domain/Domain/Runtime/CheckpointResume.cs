@@ -29,6 +29,7 @@ public sealed record CheckpointV1(
 {
     public const int CurrentSchemaVersion = 1;
     public const int RetainedCriticalMessageLimit = 20;
+    public const int RetainedInvocationLogLimit = 8;
     public const int ToolReferenceHeadTailBytes = 256 * 1024;
 
     public static CheckpointV1 Create(
@@ -65,7 +66,7 @@ public sealed record CheckpointV1(
             providerId,
             modelId,
             effectivePromptDigest,
-            (invocationLog ?? []).Select(SecretRedaction.RedactObjectJson).ToArray());
+            RetainLatestInvocations((invocationLog ?? []).Select(SecretRedaction.RedactObjectJson).ToArray()));
 
     public static IReadOnlyList<CheckpointCriticalMessage> RetainLatestMessages(
         IReadOnlyList<CheckpointCriticalMessage> messages)
@@ -80,6 +81,17 @@ public sealed record CheckpointV1(
             .OrderBy(message => message.Sequence)
             .TakeLast(RetainedCriticalMessageLimit)
             .ToArray();
+    }
+
+    public static IReadOnlyList<string> RetainLatestInvocations(IReadOnlyList<string> invocationLog)
+    {
+        ArgumentNullException.ThrowIfNull(invocationLog);
+        if (invocationLog.Count <= RetainedInvocationLogLimit)
+        {
+            return invocationLog.ToArray();
+        }
+
+        return invocationLog.TakeLast(RetainedInvocationLogLimit).ToArray();
     }
 
     public static IReadOnlyList<CheckpointToolReference> TruncateToolReferences(

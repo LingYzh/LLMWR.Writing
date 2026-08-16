@@ -159,6 +159,78 @@ public sealed record CostEstimate(
 {
     public static CostEstimate Unknown(string? priceSnapshotId) =>
         new(CostKind.Unknown, "USD", null, priceSnapshotId, "none", false);
+
+    public static CostEstimate FromReportedUsage(NormalizedUsage usage, PriceSnapshot? snapshot)
+    {
+        if (snapshot is null || usage.Status != UsageStatus.Reported)
+        {
+            return Unknown(snapshot?.PriceSnapshotId);
+        }
+
+        decimal amount = 0;
+        var matched = 0;
+        if (!TryAdd(usage.InputTokens, snapshot, "input", ref amount, ref matched))
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        if (!TryAdd(usage.OutputTokens, snapshot, "output", ref amount, ref matched))
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        if (!TryAdd(usage.CachedInputReadTokens, snapshot, "cached_input", ref amount, ref matched))
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        if (!TryAdd(usage.CacheWriteTokens, snapshot, "cache_write", ref amount, ref matched))
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        if (!TryAdd(usage.ReasoningTokens, snapshot, "reasoning", ref amount, ref matched))
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        if (matched == 0)
+        {
+            return Unknown(snapshot.PriceSnapshotId);
+        }
+
+        return new CostEstimate(
+            CostKind.CalculatedFromReportedUsage,
+            snapshot.Currency,
+            amount,
+            snapshot.PriceSnapshotId,
+            "llmw-price-snapshot-v1",
+            false);
+    }
+
+    private static bool TryAdd(
+        OptionalTokenCount tokens,
+        PriceSnapshot snapshot,
+        string component,
+        ref decimal amount,
+        ref int matched)
+    {
+        if (tokens.Status != UsageStatus.Reported || tokens.Value is null)
+        {
+            return true;
+        }
+
+        var rate = snapshot.Components.FirstOrDefault(item =>
+            string.Equals(item.Name, component, StringComparison.Ordinal));
+        if (rate?.AmountPerMillion is not decimal perMillion)
+        {
+            return false;
+        }
+
+        amount += tokens.Value.Value / 1_000_000m * perMillion;
+        matched++;
+        return true;
+    }
 }
 
 public sealed record EstimatedTokenCount(int? Tokens, string EstimatorIdentity, string Confidence)

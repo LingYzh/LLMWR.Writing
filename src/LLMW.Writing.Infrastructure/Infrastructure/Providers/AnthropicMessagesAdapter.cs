@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using LLMW.Writing.Application.Provider;
@@ -8,7 +9,7 @@ namespace LLMW.Writing.Infrastructure.Providers;
 
 public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 {
-    public const string CurrentVersion = "wp14-anthropic-messages-v1";
+    public const string CurrentVersion = "wp14-anthropic-messages-v2";
     public const string ApiVersion = "2023-06-01";
     private readonly ProviderHttpTransport transport;
 
@@ -23,6 +24,47 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 
     public ProtocolKind ProtocolKind => ProtocolKind.AnthropicMessages;
 
+    public ProviderPrepareResult Prepare(
+        ProviderDefinitionV1 definition,
+        ProviderEndpoint endpoint,
+        ProviderInvokeRequest request)
+    {
+        _ = definition;
+        if (request.Prompt.ReservedOutputTokens <= 0)
+        {
+            return new ProviderPrepareResult(null, "MAX_OUTPUT_UNKNOWN");
+        }
+
+        if (request.AdapterExtensions.TryGetValue("thinking", out var thinking))
+        {
+            if (thinking == "enabled" &&
+                (!request.AdapterExtensions.TryGetValue("thinkingBudgetTokens", out var budget) ||
+                 !int.TryParse(budget, out var tokens) || tokens <= 0))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            if (thinking == "adaptive" &&
+                !request.AdapterExtensions.TryGetValue("thinkingEffort", out _))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            if (thinking is not "enabled" and not "adaptive")
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+        }
+
+        var path = Combine(endpoint.CanonicalUri, "/v1/messages").AbsolutePath;
+        var body = BuildRequest(request, request.Stream);
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["anthropic-version"] = ApiVersion
+        };
+        return new ProviderPrepareResult(new PreparedProviderRequest("POST", path, body, headers, request.Stream), null);
+    }
+
     public async Task<ProviderInvokeResult> InvokeAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
@@ -30,22 +72,20 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         CancellationToken cancellationToken)
     {
-        if (request.Prompt.ReservedOutputTokens <= 0)
+        var prepared = Prepare(definition, endpoint, request with { Stream = false });
+        if (!prepared.Succeeded || prepared.Request is null)
         {
             return new ProviderInvokeResult(
-                InvocationLifecycle.FailedBeforeSend,
-                InvocationFailureClass.FailedBeforeSend,
-                [], null, null, null, NormalizedUsage.Unknown, [], null, null, "MAX_OUTPUT_UNKNOWN", false);
+                InvocationLifecycle.FailedBeforeSend, InvocationFailureClass.FailedBeforeSend,
+                [], null, null, null, NormalizedUsage.Unknown, [], null, null, prepared.ErrorCode, false);
         }
 
         var uri = Combine(endpoint.CanonicalUri, "/v1/messages");
-        var body = BuildRequest(request, stream: false);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
         {
-            ["x-api-key"] = secret.Reveal(),
-            ["anthropic-version"] = ApiVersion
+            ["x-api-key"] = secret.Reveal()
         };
-        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
+        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
             .ConfigureAwait(false);
         if (http.Lifecycle is InvocationLifecycle.FailedBeforeSend or InvocationLifecycle.OutcomeUnknown or InvocationLifecycle.CancelRequested ||
             http.StatusCode is < 200 or >= 300)
@@ -63,19 +103,38 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var uri = Combine(endpoint.CanonicalUri, "/v1/messages");
-        var body = BuildRequest(request, stream: true);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var prepared = Prepare(definition, endpoint, request with { Stream = true });
+        if (!prepared.Succeeded || prepared.Request is null)
         {
-            ["x-api-key"] = secret.Reveal(),
-            ["anthropic-version"] = ApiVersion
+            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, prepared.ErrorCode, true);
+            yield break;
+        }
+
+        var uri = Combine(endpoint.CanonicalUri, "/v1/messages");
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
+        {
+            ["x-api-key"] = secret.Reveal()
         };
         var terminal = false;
         var toolArgs = new StringBuilder();
         string? toolId = null;
         string? toolName = null;
-        await foreach (var (frame, _) in transport.ReadSseAsync(uri, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
+        string? stopReason = null;
+        NormalizedUsage? streamUsage = null;
+        await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
+            if (item.Failure is { } failure)
+            {
+                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, failure.FailureClass.ToString(), true);
+                yield break;
+            }
+
+            if (item.Frame is null)
+            {
+                continue;
+            }
+
+            var frame = item.Frame;
             if (!SseJson.TryParse(string.IsNullOrWhiteSpace(frame.Data) ? "{}" : frame.Data, out var document, out var parseError))
             {
                 yield return parseError;
@@ -130,8 +189,26 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                         }
 
                         break;
+                    case "message_delta":
+                        if (document.RootElement.TryGetProperty("delta", out var messageDelta) &&
+                            messageDelta.TryGetProperty("stop_reason", out var streamedStop) &&
+                            streamedStop.ValueKind == JsonValueKind.String)
+                        {
+                            stopReason = streamedStop.GetString();
+                        }
+
+                        if (document.RootElement.TryGetProperty("usage", out var usageEl))
+                        {
+                            streamUsage = UsageNormalizer.FromAnthropic(JsonDocument.Parse("{\"usage\":" + usageEl.GetRawText() + "}").RootElement);
+                        }
+
+                        break;
                     case "message_stop":
-                        yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, null, null, true);
+                        foreach (var terminalEvent in AnthropicStop.ToEvents(stopReason, streamUsage, toolId is not null))
+                        {
+                            yield return terminalEvent;
+                        }
+
                         terminal = true;
                         yield break;
                     case "error":
@@ -201,8 +278,15 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.TextCompleted, completed, null, null, null, null, null, null, false));
             }
 
-            events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, completed, null, null, null, null, usage, null, true));
-            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, idResp, model, usage, tools, LooksJson(completed) ? completed : null, null, null, false);
+            var stop = root.TryGetProperty("stop_reason", out var sr) ? sr.GetString() : null;
+            if (string.IsNullOrEmpty(stop) && tools.Count > 0)
+            {
+                stop = "tool_use";
+            }
+
+            events.AddRange(AnthropicStop.ToEvents(stop, usage, tools.Count > 0));
+            var mapped = AnthropicStop.ToResult(stop, usage, http, idResp, model, events, tools, completed);
+            return mapped;
         }
     }
 
@@ -251,11 +335,24 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                 writer.WriteEndArray();
             }
 
-            if (request.AdapterExtensions.TryGetValue("thinking", out var thinking) && thinking == "enabled")
+            if (request.AdapterExtensions.TryGetValue("thinking", out var thinking))
             {
                 writer.WritePropertyName("thinking");
                 writer.WriteStartObject();
-                writer.WriteString("type", "enabled");
+                if (thinking == "enabled")
+                {
+                    writer.WriteString("type", "enabled");
+                    writer.WriteNumber("budget_tokens", int.Parse(request.AdapterExtensions["thinkingBudgetTokens"], CultureInfo.InvariantCulture));
+                }
+                else if (thinking == "adaptive")
+                {
+                    writer.WriteString("type", "adaptive");
+                    writer.WritePropertyName("output_config");
+                    writer.WriteStartObject();
+                    writer.WriteString("effort", request.AdapterExtensions["thinkingEffort"]);
+                    writer.WriteEndObject();
+                }
+
                 writer.WriteEndObject();
             }
 
@@ -280,10 +377,53 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 
         return new Uri(trimmed + path);
     }
+}
 
-    private static bool LooksJson(string text)
+internal static class AnthropicStop
+{
+    public static IReadOnlyList<ModelRuntimeEvent> ToEvents(string? stopReason, NormalizedUsage? usage, bool hasTools)
     {
-        var trimmed = text.TrimStart();
-        return trimmed.StartsWith('{') || trimmed.StartsWith('[');
+        return stopReason switch
+        {
+            "max_tokens" or "model_context_window_exceeded" =>
+                [new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, usage, stopReason, true)],
+            "refusal" =>
+                [new ModelRuntimeEvent(ModelRuntimeEventKind.Refusal, null, null, null, null, null, usage, "refusal", true)],
+            "pause_turn" =>
+                [new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, null, null, null, null, null, usage, "pause_turn", true)],
+            "tool_use" =>
+                [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, usage, "tool_use", true)],
+            _ =>
+                hasTools
+                    ? [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, usage, stopReason ?? "tool_use", true)]
+                    : [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, usage, null, true)]
+        };
+    }
+
+    public static ProviderInvokeResult ToResult(
+        string? stopReason,
+        NormalizedUsage usage,
+        ProviderHttpResult http,
+        string? responseId,
+        string? model,
+        IReadOnlyList<ModelRuntimeEvent> events,
+        IReadOnlyList<ToolCallRequest> tools,
+        string text)
+    {
+        return stopReason switch
+        {
+            "max_tokens" or "model_context_window_exceeded" =>
+                new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, responseId, model, usage, tools, null, null, stopReason, false),
+            "refusal" =>
+                new ProviderInvokeResult(InvocationLifecycle.Rejected, InvocationFailureClass.ProviderRefusal, events, http.ProviderRequestId, responseId, model, usage, tools, null, text, "refusal", false),
+            "pause_turn" =>
+                new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, responseId, model, usage, tools, null, null, "pause_turn", false),
+            "tool_use" =>
+                new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, responseId, model, usage, tools, null, null, "tool_use", false),
+            _ =>
+                tools.Count > 0
+                    ? new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, responseId, model, usage, tools, null, null, "tool_use", false)
+                    : new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, responseId, model, usage, tools, null, null, null, false)
+        };
     }
 }

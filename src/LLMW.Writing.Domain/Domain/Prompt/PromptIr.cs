@@ -159,4 +159,5 @@ public sealed record PromptCompileRequest(
     IReadOnlyList<AuthorizedToolSchema> AuthorizedTools,
     PromptOutputContract OutputContract,
     int? ContextBudgetTokens,
-    int ReservedOutputTokens);
+    int ReservedOutputTokens,
+    IReadOnlyList<(string CallId, string ToolName, string ResultJson)>? ToolResults = null);

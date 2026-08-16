@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Text;
 using LLMW.Writing.Domain.Prompt;
 using LLMW.Writing.Domain.Provider;
 
@@ -46,6 +47,44 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
 
     public ProtocolKind ProtocolKind { get; }
 
+    public ProviderPrepareResult Prepare(
+        ProviderDefinitionV1 definition,
+        ProviderEndpoint endpoint,
+        ProviderInvokeRequest request)
+    {
+        _ = definition;
+        _ = endpoint;
+        using var stream = new MemoryStream();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("model", request.ModelId.Value);
+            writer.WriteBoolean("stream", request.Stream);
+            writer.WriteNumber("maxTokens", request.Prompt.ReservedOutputTokens);
+            writer.WriteString("promptDigest", request.Prompt.EffectivePromptDigest);
+            writer.WriteString("toolSchemaDigest", PromptDigests.ToolSchemaDigest(request.Prompt.Tools));
+            writer.WriteString("outputSchemaDigest", PromptDigests.OutputSchemaDigest(request.Prompt.OutputContract));
+            writer.WritePropertyName("extensions");
+            writer.WriteStartObject();
+            foreach (var ext in request.AdapterExtensions.OrderBy(item => item.Key, StringComparer.Ordinal))
+            {
+                writer.WriteString(ext.Key, ext.Value);
+            }
+
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return new ProviderPrepareResult(
+            new PreparedProviderRequest(
+                "POST",
+                "/v1/scripted",
+                Encoding.UTF8.GetString(stream.ToArray()),
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
+                request.Stream),
+            null);
+    }
+
     public Task<ProviderInvokeResult> InvokeAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
@@ -86,13 +125,15 @@ public static class CertificationFactory
         ModelId model,
         params (string Name, CapabilitySupport Support)[] capabilities)
     {
+        var endpointIdentity = ProviderEndpoint.TryCreate(endpoint, allowInsecureLocalHttp: true, out _)?.CanonicalUri
+            ?? endpoint;
         return new ModelCertificationRecord(
             "cert:" + provider.Value + ":" + model.Value,
             1,
             ModelCertificationRecord.CurrentProbeSuiteVersion,
             provider,
             revision,
-            endpoint,
+            endpointIdentity,
             adapterId,
             adapterVersion,
             model,

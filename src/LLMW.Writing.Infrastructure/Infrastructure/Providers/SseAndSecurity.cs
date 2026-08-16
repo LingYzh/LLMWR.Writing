@@ -6,20 +6,63 @@ namespace LLMW.Writing.Infrastructure.Providers;
 
 public sealed record SseFrame(string EventType, string Data, bool Heartbeat);
 
+public sealed class SseBoundExceededException : Exception
+{
+    public SseBoundExceededException(string code)
+        : base(code)
+    {
+        Code = code;
+    }
+
+    public string Code { get; }
+}
+
 public sealed class SseEventParser
 {
+    public const int MaxLineBytes = 64 * 1024;
+    public const int MaxEventDataBytes = 1024 * 1024;
+    public const int MaxMalformedFrames = 8;
+
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     private readonly List<byte> buffer = [];
     private string currentEvent = "message";
     private readonly StringBuilder data = new();
+    private int malformed;
+
+    public string? FailureCode { get; private set; }
 
     public List<SseFrame> Push(ReadOnlySpan<byte> chunk)
     {
+        if (FailureCode is not null)
+        {
+            return [];
+        }
+
+        var frames = new List<SseFrame>();
         foreach (var b in chunk)
         {
             buffer.Add(b);
+            if (buffer.Count > MaxLineBytes)
+            {
+                FailureCode = "PROTOCOL_SSE_LINE_TOO_LARGE";
+                buffer.Clear();
+                return frames;
+            }
+
+            if (b != (byte)'\n')
+            {
+                continue;
+            }
+
+            frames.AddRange(Drain(endOfStream: false));
+            if (FailureCode is not null)
+            {
+                return frames;
+            }
         }
 
-        return Drain(endOfStream: false);
+        return frames;
     }
 
     public List<SseFrame> Finish() => Drain(endOfStream: true);
@@ -27,6 +70,11 @@ public sealed class SseEventParser
     private List<SseFrame> Drain(bool endOfStream)
     {
         var frames = new List<SseFrame>();
+        if (FailureCode is not null)
+        {
+            return frames;
+        }
+
         while (TryReadLine(endOfStream, out var line))
         {
             if (line.Length == 0)
@@ -76,6 +124,11 @@ public sealed class SseEventParser
                 }
 
                 data.Append(value);
+                if (data.Length > MaxEventDataBytes)
+                {
+                    FailureCode = "PROTOCOL_SSE_EVENT_TOO_LARGE";
+                    return frames;
+                }
             }
         }
 
@@ -95,16 +148,42 @@ public sealed class SseEventParser
                     length--;
                 }
 
-                line = Encoding.UTF8.GetString(buffer.GetRange(0, length).ToArray());
-                var remove = i + 1;
-                buffer.RemoveRange(0, remove);
+                var raw = buffer.GetRange(0, length).ToArray();
+                try
+                {
+                    line = StrictUtf8.GetString(raw);
+                }
+                catch (DecoderFallbackException)
+                {
+                    malformed++;
+                    if (malformed > MaxMalformedFrames)
+                    {
+                        FailureCode = "PROTOCOL_SSE_MALFORMED_THRESHOLD";
+                        buffer.Clear();
+                        return false;
+                    }
+
+                    line = "";
+                }
+
+                buffer.RemoveRange(0, i + 1);
                 return true;
             }
         }
 
         if (endOfStream && buffer.Count > 0)
         {
-            line = Encoding.UTF8.GetString(buffer.ToArray());
+            try
+            {
+                line = StrictUtf8.GetString(buffer.ToArray());
+            }
+            catch (DecoderFallbackException)
+            {
+                FailureCode = "PROTOCOL_SSE_INVALID_UTF8";
+                buffer.Clear();
+                return false;
+            }
+
             buffer.Clear();
             return true;
         }
@@ -155,3 +234,5 @@ internal static class SseJson
         }
     }
 }
+
+public readonly record struct SseReadResult(SseFrame? Frame, ProviderHttpResult? Failure);

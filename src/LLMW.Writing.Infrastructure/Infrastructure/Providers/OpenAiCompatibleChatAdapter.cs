@@ -8,7 +8,7 @@ namespace LLMW.Writing.Infrastructure.Providers;
 
 public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
 {
-    public const string CurrentVersion = "wp14-openai-compatible-chat-v1";
+    public const string CurrentVersion = "wp14-openai-compatible-chat-v2";
     private readonly ProviderHttpTransport transport;
 
     public OpenAiCompatibleChatAdapter(ProviderHttpTransport transport)
@@ -22,6 +22,28 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
 
     public ProtocolKind ProtocolKind => ProtocolKind.OpenAiCompatibleChatCompletions;
 
+    public ProviderPrepareResult Prepare(
+        ProviderDefinitionV1 definition,
+        ProviderEndpoint endpoint,
+        ProviderInvokeRequest request)
+    {
+        _ = definition;
+        if (request.AdapterExtensions.ContainsKey("thinking") && request.Prompt.Tools.Count > 0)
+        {
+            return new ProviderPrepareResult(null, "DEEPSEEK_THINKING_TOOLS_UNSUPPORTED");
+        }
+
+        var path = Combine(endpoint.CanonicalUri, "/v1/chat/completions").AbsolutePath;
+        var body = BuildRequest(request, request.Stream);
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(request.ClientRequestId))
+        {
+            headers["X-Client-Request-Id"] = request.ClientRequestId;
+        }
+
+        return new ProviderPrepareResult(new PreparedProviderRequest("POST", path, body, headers, request.Stream), null);
+    }
+
     public async Task<ProviderInvokeResult> InvokeAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
@@ -29,13 +51,20 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         CancellationToken cancellationToken)
     {
+        var prepared = Prepare(definition, endpoint, request with { Stream = false });
+        if (!prepared.Succeeded || prepared.Request is null)
+        {
+            return new ProviderInvokeResult(
+                InvocationLifecycle.FailedBeforeSend, InvocationFailureClass.FailedBeforeSend,
+                [], null, null, null, NormalizedUsage.Unknown, [], null, null, prepared.ErrorCode, false);
+        }
+
         var uri = Combine(endpoint.CanonicalUri, "/v1/chat/completions");
-        var body = BuildRequest(request, stream: false);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
         {
             ["Authorization"] = "Bearer " + secret.Reveal()
         };
-        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
+        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
             .ConfigureAwait(false);
         if (http.Lifecycle is InvocationLifecycle.FailedBeforeSend or InvocationLifecycle.OutcomeUnknown or InvocationLifecycle.CancelRequested ||
             http.StatusCode is < 200 or >= 300)
@@ -53,15 +82,33 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var prepared = Prepare(definition, endpoint, request with { Stream = true });
+        if (!prepared.Succeeded || prepared.Request is null)
+        {
+            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, prepared.ErrorCode, true);
+            yield break;
+        }
+
         var uri = Combine(endpoint.CanonicalUri, "/v1/chat/completions");
-        var body = BuildRequest(request, stream: true);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
         {
             ["Authorization"] = "Bearer " + secret.Reveal()
         };
         var terminal = false;
-        await foreach (var (frame, _) in transport.ReadSseAsync(uri, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
+        await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
+            if (item.Failure is { } failure)
+            {
+                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, failure.FailureClass.ToString(), true);
+                yield break;
+            }
+
+            if (item.Frame is null)
+            {
+                continue;
+            }
+
+            var frame = item.Frame;
             if (string.Equals(frame.Data, "[DONE]", StringComparison.Ordinal))
             {
                 yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, null, null, null, null, null, null, null, true);
@@ -156,7 +203,7 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             }
 
             events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, content, null, null, null, null, usage, null, true));
-            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, idResp, model, usage, tools, LooksJson(content) ? content : null, null, null, false);
+            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, idResp, model, usage, tools, null, null, null, false);
         }
     }
 
@@ -167,6 +214,11 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         {
             writer.WriteStartObject();
             writer.WriteString("model", request.ModelId.Value);
+            if (request.Prompt.ReservedOutputTokens > 0)
+            {
+                writer.WriteNumber("max_tokens", request.Prompt.ReservedOutputTokens);
+            }
+
             writer.WriteBoolean("stream", stream);
             writer.WritePropertyName("messages");
             writer.WriteStartArray();
@@ -230,9 +282,6 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
 
         return new Uri(trimmed + path);
     }
-
-    private static bool LooksJson(string? text) =>
-        !string.IsNullOrWhiteSpace(text) && (text.TrimStart().StartsWith('{') || text.TrimStart().StartsWith('['));
 }
 
 public sealed class ScriptedHttpMessageHandler : HttpMessageHandler
@@ -294,11 +343,25 @@ public sealed class FileProviderDefinitionStore : IProviderDefinitionStore
         lock (gate)
         {
             var items = Read().ToList();
+            var existing = items.FirstOrDefault(item => item.ProviderDefinitionId.Value == definition.ProviderDefinitionId.Value);
             items.RemoveAll(item => item.ProviderDefinitionId.Value == definition.ProviderDefinitionId.Value);
-            items.Add(definition);
+            items.Add(ProviderDefinitionRevision.Apply(existing, definition));
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.WriteAllText(path, Serialize(items));
+            AtomicWrite(Serialize(items));
         }
+    }
+
+    private void AtomicWrite(string json)
+    {
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, json);
+        if (File.Exists(path))
+        {
+            File.Replace(temp, path, path + ".bak");
+            return;
+        }
+
+        File.Move(temp, path);
     }
 
     private List<ProviderDefinitionV1> Read()
@@ -384,9 +447,21 @@ public sealed class FileProviderDefinitionStore : IProviderDefinitionStore
                     writer.WriteString("defaultModelId", model.Value);
                 }
 
+                writer.WritePropertyName("modelAliases");
+                writer.WriteStartObject();
+                foreach (var alias in item.ModelAliases.OrderBy(value => value.Key, StringComparer.Ordinal))
+                {
+                    writer.WriteString(alias.Key, alias.Value);
+                }
+
+                writer.WriteEndObject();
                 writer.WriteNumber("timeoutMs", item.TimeoutMs);
                 writer.WriteString("dataPolicy", ProviderDataBehaviorCodec.ToDurableValue(item.DataPolicy));
                 writer.WriteNumber("routingPriority", item.RoutingPriority);
+                if (!string.IsNullOrEmpty(item.PriceSnapshotId))
+                {
+                    writer.WriteString("priceSnapshotId", item.PriceSnapshotId);
+                }
                 writer.WriteBoolean("allowInsecureLocalHttp", item.AllowInsecureLocalHttp);
                 writer.WritePropertyName("adapterExtensions");
                 writer.WriteStartObject();

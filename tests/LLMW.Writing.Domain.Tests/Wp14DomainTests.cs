@@ -29,6 +29,10 @@ internal static partial class Program
         Run(nameof(UserTextNotNfcCollapsedInWireDigest), UserTextNotNfcCollapsedInWireDigest);
         Run(nameof(CheckpointInvocationLogRoundTripAndOmittedWhenEmpty), CheckpointInvocationLogRoundTripAndOmittedWhenEmpty);
         Run(nameof(HttpsRequiredForRemoteEndpoint), HttpsRequiredForRemoteEndpoint);
+        Run(nameof(ProtocolProbeDoesNotSatisfyTaskCertification), ProtocolProbeDoesNotSatisfyTaskCertification);
+        Run(nameof(CertificationStaleWhenCurrentAdapterChanges), CertificationStaleWhenCurrentAdapterChanges);
+        Run(nameof(OutputSchemaRejectsUnsupportedKeywordsAndValidatesNested), OutputSchemaRejectsUnsupportedKeywordsAndValidatesNested);
+        Run(nameof(CheckpointInvocationLogRetentionIsBounded), CheckpointInvocationLogRetentionIsBounded);
     }
 
     private static PromptCompileRequest CompileRequest(
@@ -304,6 +308,95 @@ internal static partial class Program
         AssertTrue(ProviderEndpoint.TryCreate("https://api.example.com/v1/", false, out _) is not null, "HTTPS rejected.");
         var local = ProviderEndpoint.TryCreate("http://127.0.0.1:11434/v1", true, out _);
         AssertTrue(local is not null && local.InsecureLocalHttp, "Loopback HTTP with explicit flag rejected.");
+    }
+
+    private static void ProtocolProbeDoesNotSatisfyTaskCertification()
+    {
+        var protocol = Candidate("p", "m", true) with
+        {
+            Certification = Candidate("p", "m", true).Certification with { Ceiling = ReasoningCeiling.Adaptive }
+        };
+        var denied = ProviderRouter.Route(
+            [protocol],
+            RouteRequirementProfile.TextOnly with { RequestedReasoning = ReasoningCeiling.Adaptive, RequiredTaskClass = "root_conflict" });
+        AssertEqual("ROUTE_NO_ELIGIBLE_CANDIDATE", denied.FailureCode, "Protocol probe certified a high-risk task class.");
+        var issued = new TaskCapabilityCertification(
+            "task-1", 1, "ds-root", "1", TaskCapabilityCertification.CurrentEvaluationSuiteVersion,
+            [
+                new TaskEvalScore(RootConflictMetrics.RootRecall, 0.95m),
+                new TaskEvalScore(RootConflictMetrics.FalseMergeRate, 0.01m),
+                new TaskEvalScore(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ],
+            [
+                new TaskEvalThreshold(RootConflictMetrics.RootRecall, 0.9m, true),
+                new TaskEvalThreshold(RootConflictMetrics.FalseMergeRate, 0m, true)
+            ],
+            ["root_conflict"],
+            ReasoningCeiling.Adaptive,
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.example/v1",
+            "openai_responses", "v1", new ModelId("m"), "prompt-base", CertificationState.Certified, 1);
+        AssertTrue(issued.PassesThresholds(), "Valid scores failed thresholds.");
+        var eligible = ProviderRouter.Route(
+            [protocol with { TaskCertification = issued }],
+            RouteRequirementProfile.TextOnly with { RequestedReasoning = ReasoningCeiling.Adaptive, RequiredTaskClass = "root_conflict" });
+        AssertTrue(eligible.Selected is not null, "Valid task certification was not eligible.");
+        AssertEqual(ReasoningCeiling.Conservative, TaskCapabilityCertification.Uncertified(
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.example/v1", "a", "v1", new ModelId("m")).EffectiveCeiling,
+            "Uncertified custom model was not Conservative.");
+    }
+
+    private static void CertificationStaleWhenCurrentAdapterChanges()
+    {
+        var cert = new ModelCertificationRecord(
+            "c1", 1, ModelCertificationRecord.CurrentProbeSuiteVersion,
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.example/v1",
+            "openai_responses", "v1", new ModelId("m"), CertificationState.Certified,
+            ReasoningCeiling.Conservative, ProviderDataBehavior.StatelessClientManaged,
+            [new CertifiedCapability(ModelCapabilityNames.ToolCalling, CapabilitySupport.Supported, MetadataProvenance.CertifiedObserved)],
+            1, "prompt-a");
+        AssertTrue(cert.IsStaleFor(new ProviderRevision(1), "https://api.example/v1", "openai_responses", "v2"),
+            "Current adapter version change did not stale protocol profile.");
+        AssertTrue(!cert.IsStaleFor(new ProviderRevision(1), "https://api.example/v1", "openai_responses", "v1"),
+            "Unchanged current adapter was treated as stale.");
+        var task = TaskCapabilityCertification.Uncertified(
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.example/v1", "openai_responses", "v1", new ModelId("m")) with
+        {
+            State = CertificationState.Certified,
+            MaxReasoningCeiling = ReasoningCeiling.Guarded,
+            DatasetId = "ds",
+            DatasetVersion = "1",
+            PromptBaselineDigest = "prompt-a",
+            Thresholds = [new TaskEvalThreshold(RootConflictMetrics.RootRecall, 0.1m, true)],
+            Scores = [new TaskEvalScore(RootConflictMetrics.RootRecall, 1m)]
+        };
+        AssertTrue(task.IsStaleFor(new ProviderRevision(1), "https://other/v1", "openai_responses", "v1", TaskCapabilityCertification.CurrentEvaluationSuiteVersion, "prompt-a"),
+            "Endpoint change did not stale task certification.");
+        AssertTrue(task.IsStaleFor(new ProviderRevision(1), "https://api.example/v1", "openai_responses", "v1", TaskCapabilityCertification.CurrentEvaluationSuiteVersion, "prompt-b"),
+            "Prompt baseline change did not stale task certification.");
+    }
+
+    private static void OutputSchemaRejectsUnsupportedKeywordsAndValidatesNested()
+    {
+        AssertTrue(!OutputSchemaSubset.TryValidateSchema("{\"type\":\"object\",\"anyOf\":[]}", out var unsupported), "anyOf was accepted.");
+        AssertTrue(unsupported!.StartsWith("unsupported-keyword", StringComparison.Ordinal), "Unsupported keyword error drifted.");
+        const string schema = """{"type":"object","additionalProperties":false,"required":["name","tags"],"properties":{"name":{"type":"string","enum":["a","b"]},"nested":{"type":"object","properties":{"ok":{"type":["boolean","null"]}}},"tags":{"type":"array","items":{"type":"string"}}}}""";
+        AssertTrue(OutputSchemaSubset.TryValidateSchema(schema, out _), "Supported subset rejected.");
+        AssertTrue(OutputSchemaSubset.TryValidateInstance("{\"name\":\"a\",\"tags\":[\"x\"],\"nested\":{\"ok\":null}}", schema, out _), "Valid nested instance rejected.");
+        AssertTrue(!OutputSchemaSubset.TryValidateInstance("{\"name\":\"a\",\"tags\":[\"x\"],\"extra\":1}", schema, out _), "additionalProperties=false accepted extra.");
+        AssertTrue(!OutputSchemaSubset.TryValidateInstance("{\"name\":\"z\",\"tags\":[]}", schema, out _), "enum mismatch accepted.");
+    }
+
+    private static void CheckpointInvocationLogRetentionIsBounded()
+    {
+        var log = Enumerable.Range(0, 20).Select(i => "{\"invocationId\":\"i" + i + "\"}").ToArray();
+        var retained = CheckpointV1.RetainLatestInvocations(log);
+        AssertEqual(CheckpointV1.RetainedInvocationLogLimit, retained.Count, "Retention count drifted.");
+        AssertEqual("{\"invocationId\":\"i12\"}", retained[0], "Oldest retained invocation drifted.");
+        var created = CheckpointV1.Create("plan", null, "{}", "{}", "sum", [], [], [], [], [], [], "p", "prov", "m", "e", log);
+        AssertEqual(CheckpointV1.RetainedInvocationLogLimit, created.InvocationLog.Count, "Create did not bound invocation log.");
     }
 
     private static RouteCandidate Candidate(string provider, string model, bool tools, CapabilitySupport support = CapabilitySupport.Supported)

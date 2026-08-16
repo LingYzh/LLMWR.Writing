@@ -70,12 +70,19 @@ public sealed record ModelCertificationRecord(
         ProviderRevision currentRevision,
         string currentEndpointIdentity,
         string currentAdapterId,
-        string currentAdapterVersion) =>
+        string currentAdapterVersion,
+        string? currentProbeSuiteVersion = null,
+        string? currentPromptBaselineDigest = null) =>
         State is CertificationState.Stale or CertificationState.Failed ||
         currentRevision != ProviderRevision ||
-        !string.Equals(currentEndpointIdentity, EndpointIdentity, StringComparison.Ordinal) ||
+        !ProviderEndpoint.IdentitiesMatch(currentEndpointIdentity, EndpointIdentity) ||
         !string.Equals(currentAdapterId, ProtocolAdapterId, StringComparison.Ordinal) ||
-        !string.Equals(currentAdapterVersion, ProtocolAdapterVersion, StringComparison.Ordinal);
+        !string.Equals(currentAdapterVersion, ProtocolAdapterVersion, StringComparison.Ordinal) ||
+        (currentProbeSuiteVersion is not null &&
+         !string.Equals(currentProbeSuiteVersion, ProbeSuiteVersion, StringComparison.Ordinal)) ||
+        (currentPromptBaselineDigest is not null &&
+         !string.IsNullOrEmpty(PromptBaselineDigest) &&
+         !string.Equals(currentPromptBaselineDigest, PromptBaselineDigest, StringComparison.Ordinal));
 
     public static ModelCertificationRecord Uncertified(
         ProviderDefinitionId provider,

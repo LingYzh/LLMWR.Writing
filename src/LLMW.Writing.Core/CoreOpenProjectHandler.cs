@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Ipc;
+using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
@@ -133,7 +134,10 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 commands.Inner = new CompositeIpcCommandHandler(
                     this,
                     new RuntimeIpcCommandHandler(scheduler, workspaceInstanceId),
-                    new Wp13IpcCommandHandler(wp13, workspaceInstanceId));
+                    new Wp13IpcCommandHandler(wp13, workspaceInstanceId),
+                    new Wp14IpcCommandHandler(
+                        new ProviderInvocationStateHandler(store, scheduler, authorization),
+                        workspaceInstanceId));
                 wp13.RecoverBackgroundTasks();
                 runSessions.PublishOnce(sessions);
                 published = sessions;

@@ -62,6 +62,9 @@ public static class IpcSemanticTypes
     public const string ListBackgroundTasks = "listBackgroundTasks";
     public const string GetBackgroundTask = "getBackgroundTask";
     public const string StopBackgroundTask = "stopBackgroundTask";
+    public const string GetTaskExecutionSnapshot = "getTaskExecutionSnapshot";
+    public const string PersistProviderInvocation = "persistProviderInvocation";
+    public const string AuthorizeToolProposal = "authorizeToolProposal";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -121,7 +124,10 @@ public static class IpcSemanticTypes
         CreateSpecialistTestRun,
         ListBackgroundTasks,
         GetBackgroundTask,
-        StopBackgroundTask
+        StopBackgroundTask,
+        GetTaskExecutionSnapshot,
+        PersistProviderInvocation,
+        AuthorizeToolProposal
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();
@@ -148,7 +154,7 @@ public static class IpcSemanticTypes
         semanticType is Hello or HelloAck;
 
     public static bool IsSafeToReplayAfterReconnect(string semanticType) =>
-        semanticType is Hello or Heartbeat or GetStateSnapshot or SubscribeEvents;
+        semanticType is Hello or Heartbeat or GetStateSnapshot or SubscribeEvents or GetTaskExecutionSnapshot;
 
     public static bool IsCriticalControl(string semanticType) =>
         semanticType is Hello or HelloAck or Heartbeat or HeartbeatAck or Cancel or GetStateSnapshot

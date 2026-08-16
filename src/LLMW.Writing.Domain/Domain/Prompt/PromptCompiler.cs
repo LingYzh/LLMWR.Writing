@@ -38,6 +38,14 @@ public static class PromptCompiler
             }
         }
 
+        if (request.OutputContract.Kind == OutputContractKind.StructuredJson)
+        {
+            if (!OutputSchemaSubset.TryValidateSchema(request.OutputContract.SchemaJson, out var schemaError))
+            {
+                return new PromptCompileResult(null, new PromptCompileFailure("OUTPUT_SCHEMA_UNSUPPORTED", schemaError ?? "schema"));
+            }
+        }
+
         var blocks = new List<PromptBlock>();
         Add(blocks, "kernel", PromptLayer.RuntimePolicy, PromptSemanticRole.Instruction, PromptSourceKind.RuntimeKernel,
             "runtime-kernel", RuntimeKernelText, true, PromptTrustClass.RuntimeEnforced, PromptTruncationClass.Never,
@@ -106,6 +114,19 @@ public static class PromptCompiler
                 PromptSemanticRole.Context, PromptSourceKind.Narrative, narrative.SourceId, narrative.Text, false,
                 PromptTrustClass.UntrustedContext, PromptTruncationClass.Optional, "narrative:" + narrative.SourceId);
             narrativeIndex++;
+        }
+
+        if (request.ToolResults is { Count: > 0 })
+        {
+            var toolIndex = 0;
+            foreach (var tool in request.ToolResults)
+            {
+                Add(blocks, "tool-result-" + toolIndex.ToString(CultureInfo.InvariantCulture), PromptLayer.Task,
+                    PromptSemanticRole.Context, PromptSourceKind.RequiredResult, tool.CallId,
+                    "tool " + tool.ToolName + " result:\n" + tool.ResultJson, true,
+                    PromptTrustClass.UntrustedContext, PromptTruncationClass.Never, "tool-result:" + tool.CallId);
+                toolIndex++;
+            }
         }
 
         if (!string.IsNullOrEmpty(request.UserRequest))
@@ -373,6 +394,49 @@ public static class PromptDigests
 
         return Utf8Digest.Sha256Hex(WireRequestPrefix + Encoding.UTF8.GetString(stream.ToArray()));
     }
+
+    public static string WireRequestDigestFromPrepared(
+        string adapterId,
+        string adapterVersion,
+        string method,
+        string path,
+        bool stream,
+        string canonicalSemanticBody,
+        IReadOnlyDictionary<string, string> nonSecretHeaders)
+    {
+        using var streamOut = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(streamOut))
+        {
+            writer.WriteStartObject();
+            writer.WriteString("adapterId", adapterId);
+            writer.WriteString("adapterVersion", adapterVersion);
+            writer.WriteString("method", method);
+            writer.WriteString("path", path);
+            writer.WriteBoolean("stream", stream);
+            writer.WriteString("body", canonicalSemanticBody);
+            writer.WritePropertyName("headers");
+            writer.WriteStartObject();
+            foreach (var header in nonSecretHeaders
+                         .Where(item => !IsUnstableOrSecretHeader(item.Key))
+                         .OrderBy(item => item.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                writer.WriteString(header.Key.ToLowerInvariant(), header.Value);
+            }
+
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return Utf8Digest.Sha256Hex(WireRequestPrefix + Encoding.UTF8.GetString(streamOut.ToArray()));
+    }
+
+    private static bool IsUnstableOrSecretHeader(string name) =>
+        name.Equals("X-Client-Request-Id", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("OpenAI-Client-Request-Id", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("x-api-key", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("authorization", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("api-key", StringComparison.OrdinalIgnoreCase);
 
     public static string ToolSchemaDigest(IReadOnlyList<AuthorizedToolSchema> tools)
     {

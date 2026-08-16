@@ -96,7 +96,7 @@ public sealed class ProviderHttpTransport
             false);
     }
 
-    public async IAsyncEnumerable<(SseFrame Frame, byte[] Raw)> ReadSseAsync(
+    public async IAsyncEnumerable<SseReadResult> ReadSseAsync(
         Uri uri,
         IReadOnlyDictionary<string, string> headers,
         string jsonBody,
@@ -112,27 +112,117 @@ public sealed class ProviderHttpTransport
 
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("text/event-stream"));
         request.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
-        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-            .ConfigureAwait(false);
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        var parser = new SseEventParser();
-        var buffer = new byte[1];
-        while (true)
+        HttpResponseMessage? response = null;
+        ProviderHttpResult? sendFailure = null;
+        try
         {
-            var read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                foreach (var frame in parser.Finish())
-                {
-                    yield return (frame, buffer);
-                }
+            response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            sendFailure = ProviderHttpResult.AfterPossibleSend(
+                InvocationLifecycle.CancelRequested, InvocationFailureClass.LocalCancelUnknownRemote, true);
+        }
+        catch (TaskCanceledException)
+        {
+            sendFailure = ProviderHttpResult.AfterPossibleSend(
+                InvocationLifecycle.OutcomeUnknown, InvocationFailureClass.TimeoutOutcomeUnknown, true);
+        }
+        catch (HttpRequestException)
+        {
+            sendFailure = ProviderHttpResult.AfterPossibleSend(
+                InvocationLifecycle.OutcomeUnknown, InvocationFailureClass.TransportOutcomeUnknown, true);
+        }
 
+        if (sendFailure is not null || response is null)
+        {
+            yield return new SseReadResult(
+                null,
+                sendFailure ?? ProviderHttpResult.AfterPossibleSend(
+                    InvocationLifecycle.OutcomeUnknown, InvocationFailureClass.TransportOutcomeUnknown, true));
+            yield break;
+        }
+
+        using (response)
+        {
+            var status = (int)response.StatusCode;
+            if (status is < 200 or >= 300)
+            {
+                var errorBody = await response.Content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+                var media = response.Content.Headers.ContentType?.MediaType;
+                var requestId = response.Headers.TryGetValues("x-request-id", out var values)
+                    ? values.FirstOrDefault()
+                    : null;
+                yield return new SseReadResult(
+                    null,
+                    new ProviderHttpResult(
+                        InvocationStateMachine.AfterHttpStatus(status),
+                        InvocationStateMachine.ClassifyHttp(status),
+                        status,
+                        requestId,
+                        errorBody,
+                        media,
+                        HeaderRedaction.Describe(request),
+                        false));
                 yield break;
             }
 
-            foreach (var frame in parser.Push(buffer.AsSpan(0, read)))
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var parser = new SseEventParser();
+            var buffer = new byte[1];
+            while (true)
             {
-                yield return (frame, buffer);
+                int read = 0;
+                ProviderHttpResult? readFailure = null;
+                try
+                {
+                    read = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    readFailure = ProviderHttpResult.AfterPossibleSend(
+                        InvocationLifecycle.CancelRequested, InvocationFailureClass.LocalCancelUnknownRemote, true);
+                }
+                catch (TaskCanceledException)
+                {
+                    readFailure = ProviderHttpResult.AfterPossibleSend(
+                        InvocationLifecycle.OutcomeUnknown, InvocationFailureClass.TimeoutOutcomeUnknown, true);
+                }
+                catch (HttpRequestException)
+                {
+                    readFailure = ProviderHttpResult.AfterPossibleSend(
+                        InvocationLifecycle.OutcomeUnknown, InvocationFailureClass.TransportOutcomeUnknown, true);
+                }
+
+                if (readFailure is not null)
+                {
+                    yield return new SseReadResult(null, readFailure);
+                    yield break;
+                }
+
+                var frames = read == 0 ? parser.Finish() : parser.Push(buffer.AsSpan(0, read));
+                if (parser.FailureCode is not null)
+                {
+                    yield return new SseReadResult(
+                        null,
+                        ProviderHttpResult.BeforeSend(parser.FailureCode) with
+                        {
+                            Lifecycle = InvocationLifecycle.Rejected,
+                            FailureClass = InvocationFailureClass.MalformedProtocol
+                        });
+                    yield break;
+                }
+
+                foreach (var frame in frames)
+                {
+                    yield return new SseReadResult(frame, null);
+                }
+
+                if (read == 0)
+                {
+                    yield break;
+                }
             }
         }
     }

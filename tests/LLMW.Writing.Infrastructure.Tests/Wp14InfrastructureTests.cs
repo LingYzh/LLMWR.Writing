@@ -18,6 +18,12 @@ internal static partial class Program
         Run(nameof(HttpErrorsClassifyExactly), HttpErrorsClassifyExactly);
         Run(nameof(SensitiveHeadersAreRedactedAndDefinitionsOmitSecrets), SensitiveHeadersAreRedactedAndDefinitionsOmitSecrets);
         Run(nameof(StreamEofBeforeTerminalIsIncomplete), StreamEofBeforeTerminalIsIncomplete);
+        Run(nameof(OpenAiUsesStableClientRequestIdAndStreamHttpTaxonomy), OpenAiUsesStableClientRequestIdAndStreamHttpTaxonomy);
+        Run(nameof(SseParserEnforcesBounds), SseParserEnforcesBounds);
+        Run(nameof(AnthropicStopReasonsAndThinkingModes), AnthropicStopReasonsAndThinkingModes);
+        Run(nameof(DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses), DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses);
+        Run(nameof(ProviderDefinitionRoundTripAndRevisionAdvance), ProviderDefinitionRoundTripAndRevisionAdvance);
+        Run(nameof(WireDigestChangesWithSemanticRequestDimensions), WireDigestChangesWithSemanticRequestDimensions);
     }
 
     private static PromptIr SampleIr(bool tools = false)
@@ -227,6 +233,194 @@ internal static partial class Program
         }
         AssertTrue(events.Any(item => item.Kind == ModelRuntimeEventKind.Incomplete && item.ErrorCode == "eof-before-terminal"),
             "EOF before terminal not Incomplete.");
+    }
+
+    private static void OpenAiUsesStableClientRequestIdAndStreamHttpTaxonomy()
+    {
+        string? captured = null;
+        var handler = new ScriptedHttpMessageHandler(request =>
+        {
+            captured = request.Headers.TryGetValues("X-Client-Request-Id", out var values) ? values.FirstOrDefault() : null;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"id\":\"r\",\"output\":[],\"status\":\"completed\"}", Encoding.UTF8, "application/json")
+            };
+        });
+        var adapter = new OpenAiResponsesAdapter(new ProviderHttpTransport(handler));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        using var secret = new ResolvedProviderSecret("token");
+        var ir = SampleIr();
+        _ = adapter.InvokeAsync(definition, ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!, secret,
+            new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string>(), "inv-stable"),
+            CancellationToken.None).GetAwaiter().GetResult();
+        AssertEqual("inv-stable", captured ?? "", "X-Client-Request-Id was not the frozen InvocationId.");
+
+        foreach (var (status, expected) in new[]
+                 {
+                     (HttpStatusCode.Unauthorized, InvocationFailureClass.HttpUnauthorized),
+                     (HttpStatusCode.TooManyRequests, InvocationFailureClass.HttpRateLimited),
+                     (HttpStatusCode.InternalServerError, InvocationFailureClass.HttpServerError)
+                 })
+        {
+            var streamHandler = new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(status)
+            {
+                Content = new StringContent("{\"error\":\"nope\"}", Encoding.UTF8, "application/json")
+            });
+            var streamAdapter = new OpenAiResponsesAdapter(new ProviderHttpTransport(streamHandler));
+            var events = Drain(streamAdapter.StreamAsync(
+                definition,
+                ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+                secret,
+                new ProviderInvokeRequest(ir, new ModelId("m"), true, new Dictionary<string, string>(), "inv-stream"),
+                CancellationToken.None));
+            AssertTrue(events.Any(item => item.Terminal && item.ErrorCode == expected.ToString()),
+                status + " stream was not classified as " + expected);
+        }
+    }
+
+    private static void SseParserEnforcesBounds()
+    {
+        var parser = new SseEventParser();
+        var linePayload = new string('x', 32 * 1024);
+        var builder = new StringBuilder();
+        while (builder.Length < SseEventParser.MaxEventDataBytes + 4096)
+        {
+            builder.Append("data: ").Append(linePayload).Append('\n');
+        }
+
+        builder.Append('\n');
+        _ = parser.Push(Encoding.UTF8.GetBytes(builder.ToString()));
+        AssertEqual("PROTOCOL_SSE_EVENT_TOO_LARGE", parser.FailureCode ?? "", "Unbounded SSE event data accepted.");
+        var line = new SseEventParser();
+        _ = line.Push(Encoding.UTF8.GetBytes(new string('a', SseEventParser.MaxLineBytes + 4)));
+        AssertEqual("PROTOCOL_SSE_LINE_TOO_LARGE", line.FailureCode ?? "", "Unbounded SSE line accepted.");
+    }
+
+    private static void AnthropicStopReasonsAndThinkingModes()
+    {
+        AssertEqual(InvocationLifecycle.Completed.ToString(), AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn"}""")).Lifecycle.ToString(), "end_turn not completed.");
+        AssertEqual(InvocationLifecycle.Incomplete.ToString(), AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"max_tokens"}""")).Lifecycle.ToString(), "max_tokens not incomplete.");
+        AssertEqual(InvocationLifecycle.Incomplete.ToString(), AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"text","text":"hi"}],"stop_reason":"model_context_window_exceeded"}""")).Lifecycle.ToString(), "context window not incomplete.");
+        AssertEqual(InvocationFailureClass.ProviderRefusal.ToString(), AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"text","text":"no"}],"stop_reason":"refusal"}""")).FailureClass.ToString(), "refusal drifted.");
+        AssertEqual("tool_use", AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"tool_use","id":"t1","name":"lookup","input":{}}],"stop_reason":"tool_use"}""")).ErrorCode ?? "", "tool_use not a model subturn.");
+        AssertEqual("pause_turn", AnthropicMessagesAdapter.Parse(Json(200, """{"id":"m","content":[{"type":"text","text":"wait"}],"stop_reason":"pause_turn"}""")).ErrorCode ?? "", "pause_turn drifted.");
+
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var ir = SampleIr();
+        var enabled = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "2048" }, "inv"));
+        AssertTrue(enabled.Succeeded, "Manual thinking with budget rejected.");
+        AssertTrue(enabled.Request!.CanonicalSemanticBody.Contains("budget_tokens", StringComparison.Ordinal), "budget_tokens missing.");
+        var adaptive = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "adaptive", ["thinkingEffort"] = "high" }, "inv"));
+        AssertTrue(adaptive.Succeeded, "Adaptive thinking rejected.");
+        AssertTrue(adaptive.Request!.CanonicalSemanticBody.Contains("adaptive", StringComparison.Ordinal), "adaptive thinking missing.");
+        var invalid = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled" }, "inv"));
+        AssertEqual("THINKING_UNSUPPORTED", invalid.ErrorCode ?? "", "Invalid thinking was sent.");
+    }
+
+    private static void DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses()
+    {
+        var adapter = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create(
+            "p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.deepseek.com", "cred", "m",
+            allowInsecureLocalHttp: false, extensions: new Dictionary<string, string> { ["thinking"] = "enabled" });
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var withTools = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, definition.AdapterExtensions, "inv"));
+        AssertEqual("DEEPSEEK_THINKING_TOOLS_UNSUPPORTED", withTools.ErrorCode ?? "", "Thinking+tools was advertised.");
+        var noTools = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(SampleIr(), new ModelId("m"), false, definition.AdapterExtensions, "inv"));
+        AssertTrue(noTools.Succeeded, "Thinking without tools was blocked.");
+        var parsed = OpenAiCompatibleChatAdapter.Parse(Json(200, """
+            {"id":"chatcmpl_think","choices":[{"message":{"role":"assistant","content":"ok","reasoning_content":"hidden-cot"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"completion_tokens_details":{"reasoning_tokens":9}}}
+            """));
+        AssertEqual(9L, parsed.Usage.ReasoningTokens.Value.GetValueOrDefault(), "Reasoning tokens dropped.");
+        AssertTrue(parsed.Events.All(item => item.Text != "hidden-cot"), "reasoning_content became a product event.");
+    }
+
+    private static void ProviderDefinitionRoundTripAndRevisionAdvance()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "llmw-wp14", Guid.NewGuid().ToString("N"), "providers.json");
+        var store = new FileProviderDefinitionStore(path);
+        var original = new ProviderDefinitionV1(
+            new ProviderDefinitionId("p1"),
+            new ProviderRevision(1),
+            "One",
+            true,
+            ProtocolKind.OpenAiResponses,
+            "https://api.example.com/v1",
+            new CredentialRef("cred-ref"),
+            new ModelId("m1"),
+            new Dictionary<string, string> { ["alias"] = "m1-alias" },
+            30_000,
+            ProviderDataBehavior.StatelessClientManaged,
+            2,
+            "price-1",
+            new Dictionary<string, string> { ["thinking"] = "enabled" },
+            false);
+        store.Upsert(original);
+        var reloaded = store.FindById(new ProviderDefinitionId("p1"))!;
+        AssertEqual(original.PriceSnapshotId ?? "", reloaded.PriceSnapshotId ?? "", "PriceSnapshotId dropped.");
+        AssertEqual("m1-alias", reloaded.ModelAliases["alias"], "modelAliases dropped.");
+        AssertEqual(1, reloaded.Revision.Value, "First insert revision drifted.");
+        store.Upsert(reloaded with { DisplayName = "Still One" });
+        AssertEqual(1, store.FindById(new ProviderDefinitionId("p1"))!.Revision.Value, "Idempotent update advanced revision.");
+        store.Upsert(reloaded with { Endpoint = "https://api.example.com/v2", Revision = new ProviderRevision(1) });
+        AssertEqual(2, store.FindById(new ProviderDefinitionId("p1"))!.Revision.Value, "Semantic endpoint change did not advance revision.");
+    }
+
+    private static void WireDigestChangesWithSemanticRequestDimensions()
+    {
+        var adapter = new OpenAiResponsesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var ir = SampleIr();
+        string Digest(ProviderInvokeRequest request)
+        {
+            var prepared = adapter.Prepare(definition, endpoint, request).Request!;
+            return PromptDigests.WireRequestDigestFromPrepared(
+                adapter.AdapterId, adapter.AdapterVersion, prepared.Method, prepared.Path, prepared.Stream,
+                prepared.CanonicalSemanticBody, prepared.NonSecretHeaders);
+        }
+
+        var baseline = new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string>(), "inv-a");
+        var baseDigest = Digest(baseline);
+        AssertTrue(baseDigest != Digest(baseline with { Stream = true }), "stream did not change digest.");
+        AssertTrue(baseDigest != Digest(baseline with { ModelId = new ModelId("m2") }), "model did not change digest.");
+        AssertTrue(baseDigest != Digest(new ProviderInvokeRequest(SampleIr() with { ReservedOutputTokens = 128 }, new ModelId("m"), false, new Dictionary<string, string>(), "inv-a")),
+            "max_tokens did not change digest.");
+        AssertTrue(baseDigest != Digest(baseline with { AdapterExtensions = new Dictionary<string, string> { ["reasoningEffort"] = "high" } }),
+            "reasoning effort did not change digest.");
+        AssertTrue(baseDigest != Digest(new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv-a")),
+            "tool schema did not change digest.");
+        var structured = PromptCompiler.Compile(new PromptCompileRequest(
+            PromptCompilerVersions.Current, "writer", "role", "behavior", BehavioralOverrideMode.Default, null,
+            ContentBehaviorMode.Sfw, ["project"], [], "workflow", "task", [], [], "hello", [],
+            new PromptOutputContract(OutputContractKind.StructuredJson, "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":[\"x\"],\"additionalProperties\":false}", ["x"]),
+            null, 64)).Ir!;
+        AssertTrue(baseDigest != Digest(new ProviderInvokeRequest(structured, new ModelId("m"), false, new Dictionary<string, string> { ["strictStructuredOutput"] = "true" }, "inv-a")),
+            "output schema did not change digest.");
+        var secretA = Digest(baseline with { ClientRequestId = "inv-a" });
+        var secretB = Digest(baseline with { ClientRequestId = "inv-b" });
+        AssertEqual(secretA, secretB, "Unstable/client request id entered WireRequestDigest.");
+    }
+
+    private static List<ModelRuntimeEvent> Drain(IAsyncEnumerable<ModelRuntimeEvent> stream)
+    {
+        var events = new List<ModelRuntimeEvent>();
+        var enumerator = stream.GetAsyncEnumerator();
+        try
+        {
+            while (enumerator.MoveNextAsync().AsTask().GetAwaiter().GetResult())
+            {
+                events.Add(enumerator.Current);
+            }
+        }
+        finally
+        {
+            enumerator.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+
+        return events;
     }
 
     private static ProviderHttpResult Json(int status, string body) =>

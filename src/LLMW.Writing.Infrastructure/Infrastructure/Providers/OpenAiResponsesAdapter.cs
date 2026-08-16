@@ -8,7 +8,7 @@ namespace LLMW.Writing.Infrastructure.Providers;
 
 public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
 {
-    public const string CurrentVersion = "wp14-openai-responses-v1";
+    public const string CurrentVersion = "wp14-openai-responses-v2";
     private readonly ProviderHttpTransport transport;
 
     public OpenAiResponsesAdapter(ProviderHttpTransport transport)
@@ -22,6 +22,23 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
 
     public ProtocolKind ProtocolKind => ProtocolKind.OpenAiResponses;
 
+    public ProviderPrepareResult Prepare(
+        ProviderDefinitionV1 definition,
+        ProviderEndpoint endpoint,
+        ProviderInvokeRequest request)
+    {
+        _ = definition;
+        var path = Combine(endpoint.CanonicalUri, "/v1/responses").AbsolutePath;
+        var body = BuildRequest(request, request.Stream);
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(request.ClientRequestId))
+        {
+            headers["X-Client-Request-Id"] = request.ClientRequestId;
+        }
+
+        return new ProviderPrepareResult(new PreparedProviderRequest("POST", path, body, headers, request.Stream), null);
+    }
+
     public async Task<ProviderInvokeResult> InvokeAsync(
         ProviderDefinitionV1 definition,
         ProviderEndpoint endpoint,
@@ -29,14 +46,20 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         CancellationToken cancellationToken)
     {
-        var uri = Combine(endpoint.CanonicalUri, "/v1/responses");
-        var body = BuildRequest(request, stream: false);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var prepared = Prepare(definition, endpoint, request with { Stream = false });
+        if (!prepared.Succeeded || prepared.Request is null)
         {
-            ["Authorization"] = "Bearer " + secret.Reveal(),
-            ["OpenAI-Client-Request-Id"] = Guid.NewGuid().ToString("N")
+            return new ProviderInvokeResult(
+                InvocationLifecycle.FailedBeforeSend, InvocationFailureClass.FailedBeforeSend,
+                [], null, null, null, NormalizedUsage.Unknown, [], null, null, prepared.ErrorCode, false);
+        }
+
+        var uri = Combine(endpoint.CanonicalUri, "/v1/responses");
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
+        {
+            ["Authorization"] = "Bearer " + secret.Reveal()
         };
-        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
+        var http = await transport.SendAsync(uri, HttpMethod.Post, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken)
             .ConfigureAwait(false);
         if (http.Lifecycle is InvocationLifecycle.FailedBeforeSend or InvocationLifecycle.OutcomeUnknown or InvocationLifecycle.CancelRequested)
         {
@@ -58,15 +81,33 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var prepared = Prepare(definition, endpoint, request with { Stream = true });
+        if (!prepared.Succeeded || prepared.Request is null)
+        {
+            yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, prepared.ErrorCode, true);
+            yield break;
+        }
+
         var uri = Combine(endpoint.CanonicalUri, "/v1/responses");
-        var body = BuildRequest(request, stream: true);
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        var headers = new Dictionary<string, string>(prepared.Request.NonSecretHeaders, StringComparer.OrdinalIgnoreCase)
         {
             ["Authorization"] = "Bearer " + secret.Reveal()
         };
         var terminal = false;
-        await foreach (var (frame, _) in transport.ReadSseAsync(uri, headers, body, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
+        await foreach (var item in transport.ReadSseAsync(uri, headers, prepared.Request.CanonicalSemanticBody, TimeSpan.FromMilliseconds(definition.TimeoutMs), cancellationToken))
         {
+            if (item.Failure is { } failure)
+            {
+                yield return new ModelRuntimeEvent(ModelRuntimeEventKind.Error, null, null, null, null, null, null, failure.FailureClass.ToString(), true);
+                yield break;
+            }
+
+            if (item.Frame is null)
+            {
+                continue;
+            }
+
+            var frame = item.Frame;
             if (string.Equals(frame.Data, "[DONE]", StringComparison.Ordinal))
             {
                 continue;
@@ -153,7 +194,6 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             var events = new List<ModelRuntimeEvent>();
             var tools = new List<ToolCallRequest>();
             string? text = null;
-            string? structured = null;
             string? refusal = null;
             if (root.TryGetProperty("output", out output))
             {
@@ -192,11 +232,6 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             if (text is not null)
             {
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.TextCompleted, text, null, null, null, null, null, null, false));
-                if (LooksJson(text))
-                {
-                    structured = text;
-                    events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.StructuredOutput, text, null, null, null, text, null, null, false));
-                }
             }
 
             var usage = UsageNormalizer.FromOpenAi(root);
@@ -205,7 +240,7 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             if (status == "incomplete")
             {
                 events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Incomplete, text, null, null, null, null, usage, "incomplete", true));
-                return new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, id, model, usage, tools, structured, refusal, "incomplete", false);
+                return new ProviderInvokeResult(InvocationLifecycle.Incomplete, InvocationFailureClass.IncompleteGeneration, events, http.ProviderRequestId, id, model, usage, tools, null, refusal, "incomplete", false);
             }
 
             if (refusal is not null)
@@ -215,7 +250,7 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             }
 
             events.Add(new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, text, null, null, null, null, usage, null, true));
-            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, id, model, usage, tools, structured, null, null, false);
+            return new ProviderInvokeResult(InvocationLifecycle.Completed, InvocationFailureClass.None, events, http.ProviderRequestId, id, model, usage, tools, null, null, null, false);
         }
     }
 
@@ -228,6 +263,10 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             writer.WriteString("model", request.ModelId.Value);
             writer.WriteBoolean("store", false);
             writer.WriteBoolean("stream", stream);
+            if (request.Prompt.ReservedOutputTokens > 0)
+            {
+                writer.WriteNumber("max_output_tokens", request.Prompt.ReservedOutputTokens);
+            }
             writer.WriteString("instructions", PromptWireMapping.JoinInstructions(request.Prompt));
             writer.WritePropertyName("input");
             writer.WriteStartArray();
@@ -264,6 +303,12 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
                 writer.WriteStartObject();
                 writer.WriteString("type", "json_schema");
                 writer.WriteString("name", "task_output");
+                if (request.AdapterExtensions.TryGetValue("strictStructuredOutput", out var strict) &&
+                    strict == "true")
+                {
+                    writer.WriteBoolean("strict", true);
+                }
+
                 writer.WritePropertyName("schema");
                 using var schema = JsonDocument.Parse(request.Prompt.OutputContract.SchemaJson);
                 schema.RootElement.WriteTo(writer);
@@ -304,10 +349,4 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
 
     private static string? Id(JsonElement element, string name) =>
         element.TryGetProperty(name, out var value) ? value.GetString() : null;
-
-    private static bool LooksJson(string text)
-    {
-        var trimmed = text.TrimStart();
-        return trimmed.StartsWith('{') || trimmed.StartsWith('[');
-    }
 }
