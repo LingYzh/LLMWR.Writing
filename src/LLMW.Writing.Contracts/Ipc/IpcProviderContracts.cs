@@ -8,7 +8,11 @@ public sealed record FrozenRequiredResultDto(
     string? Digest,
     string? Text);
 
-public sealed record GetTaskExecutionSnapshotRequest(string RunId, string TaskId, string? AttemptId);
+public sealed record GetTaskExecutionSnapshotRequest(
+    string RunId,
+    string TaskId,
+    string? AttemptId,
+    RunSessionProof? Session = null);
 
 public sealed record GetTaskExecutionSnapshotResponse(
     string SnapshotGeneration,
@@ -25,7 +29,8 @@ public sealed record PersistProviderInvocationRequest(
     string SnapshotJson,
     string? RecordJson,
     string InputDigestSetJson,
-    string SnapshotGeneration);
+    string SnapshotGeneration,
+    RunSessionProof? Session = null);
 
 public sealed record PersistProviderInvocationResponse(string CheckpointId, bool IdempotentReplay);
 

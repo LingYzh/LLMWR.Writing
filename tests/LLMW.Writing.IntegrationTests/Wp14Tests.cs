@@ -65,14 +65,17 @@ internal static partial class Program
                 InvocationLifecycle.Completed, InvocationFailureClass.None,
                 [new ModelRuntimeEvent(ModelRuntimeEventKind.Completed, "ok", null, null, null, null, NormalizedUsage.Unknown, null, true)],
                 "req", "resp", "m1-actual", NormalizedUsage.Unknown, [], null, null, null, false));
-        var coordinator = new ProviderInvocationCoordinator(
-            definitions, credentials, certifications, new MemoryPriceSnapshotStore(),
-            new StaticProviderAdapterResolver(adapter),
-            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler)),
-            clock: TimeProvider.System);
         Success(scheduler.CreateWorkflowRun("wf-14"));
         Success(scheduler.CreateRun("wf-14", "writer", null, "run-14"));
         Success(scheduler.CreateTask("run-14", "write", 1, null, "task-14"));
+        ProviderInvocationStateHandler.SeedInferenceAttempt(store, "task-14", "att-14");
+        var identity = new DirectProviderInvocationIdentity(store, clock);
+        identity.Bind("run-14");
+        var coordinator = new ProviderInvocationCoordinator(
+            definitions, credentials, certifications, new MemoryPriceSnapshotStore(),
+            new StaticProviderAdapterResolver(adapter),
+            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler), identity),
+            clock: TimeProvider.System);
         var outcome = coordinator.Invoke(new ModelInvocationCommand(
             "run-14",
             "task-14",
@@ -195,8 +198,20 @@ internal static partial class Program
             clock,
             new FakeRunWorkerSupervisor());
         var coreHandler = new ProviderInvocationStateHandler(store, scheduler);
+        Success(scheduler.CreateWorkflowRun("wf-14c"));
+        Success(scheduler.CreateRun("wf-14c", "writer", null, "run-14c"));
+        Success(scheduler.CreateTask("run-14c", "write", 1, null, "task-14c"));
+        ProviderInvocationStateHandler.SeedInferenceAttempt(store, "task-14c", "att-14c");
+        var identity = new DirectProviderInvocationIdentity(store, clock);
+        identity.Bind("run-14c");
         var ipc = new Wp14IpcCommandHandler(coreHandler, "workspace-01");
-        var client = new IpcProviderInvocationStateClient(ipc, "workspace-01");
+        var client = new AuthenticatedProviderInvocationStateClient(
+            new FakeIpcApplicationCommandTransport(
+                ipc,
+                "workspace-01",
+                identity.PrincipalFor("run-14c"),
+                identity.Channel),
+            identity.ProofFor("run-14c")!);
         var definitions = new MemoryProviderDefinitionStore();
         var credentials = new MemoryProviderCredentialResolver();
         credentials.Store(new CredentialRef("cred-a"), "sk-wp14-canary-9f3a2c");
@@ -224,9 +239,6 @@ internal static partial class Program
                 "AgentRuntime coordinator holds RuntimeSchedulerService.");
         }
 
-        Success(scheduler.CreateWorkflowRun("wf-14c"));
-        Success(scheduler.CreateRun("wf-14c", "writer", null, "run-14c"));
-        Success(scheduler.CreateTask("run-14c", "write", 1, null, "task-14c"));
         var outcome = coordinator.Invoke(new ModelInvocationCommand(
             "run-14c",
             "task-14c",
@@ -258,6 +270,10 @@ internal static partial class Program
         Success(scheduler.CreateWorkflowRun("wf-hist"));
         Success(scheduler.CreateRun("wf-hist", "writer", null, "run-hist"));
         Success(scheduler.CreateTask("run-hist", "write", 1, null, "task-hist"));
+        ProviderInvocationStateHandler.SeedInferenceAttempt(store, "task-hist", "att-1");
+        ProviderInvocationStateHandler.SeedInferenceAttempt(store, "task-hist", "att-2");
+        var identity = new DirectProviderInvocationIdentity(store, clock);
+        identity.Bind("run-hist");
         var definitions = new MemoryProviderDefinitionStore();
         var credentials = new MemoryProviderCredentialResolver();
         credentials.Store(new CredentialRef("cred-a"), "secret-g1");
@@ -276,7 +292,7 @@ internal static partial class Program
         var coordinator = new ProviderInvocationCoordinator(
             definitions, credentials, certifications, new MemoryPriceSnapshotStore(),
             new StaticProviderAdapterResolver(adapter),
-            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler)));
+            new DirectProviderInvocationStatePort(new ProviderInvocationStateHandler(store, scheduler), identity));
         var first = coordinator.Invoke(new ModelInvocationCommand(
             "run-hist", "task-hist", "att-1",
             new PromptCompileRequest(

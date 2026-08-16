@@ -16,7 +16,25 @@ public static class RootConflictMetrics
 
 public sealed record TaskEvalScore(string MetricName, decimal Value);
 
-public sealed record TaskEvalThreshold(string MetricName, decimal Minimum, bool MustPass);
+public enum ThresholdComparator
+{
+    Minimum,
+    Maximum
+}
+
+public sealed record TaskEvalThreshold(string MetricName, decimal Bound, ThresholdComparator Comparator, bool MustPass)
+{
+    public static TaskEvalThreshold AtLeast(string metricName, decimal bound, bool mustPass = true) =>
+        new(metricName, bound, ThresholdComparator.Minimum, mustPass);
+
+    public static TaskEvalThreshold AtMost(string metricName, decimal bound, bool mustPass = true) =>
+        new(metricName, bound, ThresholdComparator.Maximum, mustPass);
+
+    public static ThresholdComparator ComparatorFor(string metricName) =>
+        string.Equals(metricName, RootConflictMetrics.FalseMergeRate, StringComparison.Ordinal)
+            ? ThresholdComparator.Maximum
+            : ThresholdComparator.Minimum;
+}
 
 public sealed record TaskCapabilityCertification(
     string CertificationId,
@@ -39,9 +57,47 @@ public sealed record TaskCapabilityCertification(
     long CertifiedAtMs)
 {
     public const string CurrentEvaluationSuiteVersion = "wp14-task-eval-v1";
+    public const string RootConflictTaskClass = "root_conflict";
+
+    public static IReadOnlyList<string> RootConflictRequiredMetrics { get; } =
+    [
+        RootConflictMetrics.RootRecall,
+        RootConflictMetrics.FalseMergeRate,
+        RootConflictMetrics.EvidenceFidelity,
+        RootConflictMetrics.PropagationAccuracy,
+        RootConflictMetrics.RecomputeAccuracy,
+        RootConflictMetrics.AbstentionQuality
+    ];
 
     public ReasoningCeiling EffectiveCeiling =>
         State == CertificationState.Certified ? MaxReasoningCeiling : ReasoningCeiling.Conservative;
+
+    public bool RequiresRootConflictMetrics =>
+        CertifiedTaskClasses.Any(item => string.Equals(item, RootConflictTaskClass, StringComparison.Ordinal));
+
+    public bool HasCompleteRequiredMetrics()
+    {
+        if (!RequiresRootConflictMetrics)
+        {
+            return true;
+        }
+
+        foreach (var metric in RootConflictRequiredMetrics)
+        {
+            if (!Scores.Any(item => string.Equals(item.MetricName, metric, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+
+            if (!Thresholds.Any(item =>
+                    item.MustPass && string.Equals(item.MetricName, metric, StringComparison.Ordinal)))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     public bool PassesThresholds()
     {
@@ -55,7 +111,19 @@ public sealed record TaskCapabilityCertification(
         {
             var score = Scores.FirstOrDefault(item =>
                 string.Equals(item.MetricName, threshold.MetricName, StringComparison.Ordinal));
-            if (score is null || score.Value < threshold.Minimum)
+            if (score is null)
+            {
+                return false;
+            }
+
+            if (threshold.Comparator == ThresholdComparator.Maximum)
+            {
+                if (score.Value > threshold.Bound)
+                {
+                    return false;
+                }
+            }
+            else if (score.Value < threshold.Bound)
             {
                 return false;
             }
@@ -82,8 +150,8 @@ public sealed record TaskCapabilityCertification(
                !string.Equals(currentAdapterId, ProtocolAdapterId, StringComparison.Ordinal) ||
                !string.Equals(currentAdapterVersion, ProtocolAdapterVersion, StringComparison.Ordinal) ||
                !string.Equals(currentEvaluationSuiteVersion, EvaluationSuiteVersion, StringComparison.Ordinal) ||
-               (!string.IsNullOrEmpty(PromptBaselineDigest) &&
-                !string.Equals(currentPromptBaselineDigest, PromptBaselineDigest, StringComparison.Ordinal));
+               (currentPromptBaselineDigest is not null &&
+                !string.Equals(currentPromptBaselineDigest, PromptBaselineDigest ?? "", StringComparison.Ordinal));
     }
 
     public static TaskCapabilityCertification Uncertified(
@@ -141,7 +209,8 @@ public sealed record TaskCapabilityCertification(
             {
                 writer.WriteStartObject();
                 writer.WriteString("metric", threshold.MetricName);
-                writer.WriteString("minimum", threshold.Minimum.ToString(CultureInfo.InvariantCulture));
+                writer.WriteString("bound", threshold.Bound.ToString(CultureInfo.InvariantCulture));
+                writer.WriteString("comparator", threshold.Comparator == ThresholdComparator.Maximum ? "maximum" : "minimum");
                 writer.WriteBoolean("mustPass", threshold.MustPass);
                 writer.WriteEndObject();
             }
@@ -190,4 +259,7 @@ public static class ProtocolCapabilityNames
     public const string OutputMetadata = "output_metadata";
     public const string DataBehavior = "data_behavior";
     public const string ThinkingWithTools = "thinking_with_tools";
+    public const string ThinkingManual = "thinking_manual";
+    public const string ThinkingAdaptive = "thinking_adaptive";
+    public const string ThinkingEffort = "thinking_effort";
 }

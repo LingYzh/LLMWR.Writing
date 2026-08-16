@@ -43,6 +43,38 @@ public sealed record NormalizedUsage(
 
     public static NormalizedUsage MissingIsNotZero() => Unknown;
 
+    public static OptionalTokenCount Prefer(OptionalTokenCount prior, OptionalTokenCount next) =>
+        next.Status == UsageStatus.Reported ? next : prior;
+
+    public static NormalizedUsage Merge(NormalizedUsage? prior, NormalizedUsage next)
+    {
+        if (prior is null || prior.Status == UsageStatus.Unknown)
+        {
+            return next;
+        }
+
+        if (next.Status == UsageStatus.Unknown)
+        {
+            return prior;
+        }
+
+        var extras = new Dictionary<string, long>(prior.ProviderSpecificBillableUnits, StringComparer.Ordinal);
+        foreach (var pair in next.ProviderSpecificBillableUnits)
+        {
+            extras[pair.Key] = pair.Value;
+        }
+
+        return new NormalizedUsage(
+            UsageStatus.Reported,
+            Prefer(prior.InputTokens, next.InputTokens),
+            Prefer(prior.CachedInputReadTokens, next.CachedInputReadTokens),
+            Prefer(prior.CacheWriteTokens, next.CacheWriteTokens),
+            Prefer(prior.OutputTokens, next.OutputTokens),
+            Prefer(prior.ReasoningTokens, next.ReasoningTokens),
+            extras,
+            next.RawProviderUsageCanonical ?? prior.RawProviderUsageCanonical);
+    }
+
     public string CanonicalJson()
     {
         using var stream = new MemoryStream();

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Prompt;
 using LLMW.Writing.Domain.Provider;
@@ -18,7 +19,10 @@ public sealed record ModelInvocationCommand(
     string? FallbackReason = null,
     ProviderRetryPolicy? Retry = null,
     ILocalToolExecutor? ToolExecutor = null,
-    int ToolRound = 0);
+    int ToolRound = 0,
+    string? ParentInvocationId = null,
+    string? ContinuationKind = null,
+    IReadOnlyList<ProviderNativeToolTurn>? NativeToolTurns = null);
 
 public sealed record ModelInvocationOutcome(
     InvocationRecord Record,
@@ -36,7 +40,7 @@ public sealed class ProviderInvocationCoordinator
     private readonly IProviderDefinitionStore definitions;
     private readonly IProviderCredentialResolver credentials;
     private readonly IModelCertificationStore protocolProfiles;
-    private readonly ITaskCertificationStore taskCertifications;
+    private readonly MemoryTaskCertificationStore taskCertifications;
     private readonly TaskCapabilityCertificationService taskCertService;
     private readonly IPriceSnapshotStore prices;
     private readonly IProviderAdapterResolver adapters;
@@ -54,7 +58,7 @@ public sealed class ProviderInvocationCoordinator
         IProviderAdapterResolver adapters,
         IProviderInvocationStatePort core,
         IModelCatalogStore? catalog = null,
-        ITaskCertificationStore? taskCertifications = null,
+        MemoryTaskCertificationStore? taskCertifications = null,
         TimeProvider? clock = null)
     {
         this.definitions = definitions;
@@ -88,7 +92,20 @@ public sealed class ProviderInvocationCoordinator
         ProviderRetryPolicy policy,
         CancellationToken cancellationToken)
     {
-        var coreSnapshot = core.GetSnapshot(new GetTaskExecutionSnapshotRequest(command.RunId, command.TaskId, command.AttemptId));
+        GetTaskExecutionSnapshotResponse coreSnapshot;
+        try
+        {
+            coreSnapshot = core.GetSnapshot(new GetTaskExecutionSnapshotRequest(command.RunId, command.TaskId, command.AttemptId));
+        }
+        catch (IpcProtocolException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.None, exception.ErrorCode);
+        }
+        catch (ProviderInvocationDeniedException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.None, exception.Code);
+        }
+
         if (!coreSnapshot.OwnershipValid)
         {
             return FailPrepared(command, InvocationFailureClass.None, "TASK_OWNERSHIP_DENIED");
@@ -118,13 +135,27 @@ public sealed class ProviderInvocationCoordinator
             return FailPrepared(command, InvocationFailureClass.None, route.FailureCode ?? "ROUTE_NO_ELIGIBLE_CANDIDATE");
         }
 
-        var outcome = DispatchAttempt(command, compiled.Ir, route.Selected, coreSnapshot.SnapshotGeneration, cancellationToken);
+        ModelInvocationOutcome outcome;
+        try
+        {
+            outcome = DispatchAttempt(command, compiled.Ir, route.Selected, coreSnapshot, cancellationToken);
+        }
+        catch (IpcProtocolException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, exception.ErrorCode);
+        }
+        catch (ProviderInvocationDeniedException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, exception.Code);
+        }
         if (ShouldRetry(outcome.Record, policy) && policy.MaxNetworkAttempts > 1)
         {
             var retryCommand = command with
             {
-                FallbackFromInvocationId = outcome.Record.Snapshot.InvocationId.Value,
-                FallbackReason = "retry:" + outcome.Record.FailureClass,
+                ParentInvocationId = outcome.Record.Snapshot.InvocationId.Value,
+                ContinuationKind = InvocationContinuationKinds.Retry,
+                FallbackFromInvocationId = null,
+                FallbackReason = null,
                 Retry = policy with { MaxNetworkAttempts = policy.MaxNetworkAttempts - 1 }
             };
             return InvokeRound(retryCommand, retryCommand.Retry ?? policy, cancellationToken);
@@ -138,6 +169,8 @@ public sealed class ProviderInvocationCoordinator
             {
                 var fallbackCommand = command with
                 {
+                    ParentInvocationId = outcome.Record.Snapshot.InvocationId.Value,
+                    ContinuationKind = InvocationContinuationKinds.Fallback,
                     FallbackFromInvocationId = outcome.Record.Snapshot.InvocationId.Value,
                     FallbackReason = "fallback:" + outcome.Record.FailureClass,
                     Requirements = command.Requirements with
@@ -157,6 +190,7 @@ public sealed class ProviderInvocationCoordinator
             outcome.ToolProposals.Any(item => item.MayExecute && item.Request is not null))
         {
             var results = new List<(string CallId, string ToolName, string ResultJson)>();
+            var turns = new List<ProviderNativeToolTurn>();
             foreach (var proposal in outcome.ToolProposals.Where(item => item.MayExecute && item.Request is not null))
             {
                 var executed = command.ToolExecutor.Execute(
@@ -164,6 +198,11 @@ public sealed class ProviderInvocationCoordinator
                     proposal.Request.ToolName,
                     proposal.Request.ArgumentsJson);
                 results.Add((executed.CallId, executed.ToolName, executed.ResultJson));
+                turns.Add(new ProviderNativeToolTurn(
+                    executed.CallId,
+                    executed.ToolName,
+                    proposal.Request.ArgumentsJson,
+                    executed.ResultJson));
             }
 
             var nextCompile = compileRequest with { ToolResults = results };
@@ -171,8 +210,11 @@ public sealed class ProviderInvocationCoordinator
             {
                 CompileRequest = nextCompile,
                 ToolRound = command.ToolRound + 1,
-                FallbackFromInvocationId = outcome.Record.Snapshot.InvocationId.Value,
-                FallbackReason = "tool_loop"
+                ParentInvocationId = outcome.Record.Snapshot.InvocationId.Value,
+                ContinuationKind = InvocationContinuationKinds.ToolContinuation,
+                NativeToolTurns = turns,
+                FallbackFromInvocationId = null,
+                FallbackReason = null
             };
             return InvokeRound(next, policy, cancellationToken);
         }
@@ -184,9 +226,10 @@ public sealed class ProviderInvocationCoordinator
         ModelInvocationCommand command,
         PromptIr ir,
         RouteCandidate selected,
-        string snapshotGeneration,
+        GetTaskExecutionSnapshotResponse compiledSnapshot,
         CancellationToken cancellationToken)
     {
+        var snapshotGeneration = compiledSnapshot.SnapshotGeneration;
         var definition = definitions.FindById(selected.ProviderDefinitionId)
             ?? throw new InvalidOperationException("Routed provider disappeared.");
         var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, definition.AllowInsecureLocalHttp, out var endpointError);
@@ -196,11 +239,11 @@ public sealed class ProviderInvocationCoordinator
         }
 
         var adapter = adapters.Resolve(definition.ProtocolKind);
-        if (definition.ProtocolKind == ProtocolKind.OpenAiCompatibleChatCompletions &&
-            definition.AdapterExtensions.TryGetValue("thinking", out _) &&
-            ir.Tools.Count > 0)
+        if (definition.AdapterExtensions.TryGetValue("thinking", out _) &&
+            ir.Tools.Count > 0 &&
+            !CapabilitySupportCodec.IsUsableAsSupported(selected.Certification.SupportFor(ProtocolCapabilityNames.ThinkingWithTools)))
         {
-            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, "DEEPSEEK_THINKING_TOOLS_UNSUPPORTED");
+            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, "THINKING_WITH_TOOLS_UNSUPPORTED");
         }
 
         var invocationId = new InvocationId(Guid.NewGuid().ToString("N"));
@@ -218,29 +261,43 @@ public sealed class ProviderInvocationCoordinator
             selected.ModelId,
             command.Stream,
             ext,
-            invocationId.Value);
+            invocationId.Value,
+            command.NativeToolTurns,
+            selected.Certification);
         var prepared = adapter.Prepare(definition, endpoint, invokeRequest);
         if (!prepared.Succeeded || prepared.Request is null)
         {
             return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, prepared.ErrorCode ?? "PREPARE_FAILED");
         }
 
-        var snapshot = FreezeSnapshot(command, ir, definition, adapter, selected, endpoint, invocationId, prepared.Request);
+        var snapshot = FreezeSnapshot(command, ir, definition, adapter, selected, endpoint, invocationId, prepared.Request, snapshotGeneration);
         lock (invocationGate)
         {
             frozen[snapshot.InvocationId.Value] = snapshot;
         }
 
-        Persist(command, snapshot, ir);
-        var revalidated = core.GetSnapshot(new GetTaskExecutionSnapshotRequest(command.RunId, command.TaskId, command.AttemptId));
-        if (!string.Equals(revalidated.SnapshotGeneration, snapshotGeneration, StringComparison.Ordinal) &&
-            revalidated.RequiredResults.Any(item => item.Required && (item.Stale || item.Missing)))
+        Persist(command, snapshot, ir, compiledSnapshotGeneration: snapshotGeneration);
+        GetTaskExecutionSnapshotResponse revalidated;
+        try
+        {
+            revalidated = core.GetSnapshot(new GetTaskExecutionSnapshotRequest(command.RunId, command.TaskId, command.AttemptId));
+        }
+        catch (IpcProtocolException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, exception.ErrorCode);
+        }
+        catch (ProviderInvocationDeniedException exception)
+        {
+            return FailPrepared(command, InvocationFailureClass.FailedBeforeSend, exception.Code);
+        }
+
+        if (FreshnessFenceBlocks(compiledSnapshot, revalidated, out var fenceCode))
         {
             var blocked = new InvocationRecord(
                 snapshot, InvocationLifecycle.FailedBeforeSend, InvocationFailureClass.FailedBeforeSend,
-                null, null, null, NormalizedUsage.Unknown, CostEstimate.Unknown(snapshot.PriceSnapshotId), false, "RESULT_REQUIRED_STALE", false);
-            Persist(command, snapshot, ir, blocked);
-            return new ModelInvocationOutcome(blocked, ir, [], [], null, "RESULT_REQUIRED_STALE");
+                null, null, null, NormalizedUsage.Unknown, CostEstimate.Unknown(snapshot.PriceSnapshotId), false, fenceCode, false);
+            Persist(command, snapshot, ir, blocked, snapshotGeneration);
+            return new ModelInvocationOutcome(blocked, ir, [], [], null, fenceCode);
         }
 
         if (cancellationToken.IsCancellationRequested)
@@ -402,7 +459,9 @@ public sealed class ProviderInvocationCoordinator
                 events, null, null, null, NormalizedUsage.Unknown, tools, null, null, "eof-before-terminal", false);
         }
 
-        var usage = events.LastOrDefault(item => item.Usage is not null)?.Usage ?? NormalizedUsage.Unknown;
+        var usage = events.Aggregate(
+            NormalizedUsage.Unknown,
+            (prior, item) => item.Usage is null ? prior : NormalizedUsage.Merge(prior, item.Usage));
         return terminal.Kind switch
         {
             ModelRuntimeEventKind.Completed when tools.Count > 0 =>
@@ -446,6 +505,76 @@ public sealed class ProviderInvocationCoordinator
         return command.Requirements.AllowFallback;
     }
 
+    private static bool FreshnessFenceBlocks(
+        GetTaskExecutionSnapshotResponse compiled,
+        GetTaskExecutionSnapshotResponse current,
+        out string code)
+    {
+        if (!current.OwnershipValid)
+        {
+            code = IpcErrorCodes.TaskOwnershipDenied;
+            return true;
+        }
+
+        if (!current.AttemptLegal)
+        {
+            code = IpcErrorCodes.IllegalCompletionLifecycle;
+            return true;
+        }
+
+        if (string.Equals(current.SnapshotGeneration, compiled.SnapshotGeneration, StringComparison.Ordinal))
+        {
+            code = "";
+            return false;
+        }
+
+        if (!string.Equals(current.PacketDigest ?? "", compiled.PacketDigest ?? "", StringComparison.Ordinal))
+        {
+            code = "EXECUTION_SNAPSHOT_STALE";
+            return true;
+        }
+
+        if (RequiredResultsChanged(compiled.RequiredResults, current.RequiredResults))
+        {
+            code = current.RequiredResults.Any(item => item.Required && (item.Stale || item.Missing))
+                ? IpcErrorCodes.ResultRequiredStale
+                : "EXECUTION_SNAPSHOT_STALE";
+            return true;
+        }
+
+        code = "EXECUTION_SNAPSHOT_STALE";
+        return true;
+    }
+
+    private static bool RequiredResultsChanged(
+        FrozenRequiredResultDto[] compiled,
+        FrozenRequiredResultDto[] current)
+    {
+        if (compiled.Length != current.Length)
+        {
+            return true;
+        }
+
+        var byId = current.ToDictionary(item => item.ResultId, StringComparer.Ordinal);
+        foreach (var item in compiled)
+        {
+            if (!byId.TryGetValue(item.ResultId, out var next))
+            {
+                return true;
+            }
+
+            if (item.Required != next.Required ||
+                item.Stale != next.Stale ||
+                item.Missing != next.Missing ||
+                !string.Equals(item.Digest ?? "", next.Digest ?? "", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static PromptCompileRequest OverlayResults(PromptCompileRequest request, GetTaskExecutionSnapshotResponse snapshot)
     {
         if (snapshot.RequiredResults.Length == 0)
@@ -453,10 +582,31 @@ public sealed class ProviderInvocationCoordinator
             return request;
         }
 
-        var overlay = snapshot.RequiredResults
-            .Select(item => (item.ResultId, item.Text ?? "", item.Required, item.Stale || item.Missing))
-            .ToArray();
-        return request with { Results = overlay };
+        var coreById = snapshot.RequiredResults.ToDictionary(item => item.ResultId, StringComparer.Ordinal);
+        var merged = new List<(string ResultId, string Text, bool Required, bool Stale)>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var existing in request.Results)
+        {
+            if (existing.Required && coreById.TryGetValue(existing.ResultId, out var core))
+            {
+                merged.Add((core.ResultId, core.Text ?? "", true, core.Stale || core.Missing));
+                seen.Add(core.ResultId);
+            }
+            else
+            {
+                merged.Add(existing);
+            }
+        }
+
+        foreach (var core in snapshot.RequiredResults)
+        {
+            if (seen.Add(core.ResultId))
+            {
+                merged.Add((core.ResultId, core.Text ?? "", true, core.Stale || core.Missing));
+            }
+        }
+
+        return request with { Results = merged };
     }
 
     private static string? LooksJsonHint(IReadOnlyList<ModelRuntimeEvent> events)
@@ -497,7 +647,9 @@ public sealed class ProviderInvocationCoordinator
             null,
             clock.GetUtcNow().ToUnixTimeMilliseconds(),
             command.FallbackFromInvocationId,
-            command.FallbackReason ?? code);
+            command.FallbackReason ?? code,
+            ParentInvocationId: command.ParentInvocationId,
+            ContinuationKind: command.ContinuationKind);
         var record = new InvocationRecord(
             snapshot,
             failure == InvocationFailureClass.FailedBeforeSend ? InvocationLifecycle.FailedBeforeSend : InvocationLifecycle.Rejected,
@@ -586,7 +738,7 @@ public sealed class ProviderInvocationCoordinator
                     adapter.AdapterId,
                     adapter.AdapterVersion,
                     TaskCapabilityCertification.CurrentEvaluationSuiteVersion,
-                    null);
+                    PromptCompiler.CurrentShippedCertificationBaselineDigest);
                 var contextLimit = catalog.List(definition.ProviderDefinitionId)
                     .FirstOrDefault(item => item.ModelId.Value == model.Value)?.DeclaredContextLimit;
                 list.Add(new RouteCandidate(
@@ -614,7 +766,8 @@ public sealed class ProviderInvocationCoordinator
         RouteCandidate selected,
         ProviderEndpoint endpoint,
         InvocationId invocationId,
-        PreparedProviderRequest prepared)
+        PreparedProviderRequest prepared,
+        string compiledSnapshotGeneration)
     {
         var wire = PromptDigests.WireRequestDigestFromPrepared(
             adapter.AdapterId,
@@ -665,14 +818,34 @@ public sealed class ProviderInvocationCoordinator
                 definition.DefaultModelId?.Value,
                 definition.ModelAliases,
                 definition.AdapterExtensions),
-            credentials.BindingGeneration(definition.CredentialRef));
+            credentials.BindingGeneration(definition.CredentialRef),
+            command.ParentInvocationId ?? command.FallbackFromInvocationId,
+            command.ContinuationKind ?? InferContinuationKind(command),
+            compiledSnapshotGeneration);
+    }
+
+    private static string? InferContinuationKind(ModelInvocationCommand command)
+    {
+        if (!string.IsNullOrWhiteSpace(command.ContinuationKind))
+        {
+            return command.ContinuationKind;
+        }
+
+        if (!string.IsNullOrWhiteSpace(command.FallbackFromInvocationId) ||
+            !string.IsNullOrWhiteSpace(command.FallbackReason))
+        {
+            return InvocationContinuationKinds.Fallback;
+        }
+
+        return null;
     }
 
     private void Persist(
         ModelInvocationCommand command,
         ProviderInvocationSnapshot snapshot,
         PromptIr ir,
-        InvocationRecord? record = null)
+        InvocationRecord? record = null,
+        string? compiledSnapshotGeneration = null)
     {
         var payload = snapshot.CanonicalJson();
         string? recordJson = null;
@@ -681,18 +854,32 @@ public sealed class ProviderInvocationCoordinator
             recordJson = MergeRecord(snapshot, record);
         }
 
-        _ = core.Persist(new PersistProviderInvocationRequest(
-            snapshot.InvocationId.Value,
-            command.RunId,
-            command.TaskId,
-            command.AttemptId,
-            payload,
-            recordJson,
-            WriteRunIdentityDigest(snapshot, ir),
-            snapshot.InvocationId.Value));
+        var generation = compiledSnapshotGeneration
+                         ?? snapshot.CompiledSnapshotGeneration
+                         ?? "";
+        try
+        {
+            _ = core.Persist(new PersistProviderInvocationRequest(
+                snapshot.InvocationId.Value,
+                command.RunId,
+                command.TaskId,
+                command.AttemptId,
+                payload,
+                recordJson,
+                WriteRunIdentityDigest(snapshot, ir, generation),
+                generation));
+        }
+        catch (IpcProtocolException)
+        {
+            throw;
+        }
+        catch (ProviderInvocationDeniedException)
+        {
+            throw;
+        }
     }
 
-    private static string WriteRunIdentityDigest(ProviderInvocationSnapshot snapshot, PromptIr ir)
+    private static string WriteRunIdentityDigest(ProviderInvocationSnapshot snapshot, PromptIr ir, string snapshotGeneration)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
@@ -703,6 +890,7 @@ public sealed class ProviderInvocationCoordinator
             writer.WriteString("promptConfigId", ir.PromptConfigId);
             writer.WriteString("providerId", snapshot.ProviderDefinitionId.Value);
             writer.WriteString("wireRequestDigest", snapshot.WireRequestDigest);
+            writer.WriteString("snapshotGeneration", snapshotGeneration);
             writer.WriteEndObject();
         }
 

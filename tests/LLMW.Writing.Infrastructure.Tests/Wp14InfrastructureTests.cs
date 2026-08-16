@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Domain.Prompt;
 using LLMW.Writing.Domain.Provider;
@@ -24,9 +25,14 @@ internal static partial class Program
         Run(nameof(DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses), DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses);
         Run(nameof(ProviderDefinitionRoundTripAndRevisionAdvance), ProviderDefinitionRoundTripAndRevisionAdvance);
         Run(nameof(WireDigestChangesWithSemanticRequestDimensions), WireDigestChangesWithSemanticRequestDimensions);
+        Run(nameof(AnthropicAdaptiveThinkingExactJsonFixture), AnthropicAdaptiveThinkingExactJsonFixture);
+        Run(nameof(AnthropicManualThinkingBudgetBounds), AnthropicManualThinkingBudgetBounds);
+        Run(nameof(NativeToolContinuationIsProviderOwned), NativeToolContinuationIsProviderOwned);
+        Run(nameof(AnthropicStreamMergesMessageStartUsage), AnthropicStreamMergesMessageStartUsage);
+        Run(nameof(CompatibleChatThinkingWithToolsHonorsCapability), CompatibleChatThinkingWithToolsHonorsCapability);
     }
 
-    private static PromptIr SampleIr(bool tools = false)
+    private static PromptIr SampleIr(bool tools = false, int reserved = 64)
     {
         var compiled = PromptCompiler.Compile(new PromptCompileRequest(
             PromptCompilerVersions.Current,
@@ -46,7 +52,7 @@ internal static partial class Program
             tools ? [new AuthorizedToolSchema("lookup", "lookup", "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"}}}", ["q"])] : [],
             new PromptOutputContract(OutputContractKind.PlainText, null, []),
             null,
-            64));
+            reserved));
         return compiled.Ir!;
     }
 
@@ -308,15 +314,18 @@ internal static partial class Program
         var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
         var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
         var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
-        var ir = SampleIr();
-        var enabled = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "2048" }, "inv"));
+        var ir = SampleIr(reserved: 4096);
+        var profile = AnthropicThinkingProfile();
+        var enabled = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "2048" }, "inv", ProtocolProfile: profile));
         AssertTrue(enabled.Succeeded, "Manual thinking with budget rejected.");
         AssertTrue(enabled.Request!.CanonicalSemanticBody.Contains("budget_tokens", StringComparison.Ordinal), "budget_tokens missing.");
-        var adaptive = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "adaptive", ["thinkingEffort"] = "high" }, "inv"));
+        var adaptive = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "adaptive", ["thinkingEffort"] = "high" }, "inv", ProtocolProfile: profile));
         AssertTrue(adaptive.Succeeded, "Adaptive thinking rejected.");
         AssertTrue(adaptive.Request!.CanonicalSemanticBody.Contains("adaptive", StringComparison.Ordinal), "adaptive thinking missing.");
-        var invalid = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled" }, "inv"));
-        AssertEqual("THINKING_UNSUPPORTED", invalid.ErrorCode ?? "", "Invalid thinking was sent.");
+        var invalid = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled" }, "inv", ProtocolProfile: profile));
+        AssertEqual("THINKING_BUDGET_INVALID", invalid.ErrorCode ?? "", "Invalid thinking was sent.");
+        var unsupported = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "2048" }, "inv"));
+        AssertEqual("THINKING_UNSUPPORTED", unsupported.ErrorCode ?? "", "Uncertified thinking was sent.");
     }
 
     private static void DeepSeekThinkingToolsAreUnsupportedWhileThinkingAloneParses()
@@ -327,7 +336,7 @@ internal static partial class Program
             allowInsecureLocalHttp: false, extensions: new Dictionary<string, string> { ["thinking"] = "enabled" });
         var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
         var withTools = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, definition.AdapterExtensions, "inv"));
-        AssertEqual("DEEPSEEK_THINKING_TOOLS_UNSUPPORTED", withTools.ErrorCode ?? "", "Thinking+tools was advertised.");
+        AssertEqual("THINKING_WITH_TOOLS_UNSUPPORTED", withTools.ErrorCode ?? "", "Thinking+tools was advertised.");
         var noTools = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(SampleIr(), new ModelId("m"), false, definition.AdapterExtensions, "inv"));
         AssertTrue(noTools.Succeeded, "Thinking without tools was blocked.");
         var parsed = OpenAiCompatibleChatAdapter.Parse(Json(200, """
@@ -403,6 +412,132 @@ internal static partial class Program
         var secretB = Digest(baseline with { ClientRequestId = "inv-b" });
         AssertEqual(secretA, secretB, "Unstable/client request id entered WireRequestDigest.");
     }
+
+    private static void AnthropicAdaptiveThinkingExactJsonFixture()
+    {
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var prepared = adapter.Prepare(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(
+                SampleIr(reserved: 4096),
+                new ModelId("m"),
+                false,
+                new Dictionary<string, string> { ["thinking"] = "adaptive", ["thinkingEffort"] = "high" },
+                "inv",
+                ProtocolProfile: AnthropicThinkingProfile()));
+        AssertTrue(prepared.Succeeded, "Adaptive thinking Prepare failed.");
+        using var document = JsonDocument.Parse(prepared.Request!.CanonicalSemanticBody);
+        var thinking = document.RootElement.GetProperty("thinking");
+        AssertEqual("adaptive", thinking.GetProperty("type").GetString() ?? "", "thinking.type drifted.");
+        AssertTrue(!thinking.TryGetProperty("output_config", out _), "output_config nested inside thinking.");
+        AssertEqual("high", document.RootElement.GetProperty("output_config").GetProperty("effort").GetString() ?? "", "top-level output_config.effort drifted.");
+    }
+
+    private static void AnthropicManualThinkingBudgetBounds()
+    {
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var ir = SampleIr(reserved: 4096);
+        var profile = AnthropicThinkingProfile();
+        foreach (var budget in new[] { "1", "1023" })
+        {
+            var rejected = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
+                ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = budget }, "inv", ProtocolProfile: profile));
+            AssertEqual("THINKING_BUDGET_INVALID", rejected.ErrorCode ?? "", "budget " + budget + " was sent.");
+        }
+
+        var accepted = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
+            ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "1024" }, "inv", ProtocolProfile: profile));
+        AssertTrue(accepted.Succeeded, "Valid >=1024 budget < max_tokens rejected.");
+        var tooLarge = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
+            ir, new ModelId("m"), false, new Dictionary<string, string> { ["thinking"] = "enabled", ["thinkingBudgetTokens"] = "4096" }, "inv", ProtocolProfile: profile));
+        AssertEqual("THINKING_BUDGET_INVALID", tooLarge.ErrorCode ?? "", "budget == max_tokens was sent.");
+    }
+
+    private static void NativeToolContinuationIsProviderOwned()
+    {
+        var turns = new[] { new ProviderNativeToolTurn("call_1", "lookup", "{\"q\":\"a\"}", "{\"ok\":true}") };
+        var openai = new OpenAiResponsesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var openaiDef = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiResponses, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var openaiBody = openai.Prepare(openaiDef, ProviderEndpoint.TryCreate(openaiDef.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", turns)).Request!.CanonicalSemanticBody;
+        AssertTrue(openaiBody.Contains("\"type\":\"function_call\"", StringComparison.Ordinal), "OpenAI function_call missing.");
+        AssertTrue(openaiBody.Contains("\"type\":\"function_call_output\"", StringComparison.Ordinal), "OpenAI function_call_output missing.");
+        AssertTrue(openaiBody.Contains("\"call_id\":\"call_1\"", StringComparison.Ordinal), "OpenAI call_id missing.");
+        AssertTrue(!openaiBody.Contains("previous_response_id", StringComparison.Ordinal), "OpenAI required previous_response_id.");
+
+        var anthropic = new AnthropicMessagesAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var anthropicDef = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        var anthropicBody = anthropic.Prepare(anthropicDef, ProviderEndpoint.TryCreate(anthropicDef.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", turns)).Request!.CanonicalSemanticBody;
+        AssertTrue(anthropicBody.Contains("\"type\":\"tool_use\"", StringComparison.Ordinal), "Anthropic tool_use missing.");
+        AssertTrue(anthropicBody.Contains("\"type\":\"tool_result\"", StringComparison.Ordinal), "Anthropic tool_result missing.");
+        AssertTrue(anthropicBody.Contains("\"tool_use_id\":\"call_1\"", StringComparison.Ordinal), "Anthropic tool_use_id missing.");
+
+        var chat = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var chatDef = ProviderDefinitionFactory.Create("p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m", allowInsecureLocalHttp: false);
+        var chatBody = chat.Prepare(chatDef, ProviderEndpoint.TryCreate(chatDef.Endpoint, false, out _)!,
+            new ProviderInvokeRequest(SampleIr(tools: true), new ModelId("m"), false, new Dictionary<string, string>(), "inv", turns)).Request!.CanonicalSemanticBody;
+        AssertTrue(chatBody.Contains("\"tool_calls\"", StringComparison.Ordinal), "Chat tool_calls missing.");
+        AssertTrue(chatBody.Contains("\"role\":\"tool\"", StringComparison.Ordinal), "Chat tool role missing.");
+        AssertTrue(chatBody.Contains("\"tool_call_id\":\"call_1\"", StringComparison.Ordinal), "Chat tool_call_id missing.");
+        AssertTrue(!chatBody.Contains("tool lookup result:", StringComparison.Ordinal), "Generic tool-result text used as protocol continuation.");
+    }
+
+    private static void AnthropicStreamMergesMessageStartUsage()
+    {
+        var handler = new ScriptedHttpMessageHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.OK);
+            response.Content = new StringContent(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":4}}}\n\n" +
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" +
+                "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            response.Content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("text/event-stream");
+            return response;
+        });
+        var adapter = new AnthropicMessagesAdapter(new ProviderHttpTransport(handler));
+        var definition = ProviderDefinitionFactory.Create("p", ProtocolKind.AnthropicMessages, "https://api.anthropic.com", "cred", "m", allowInsecureLocalHttp: false);
+        using var secret = new ResolvedProviderSecret("token");
+        var events = Drain(adapter.StreamAsync(
+            definition,
+            ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!,
+            secret,
+            new ProviderInvokeRequest(SampleIr(), new ModelId("m"), true, new Dictionary<string, string>()),
+            CancellationToken.None));
+        var usage = events.Last(item => item.Usage is not null).Usage!;
+        AssertEqual(11L, usage.InputTokens.Value.GetValueOrDefault(), "message_start input usage lost.");
+        AssertEqual(4L, usage.CachedInputReadTokens.Value.GetValueOrDefault(), "message_start cache usage lost.");
+        AssertEqual(3L, usage.OutputTokens.Value.GetValueOrDefault(), "message_delta output usage lost.");
+        AssertTrue(usage.ReasoningTokens.Value is null, "Missing reasoning tokens became zero.");
+    }
+
+    private static void CompatibleChatThinkingWithToolsHonorsCapability()
+    {
+        var adapter = new OpenAiCompatibleChatAdapter(new ProviderHttpTransport(new ScriptedHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK))));
+        var definition = ProviderDefinitionFactory.Create(
+            "p", ProtocolKind.OpenAiCompatibleChatCompletions, "https://api.example.com", "cred", "m",
+            allowInsecureLocalHttp: false, extensions: new Dictionary<string, string> { ["thinking"] = "enabled" });
+        var endpoint = ProviderEndpoint.TryCreate(definition.Endpoint, false, out _)!;
+        var certified = CertificationFactory.Certified(
+            definition.ProviderDefinitionId, definition.Revision, definition.Endpoint,
+            adapter.AdapterId, adapter.AdapterVersion, new ModelId("m"),
+            (ProtocolCapabilityNames.ThinkingWithTools, CapabilitySupport.Supported));
+        var allowed = adapter.Prepare(definition, endpoint, new ProviderInvokeRequest(
+            SampleIr(tools: true), new ModelId("m"), false, definition.AdapterExtensions, "inv", ProtocolProfile: certified));
+        AssertTrue(allowed.Succeeded, "Certified thinking+tools continuation was hard-denied.");
+    }
+
+    private static ModelCertificationRecord AnthropicThinkingProfile() =>
+        CertificationFactory.Certified(
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.anthropic.com/",
+            "anthropic_messages", AnthropicMessagesAdapter.CurrentVersion, new ModelId("m"),
+            (ProtocolCapabilityNames.ThinkingManual, CapabilitySupport.Supported),
+            (ProtocolCapabilityNames.ThinkingAdaptive, CapabilitySupport.Supported),
+            (ProtocolCapabilityNames.ThinkingEffort, CapabilitySupport.Supported));
 
     private static List<ModelRuntimeEvent> Drain(IAsyncEnumerable<ModelRuntimeEvent> stream)
     {

@@ -28,9 +28,12 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
         ProviderInvokeRequest request)
     {
         _ = definition;
-        if (request.AdapterExtensions.ContainsKey("thinking") && request.Prompt.Tools.Count > 0)
+        if (request.AdapterExtensions.ContainsKey("thinking") &&
+            request.Prompt.Tools.Count > 0 &&
+            !CapabilitySupportCodec.IsUsableAsSupported(
+                request.ProtocolProfile?.SupportFor(ProtocolCapabilityNames.ThinkingWithTools) ?? CapabilitySupport.Unknown))
         {
-            return new ProviderPrepareResult(null, "DEEPSEEK_THINKING_TOOLS_UNSUPPORTED");
+            return new ProviderPrepareResult(null, "THINKING_WITH_TOOLS_UNSUPPORTED");
         }
 
         var path = Combine(endpoint.CanonicalUri, "/v1/chat/completions").AbsolutePath;
@@ -230,6 +233,31 @@ public sealed class OpenAiCompatibleChatAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
+            foreach (var turn in request.ToolContinuation ?? [])
+            {
+                writer.WriteStartObject();
+                writer.WriteString("role", "assistant");
+                writer.WriteNull("content");
+                writer.WritePropertyName("tool_calls");
+                writer.WriteStartArray();
+                writer.WriteStartObject();
+                writer.WriteString("id", turn.CallId);
+                writer.WriteString("type", "function");
+                writer.WritePropertyName("function");
+                writer.WriteStartObject();
+                writer.WriteString("name", turn.ToolName);
+                writer.WriteString("arguments", turn.ArgumentsJson);
+                writer.WriteEndObject();
+                writer.WriteEndObject();
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+                writer.WriteStartObject();
+                writer.WriteString("role", "tool");
+                writer.WriteString("tool_call_id", turn.CallId);
+                writer.WriteString("content", turn.ResultJson);
+                writer.WriteEndObject();
+            }
+
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {

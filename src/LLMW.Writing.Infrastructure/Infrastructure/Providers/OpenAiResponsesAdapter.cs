@@ -274,6 +274,21 @@ public sealed class OpenAiResponsesAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
+            foreach (var turn in request.ToolContinuation ?? [])
+            {
+                writer.WriteStartObject();
+                writer.WriteString("type", "function_call");
+                writer.WriteString("call_id", turn.CallId);
+                writer.WriteString("name", turn.ToolName);
+                writer.WriteString("arguments", turn.ArgumentsJson);
+                writer.WriteEndObject();
+                writer.WriteStartObject();
+                writer.WriteString("type", "function_call_output");
+                writer.WriteString("call_id", turn.CallId);
+                writer.WriteString("output", turn.ResultJson);
+                writer.WriteEndObject();
+            }
+
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {

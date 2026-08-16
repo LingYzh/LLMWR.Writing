@@ -271,7 +271,9 @@ WP13 error codes include: `OVERSIGHT_MUTATION_DENIED`, `COMPLETION_CONTRACT_FAIL
 
 Agent Runtime owns Prompt compile, Provider routing, Provider HTTP, streaming, and credential injection at send time. Authority Core remains the only `project.db` writer. These commands are the typed Core IPC/port for invocation provenance and Task execution truth. They are not generic CRUD/SQL, do not serialize Domain entities, and MUST NOT carry Provider API secrets, `Authorization` headers, or `x-api-key` values.
 
-Provider network invocation is not replayed merely because IPC reconnects. `persistProviderInvocation` is idempotent on stable `invocationId` (safe provenance persist may be retried; the HTTP send is not). `getTaskExecutionSnapshot` is a read and may be replayed after reconnect. `authorizeToolProposal` is not auto-replayed.
+These commands inherit WP09/WP11 caller identity. Agent Runtime must present an authenticated channel plus a Core-issued RunSession. A caller-supplied `runId` is never authority: `principal.RunId`, `request.RunId`, `Task.RunId`, and (when supplied) `Attempt` ownership must agree. Missing/invalid RunSession is denied. Cross-run callers are denied.
+
+Provider network invocation is not replayed merely because IPC reconnects. `persistProviderInvocation` is idempotent on stable `invocationId` across historical checkpoints (safe provenance persist may be retried; the HTTP send is not). `snapshotGeneration` is the Core Task snapshot generation used to compile/send, never `invocationId`. `getTaskExecutionSnapshot` is a read and may be replayed after reconnect. `authorizeToolProposal` is not auto-replayed.
 
 No credential, sandbox, or Shell execute payload crosses this boundary. A Prompt Tool Schema means the model may propose the tool; Core RunSession/principal/capability remains the execution authority. OpenProject is not Project Trust.
 
@@ -281,7 +283,7 @@ No credential, sandbox, or Shell execute payload crosses this boundary. A Prompt
 | `persistProviderInvocation` | stable `invocationId` + safe snapshot/record JSON (no secrets) + input digest object + snapshot generation | `checkpointId`; `idempotentReplay=true` when the same invocation was already persisted |
 | `authorizeToolProposal` | run/task + tool name + arguments JSON + mapped capability name (`Shell.Execute`, `MCP.Call`, `Git.Execute`, …) + optional session proof | `authorized` / `denied` / `awaitingAuthorization`; Core evaluates RunSession + principal + that capability. Missing Core facts never authorize. |
 
-WP14 error codes include: `TASK_OWNERSHIP_DENIED`, `RESULT_REQUIRED_STALE`, `PROVIDER_SECRET_FORBIDDEN`.
+WP14 error codes include: `TASK_OWNERSHIP_DENIED`, `RESULT_REQUIRED_STALE`, `PROVIDER_SECRET_FORBIDDEN`, `INVOCATION_IDENTITY_CONFLICT`, `SECURITY_INVALID_SESSION`, `SECURITY_BINDING_MISMATCH`, `ILLEGAL_COMPLETION_LIFECYCLE`.
 
 Agent RunSession mutations (`submitResultArtifact`, `requestTaskCompletion`, `proposeResultDependencyChange`) require the durable Task to belong to `principal.RunId`. Envelope `runId` plus a payload TaskId from another Run is denied. `createWorkflowRun.storylineId` is persisted on `workflow_runs.storyline_id` when the Storyline exists. Runtime Grill resolution reloads the durable pause request from Checkpoint; the caller may select only a persisted option. Background stop maps by `BackgroundExecutionKind` and never falls back to cancelling the owner Run.
 

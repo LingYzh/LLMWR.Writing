@@ -217,6 +217,7 @@ public static class IpcErrorCodes
     public const string BackgroundStopUnavailable = "BACKGROUND_STOP_UNAVAILABLE";
     public const string SpecialistIdentityMismatch = "SPECIALIST_IDENTITY_MISMATCH";
     public const string ProviderSecretForbidden = "PROVIDER_SECRET_FORBIDDEN";
+    public const string InvocationIdentityConflict = "INVOCATION_IDENTITY_CONFLICT";
 }
 
 public static class IpcServerCapabilities

@@ -210,12 +210,20 @@ public sealed class MemoryPriceSnapshotStore : IPriceSnapshotStore
     }
 }
 
+public sealed record ProviderNativeToolTurn(
+    string CallId,
+    string ToolName,
+    string ArgumentsJson,
+    string ResultJson);
+
 public sealed record ProviderInvokeRequest(
     PromptIr Prompt,
     ModelId ModelId,
     bool Stream,
     IReadOnlyDictionary<string, string> AdapterExtensions,
-    string ClientRequestId = "");
+    string ClientRequestId = "",
+    IReadOnlyList<ProviderNativeToolTurn>? ToolContinuation = null,
+    ModelCertificationRecord? ProtocolProfile = null);
 
 public sealed record PreparedProviderRequest(
     string Method,
@@ -550,8 +558,6 @@ public interface ITaskCertificationStore
 {
     TaskCapabilityCertification? Find(ProviderDefinitionId provider, ModelId model);
 
-    void Upsert(TaskCapabilityCertification record);
-
     IReadOnlyList<TaskCapabilityCertification> List();
 }
 
@@ -568,7 +574,12 @@ public sealed class MemoryTaskCertificationStore : ITaskCertificationStore
         }
     }
 
-    public void Upsert(TaskCapabilityCertification record)
+    public void UpsertUncheckedForTests(TaskCapabilityCertification record)
+    {
+        Write(record);
+    }
+
+    internal void Write(TaskCapabilityCertification record)
     {
         ArgumentNullException.ThrowIfNull(record);
         lock (gate)
@@ -588,9 +599,9 @@ public sealed class MemoryTaskCertificationStore : ITaskCertificationStore
 
 public sealed class TaskCapabilityCertificationService
 {
-    private readonly ITaskCertificationStore store;
+    private readonly MemoryTaskCertificationStore store;
 
-    public TaskCapabilityCertificationService(ITaskCertificationStore store)
+    public TaskCapabilityCertificationService(MemoryTaskCertificationStore store)
     {
         this.store = store;
     }
@@ -600,10 +611,14 @@ public sealed class TaskCapabilityCertificationService
         ArgumentNullException.ThrowIfNull(candidate);
         if (candidate.State == CertificationState.Certified)
         {
+            var missingBaseline = string.IsNullOrWhiteSpace(candidate.PromptBaselineDigest);
+            var missingIdentity = string.IsNullOrWhiteSpace(candidate.DatasetId) ||
+                                  string.IsNullOrWhiteSpace(candidate.DatasetVersion) ||
+                                  string.IsNullOrWhiteSpace(candidate.EvaluationSuiteVersion);
             if (!candidate.PassesThresholds() ||
-                string.IsNullOrWhiteSpace(candidate.DatasetId) ||
-                string.IsNullOrWhiteSpace(candidate.DatasetVersion) ||
-                string.IsNullOrWhiteSpace(candidate.EvaluationSuiteVersion))
+                missingIdentity ||
+                missingBaseline ||
+                !candidate.HasCompleteRequiredMetrics())
             {
                 candidate = candidate with
                 {
@@ -613,7 +628,7 @@ public sealed class TaskCapabilityCertificationService
             }
         }
 
-        store.Upsert(candidate);
+        store.Write(candidate);
         return candidate;
     }
 

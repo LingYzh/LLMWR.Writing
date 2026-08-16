@@ -72,6 +72,19 @@ public sealed class ScriptedProtocolAdapter : IProviderProtocolAdapter
             }
 
             writer.WriteEndObject();
+            writer.WritePropertyName("toolContinuation");
+            writer.WriteStartArray();
+            foreach (var turn in request.ToolContinuation ?? [])
+            {
+                writer.WriteStartObject();
+                writer.WriteString("callId", turn.CallId);
+                writer.WriteString("toolName", turn.ToolName);
+                writer.WriteString("arguments", turn.ArgumentsJson);
+                writer.WriteString("resultDigest", Utf8Digest.Sha256Hex(turn.ResultJson));
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
             writer.WriteEndObject();
         }
 

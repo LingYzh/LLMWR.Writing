@@ -64,7 +64,10 @@ public sealed record ProviderInvocationSnapshot(
     string? FallbackReason,
     string? EndpointIdentity = null,
     string? EndpointProfileDigest = null,
-    int AuthBindingGeneration = 0)
+    int AuthBindingGeneration = 0,
+    string? ParentInvocationId = null,
+    string? ContinuationKind = null,
+    string? CompiledSnapshotGeneration = null)
 {
     public ModelId EffectiveRoutedModelId => EffectiveModelId;
 
@@ -103,6 +106,10 @@ public sealed record ProviderInvocationSnapshot(
             {
                 writer.WriteNumber("authBindingGeneration", AuthBindingGeneration);
             }
+
+            WriteOptional(writer, "parentInvocationId", ParentInvocationId);
+            WriteOptional(writer, "continuationKind", ContinuationKind);
+            WriteOptional(writer, "compiledSnapshotGeneration", CompiledSnapshotGeneration);
             writer.WriteEndObject();
         }
 
@@ -141,7 +148,10 @@ public sealed record ProviderInvocationSnapshot(
             Optional(root, "endpointProfileDigest"),
             root.TryGetProperty("authBindingGeneration", out var gen) && gen.TryGetInt32(out var generation)
                 ? generation
-                : 0);
+                : 0,
+            Optional(root, "parentInvocationId"),
+            Optional(root, "continuationKind"),
+            Optional(root, "compiledSnapshotGeneration"));
     }
 
     private static ProviderDataBehavior ParseData(string? value) => value switch
@@ -162,6 +172,13 @@ public sealed record ProviderInvocationSnapshot(
 
     private static string? Optional(JsonElement root, string name) =>
         root.TryGetProperty(name, out var property) ? property.GetString() : null;
+}
+
+public static class InvocationContinuationKinds
+{
+    public const string Retry = "retry";
+    public const string Fallback = "fallback";
+    public const string ToolContinuation = "tool_continuation";
 }
 
 public sealed record InvocationRecord(

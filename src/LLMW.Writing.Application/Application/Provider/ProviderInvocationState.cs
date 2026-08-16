@@ -1,6 +1,4 @@
-using System.Text;
 using System.Text.Json;
-using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
@@ -22,22 +20,34 @@ public interface IProviderInvocationStatePort
 public sealed class DirectProviderInvocationStatePort : IProviderInvocationStatePort
 {
     private readonly ProviderInvocationStateHandler handler;
-    private readonly CallerPrincipal? principal;
+    private readonly Func<string, CallerPrincipal?> principalForRun;
+    private readonly AuthenticatedChannelContext? channel;
 
-    public DirectProviderInvocationStatePort(ProviderInvocationStateHandler handler, CallerPrincipal? principal = null)
+    public DirectProviderInvocationStatePort(
+        ProviderInvocationStateHandler handler,
+        Func<string, CallerPrincipal?>? principalForRun = null,
+        AuthenticatedChannelContext? channel = null)
     {
         this.handler = handler;
-        this.principal = principal;
+        this.principalForRun = principalForRun ?? (_ => null);
+        this.channel = channel;
+    }
+
+    public DirectProviderInvocationStatePort(
+        ProviderInvocationStateHandler handler,
+        DirectProviderInvocationIdentity identity)
+        : this(handler, identity.PrincipalFor, identity.Channel)
+    {
     }
 
     public GetTaskExecutionSnapshotResponse GetSnapshot(GetTaskExecutionSnapshotRequest request) =>
-        handler.GetSnapshot(request);
+        handler.GetSnapshot(request, principalForRun(request.RunId), channel);
 
     public PersistProviderInvocationResponse Persist(PersistProviderInvocationRequest request) =>
-        handler.Persist(request);
+        handler.Persist(request, principalForRun(request.RunId), channel);
 
     public AuthorizeToolProposalResponse Authorize(AuthorizeToolProposalRequest request) =>
-        handler.Authorize(request, principal);
+        handler.Authorize(request, principalForRun(request.RunId), channel);
 }
 
 public sealed class ProviderInvocationStateHandler
@@ -61,15 +71,25 @@ public sealed class ProviderInvocationStateHandler
         this.clock = clock ?? TimeProvider.System;
     }
 
-    public GetTaskExecutionSnapshotResponse GetSnapshot(GetTaskExecutionSnapshotRequest request)
+    public GetTaskExecutionSnapshotResponse GetSnapshot(
+        GetTaskExecutionSnapshotRequest request,
+        CallerPrincipal? principal,
+        AuthenticatedChannelContext? channel = null)
     {
         ArgumentNullException.ThrowIfNull(request);
+        EnsureAgentBinding(request.RunId, principal, channel);
         var run = store.GetRun(request.RunId);
         var task = store.GetTask(request.TaskId);
+        if (task is not null && !string.Equals(task.RunId, request.RunId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.TaskOwnershipDenied,
+                "Task does not belong to the authenticated Run.");
+        }
+
         var ownership = run is not null && task is not null &&
                         string.Equals(task.RunId, request.RunId, StringComparison.Ordinal);
-        var attemptLegal = ownership &&
-                           task!.Status is not ("completed" or "failed" or "cancelled");
+        var attemptLegal = ownership && EvaluateAttempt(request.AttemptId, request.TaskId, request.RunId);
         var required = new List<FrozenRequiredResultDto>();
         if (ownership)
         {
@@ -117,35 +137,93 @@ public sealed class ProviderInvocationStateHandler
             required.ToArray());
     }
 
-    public PersistProviderInvocationResponse Persist(PersistProviderInvocationRequest request)
+    public PersistProviderInvocationResponse Persist(
+        PersistProviderInvocationRequest request,
+        CallerPrincipal? principal,
+        AuthenticatedChannelContext? channel = null)
     {
         ArgumentNullException.ThrowIfNull(request);
+        EnsureAgentBinding(request.RunId, principal, channel);
         if (SecretRedaction.ContainsSecretMaterial(request.SnapshotJson) ||
             (!string.IsNullOrWhiteSpace(request.RecordJson) && SecretRedaction.ContainsSecretMaterial(request.RecordJson)))
         {
-            throw new InvalidOperationException(IpcErrorCodes.ProviderSecretForbidden);
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.ProviderSecretForbidden,
+                "Provider secrets must not cross Core IPC.");
+        }
+
+        var task = store.GetTask(request.TaskId);
+        if (task is not null && !string.Equals(task.RunId, request.RunId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.TaskOwnershipDenied,
+                "Task does not belong to the authenticated Run.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(request.AttemptId) &&
+            !EvaluateAttempt(request.AttemptId, request.TaskId, request.RunId))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.IllegalCompletionLifecycle,
+                "Attempt is not legal for this Task.");
         }
 
         var payload = string.IsNullOrWhiteSpace(request.RecordJson) ? request.SnapshotJson : request.RecordJson;
+        var incomingIdentity = TrySnapshotIdentity(request.SnapshotJson);
         var existingCheckpoints = store.CheckpointsForRun(request.RunId)
             .OrderBy(item => item.CreatedAtMs)
+            .ThenBy(item => item.CheckpointId, StringComparer.Ordinal)
             .ToArray();
         CheckpointV1? latest = null;
-        string? existingCheckpointId = null;
+        string? historicalCheckpointId = null;
+        string? historicalIdentity = null;
+        string? historicalPayload = null;
+        var maxCreatedAtMs = long.MinValue;
         foreach (var checkpoint in existingCheckpoints)
         {
             try
             {
                 var parsed = CanonicalJson.Parse(checkpoint.PayloadJson, checkpoint.SchemaVersion);
                 latest = parsed;
-                if (parsed.InvocationLog.Any(item => ContainsInvocation(item, request.InvocationId)))
+                foreach (var item in parsed.InvocationLog)
                 {
-                    existingCheckpointId = checkpoint.CheckpointId;
+                    var parsedSnapshot = TryParseSnapshot(item);
+                    if (parsedSnapshot is not null && parsedSnapshot.CreatedAtMs > maxCreatedAtMs)
+                    {
+                        maxCreatedAtMs = parsedSnapshot.CreatedAtMs;
+                    }
+
+                    if (!ContainsInvocation(item, request.InvocationId))
+                    {
+                        continue;
+                    }
+
+                    historicalCheckpointId = checkpoint.CheckpointId;
+                    historicalPayload = item;
+                    historicalIdentity = parsedSnapshot?.CanonicalJson() ?? TrySnapshotIdentity(item);
                 }
             }
             catch (CheckpointSchemaException)
             {
                 // Skip corrupt historical rows; Core remains the writer of a new bounded checkpoint.
+            }
+        }
+
+        if (historicalIdentity is not null)
+        {
+            if (incomingIdentity is not null &&
+                !string.Equals(historicalIdentity, incomingIdentity, StringComparison.Ordinal))
+            {
+                throw new ProviderInvocationDeniedException(
+                    IpcErrorCodes.InvocationIdentityConflict,
+                    "InvocationId was reused with a different immutable snapshot identity.");
+            }
+
+            var inWindow = latest is not null &&
+                           latest.InvocationLog.Any(item => ContainsInvocation(item, request.InvocationId));
+            if (!inWindow || string.Equals(historicalPayload, payload, StringComparison.Ordinal))
+            {
+                return new PersistProviderInvocationResponse(historicalCheckpointId ?? "", true);
             }
         }
 
@@ -161,11 +239,6 @@ public sealed class ProviderInvocationStateHandler
             if (!ContainsInvocation(log[i], request.InvocationId))
             {
                 continue;
-            }
-
-            if (string.Equals(log[i], payload, StringComparison.Ordinal))
-            {
-                return new PersistProviderInvocationResponse(existingCheckpointId ?? "", true);
             }
 
             log[i] = payload;
@@ -190,7 +263,9 @@ public sealed class ProviderInvocationStateHandler
         }
 
         var run = store.GetRun(request.RunId);
-        if (run is not null && snapshot is not null)
+        var incomingCreated = snapshot?.CreatedAtMs ?? long.MinValue;
+        var isCurrentIdentity = incomingCreated >= maxCreatedAtMs;
+        if (run is not null && snapshot is not null && isCurrentIdentity)
         {
             store.UpdateRun(run with
             {
@@ -200,6 +275,21 @@ public sealed class ProviderInvocationStateHandler
                 EffectivePromptDigest = snapshot.EffectivePromptDigest,
                 UpdatedAtMs = clock.GetUtcNow().ToUnixTimeMilliseconds()
             });
+        }
+
+        var claimedGeneration = request.SnapshotGeneration;
+        var inputDigests = (latest?.InputDigestSet ?? []).Where(item =>
+            !item.StartsWith("snapshotGeneration:", StringComparison.Ordinal)).ToList();
+        if (!string.IsNullOrWhiteSpace(claimedGeneration))
+        {
+            inputDigests.Add("snapshotGeneration:" + claimedGeneration);
+        }
+
+        var digestJson = string.IsNullOrWhiteSpace(request.InputDigestSetJson) ? "{}" : request.InputDigestSetJson;
+        if (!string.IsNullOrWhiteSpace(claimedGeneration) &&
+            !digestJson.Contains("\"snapshotGeneration\"", StringComparison.Ordinal))
+        {
+            digestJson = MergeSnapshotGeneration(digestJson, claimedGeneration);
         }
 
         var checkpointV1 = CheckpointV1.Create(
@@ -213,7 +303,7 @@ public sealed class ProviderInvocationStateHandler
             latest?.ApprovalReferences ?? [],
             latest?.ContextPointers ?? [],
             latest?.ArtifactEvidenceReferences ?? [],
-            latest?.InputDigestSet ?? [],
+            inputDigests,
             snapshot?.PromptConfigId ?? latest?.PromptConfigId,
             snapshot?.ProviderDefinitionId.Value ?? latest?.ProviderId,
             snapshot?.EffectiveRoutedModelId.Value ?? latest?.ModelId,
@@ -224,18 +314,30 @@ public sealed class ProviderInvocationStateHandler
             request.TaskId,
             CheckpointV1.CurrentSchemaVersion,
             CanonicalJson.WriteCheckpoint(checkpointV1),
-            string.IsNullOrWhiteSpace(request.InputDigestSetJson) ? "{}" : request.InputDigestSetJson);
+            digestJson);
         if (!persisted.Succeeded || persisted.Value is null)
         {
             throw new InvalidOperationException(persisted.Failure?.Detail ?? "checkpoint-persist-failed");
         }
 
-        return new PersistProviderInvocationResponse(persisted.Value, replaced);
+        return new PersistProviderInvocationResponse(persisted.Value, false);
     }
 
-    public AuthorizeToolProposalResponse Authorize(AuthorizeToolProposalRequest request, CallerPrincipal? principal)
+    public AuthorizeToolProposalResponse Authorize(
+        AuthorizeToolProposalRequest request,
+        CallerPrincipal? principal,
+        AuthenticatedChannelContext? channel = null)
     {
         ArgumentNullException.ThrowIfNull(request);
+        EnsureAgentBinding(request.RunId, principal, channel);
+        var task = store.GetTask(request.TaskId);
+        if (task is not null && !string.Equals(task.RunId, request.RunId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.TaskOwnershipDenied,
+                "Task does not belong to the authenticated Run.");
+        }
+
         Capability capability;
         if (ToolCapabilityMap.Map(request.ToolName) is { } mapped)
         {
@@ -247,18 +349,88 @@ public sealed class ProviderInvocationStateHandler
         }
 
         var name = CapabilityCodec.ToCanonicalName(capability);
-        if (authorization is null || principal is null)
+        if (authorization is null)
         {
             return new AuthorizeToolProposalResponse(false, "awaitingAuthorization", "CAPABILITY_UNAVAILABLE", name);
         }
 
-        var decision = authorization.Authorize(principal, new AuthorizationRequest(capability));
+        var decision = authorization.Authorize(principal!, new AuthorizationRequest(capability));
         if (!decision.IsAllowed)
         {
             return new AuthorizeToolProposalResponse(false, "denied", "CAPABILITY_DENIED", name);
         }
 
         return new AuthorizeToolProposalResponse(true, "authorized", null, name);
+    }
+
+    public static void SeedInferenceAttempt(IRuntimePersistence store, string taskId, string attemptId, long startedAtMs = 1)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        if (store.GetAttempt(attemptId) is not null)
+        {
+            return;
+        }
+
+        store.InsertAttempt(new DurableAttemptRecord(
+            attemptId,
+            taskId,
+            store.MaxAttemptNo(taskId) + 1,
+            AttemptStatusCodec.ToDurableValue(AttemptStatus.Starting),
+            startedAtMs,
+            null));
+    }
+
+    private bool EvaluateAttempt(string? attemptId, string taskId, string runId)
+    {
+        if (string.IsNullOrWhiteSpace(attemptId))
+        {
+            return false;
+        }
+
+        var attempt = store.GetAttempt(attemptId);
+        if (attempt is null || !string.Equals(attempt.TaskId, taskId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var task = store.GetTask(taskId);
+        if (task is null || !string.Equals(task.RunId, runId, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (!AttemptStatusCodec.TryParse(attempt.Status, out var status) ||
+            status is not (AttemptStatus.Starting or AttemptStatus.Running))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static void EnsureAgentBinding(string requestRunId, CallerPrincipal? principal, AuthenticatedChannelContext? channel)
+    {
+        if (principal is null || principal.Kind != PrincipalKind.AgentRun || string.IsNullOrWhiteSpace(principal.RunId))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.InvalidSession,
+                "Agent commands require a Core-issued RunSession.");
+        }
+
+        if (!string.Equals(principal.RunId, requestRunId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.TaskOwnershipDenied,
+                "Authenticated RunSession does not match the requested Run.");
+        }
+
+        if (channel is not null &&
+            !string.Equals(principal.TrustedInstanceId, channel.ChannelInstanceId, StringComparison.Ordinal))
+        {
+            throw new ProviderInvocationDeniedException(
+                IpcErrorCodes.BindingMismatch,
+                "CallerPrincipal is not bound to the authenticated channel.");
+        }
     }
 
     private static bool TryParseCapabilityName(string name, out Capability capability)
@@ -278,84 +450,57 @@ public sealed class ProviderInvocationStateHandler
 
     private static bool ContainsInvocation(string json, string invocationId) =>
         json.Contains("\"invocationId\":\"" + invocationId + "\"", StringComparison.Ordinal);
-}
 
-public sealed class IpcProviderInvocationStateClient : IProviderInvocationStatePort
-{
-    private readonly IIpcApplicationCommandHandler handler;
-    private readonly string workspaceInstanceId;
-    private readonly Guid? projectId;
-    private readonly CallerPrincipal? principal;
-
-    public IpcProviderInvocationStateClient(
-        IIpcApplicationCommandHandler handler,
-        string workspaceInstanceId,
-        Guid? projectId = null,
-        CallerPrincipal? principal = null)
+    private static ProviderInvocationSnapshot? TryParseSnapshot(string json)
     {
-        this.handler = handler;
-        this.workspaceInstanceId = workspaceInstanceId;
-        this.projectId = projectId;
-        this.principal = principal;
-    }
-
-    public GetTaskExecutionSnapshotResponse GetSnapshot(GetTaskExecutionSnapshotRequest request) =>
-        Exchange(
-            IpcSemanticTypes.GetTaskExecutionSnapshot,
-            request,
-            IpcJsonContext.Default.GetTaskExecutionSnapshotRequest,
-            IpcJsonContext.Default.GetTaskExecutionSnapshotResponseEnvelope);
-
-    public PersistProviderInvocationResponse Persist(PersistProviderInvocationRequest request)
-    {
-        AssertNoSecret(request.SnapshotJson);
-        AssertNoSecret(request.RecordJson);
-        return Exchange(
-            IpcSemanticTypes.PersistProviderInvocation,
-            request,
-            IpcJsonContext.Default.PersistProviderInvocationRequest,
-            IpcJsonContext.Default.PersistProviderInvocationResponseEnvelope);
-    }
-
-    public AuthorizeToolProposalResponse Authorize(AuthorizeToolProposalRequest request) =>
-        Exchange(
-            IpcSemanticTypes.AuthorizeToolProposal,
-            request,
-            IpcJsonContext.Default.AuthorizeToolProposalRequest,
-            IpcJsonContext.Default.AuthorizeToolProposalResponseEnvelope);
-
-    private TResponse Exchange<TRequest, TResponse>(
-        string semanticType,
-        TRequest payload,
-        System.Text.Json.Serialization.Metadata.JsonTypeInfo<TRequest> requestInfo,
-        System.Text.Json.Serialization.Metadata.JsonTypeInfo<IpcEnvelope<TResponse>> responseInfo)
-    {
-        var utf8 = JsonSerializer.SerializeToUtf8Bytes(payload, requestInfo);
-        AssertNoSecret(Encoding.UTF8.GetString(utf8));
-        using var document = JsonDocument.Parse(utf8);
-        var context = new IpcApplicationCommandContext(
-            IpcClientKind.AgentRuntime,
-            "wp14-state",
-            null,
-            principal,
-            IpcMessageIds.Create(),
-            IpcMessageIds.Create(),
-            projectId,
-            null,
-            semanticType,
-            document.RootElement.Clone(),
-            CancellationToken.None);
-        var result = handler.HandleAsync(context).GetAwaiter().GetResult()
-                     ?? throw new InvalidOperationException("WP14 IPC command was not handled.");
-        var envelope = IpcJson.Deserialize(result.ResponseUtf8, responseInfo);
-        return envelope.Payload;
-    }
-
-    private static void AssertNoSecret(string? json)
-    {
-        if (!string.IsNullOrEmpty(json) && SecretRedaction.ContainsSecretMaterial(json))
+        try
         {
-            throw new InvalidOperationException(IpcErrorCodes.ProviderSecretForbidden);
+            return ProviderInvocationSnapshot.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        catch (KeyNotFoundException)
+        {
+            return null;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    private static string? TrySnapshotIdentity(string json) => TryParseSnapshot(json)?.CanonicalJson();
+
+    private static string MergeSnapshotGeneration(string digestJson, string generation)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(digestJson) ? "{}" : digestJson);
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                foreach (var property in document.RootElement.EnumerateObject())
+                {
+                    if (property.NameEquals("snapshotGeneration"))
+                    {
+                        continue;
+                    }
+
+                    property.WriteTo(writer);
+                }
+
+                writer.WriteString("snapshotGeneration", generation);
+                writer.WriteEndObject();
+            }
+
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch (JsonException)
+        {
+            return digestJson;
         }
     }
 }

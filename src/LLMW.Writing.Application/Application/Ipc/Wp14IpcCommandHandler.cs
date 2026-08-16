@@ -23,6 +23,11 @@ public sealed class Wp14IpcCommandHandler : IIpcApplicationCommandHandler
         {
             return Task.FromResult(Handle(context));
         }
+        catch (ProviderInvocationDeniedException exception)
+        {
+            return Task.FromResult<IpcApplicationCommandResult?>(
+                Error(context, exception.Code, exception.Detail));
+        }
         catch (InvalidOperationException exception) when (exception.Message == IpcErrorCodes.ProviderSecretForbidden)
         {
             return Task.FromResult<IpcApplicationCommandResult?>(
@@ -47,21 +52,21 @@ public sealed class Wp14IpcCommandHandler : IIpcApplicationCommandHandler
     private IpcApplicationCommandResult Snapshot(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.GetTaskExecutionSnapshotRequest);
-        var response = handler.GetSnapshot(request);
+        var response = handler.GetSnapshot(request, context.Principal, context.Channel);
         return Respond(context, response, IpcJsonContext.Default.GetTaskExecutionSnapshotResponseEnvelope);
     }
 
     private IpcApplicationCommandResult Persist(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.PersistProviderInvocationRequest);
-        var response = handler.Persist(request);
+        var response = handler.Persist(request, context.Principal, context.Channel);
         return Respond(context, response, IpcJsonContext.Default.PersistProviderInvocationResponseEnvelope);
     }
 
     private IpcApplicationCommandResult Authorize(IpcApplicationCommandContext context)
     {
         var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.AuthorizeToolProposalRequest);
-        var response = handler.Authorize(request, context.Principal);
+        var response = handler.Authorize(request, context.Principal, context.Channel);
         return Respond(context, response, IpcJsonContext.Default.AuthorizeToolProposalResponseEnvelope);
     }
 

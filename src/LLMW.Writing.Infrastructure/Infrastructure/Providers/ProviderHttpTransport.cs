@@ -260,7 +260,8 @@ public static class PromptWireMapping
 
     public static IReadOnlyList<PromptBlock> ContextBlocks(PromptIr ir) =>
         ir.OrderedBlocks.Where(block =>
-            block.Layer is PromptLayer.ProjectContext or PromptLayer.Skills or PromptLayer.Workflow or PromptLayer.Task or PromptLayer.User)
+            block.Layer is PromptLayer.ProjectContext or PromptLayer.Skills or PromptLayer.Workflow or PromptLayer.Task or PromptLayer.User &&
+            block.SourceKind != PromptSourceKind.ToolContinuationProvenance)
             .ToArray();
 
     public static string JoinInstructions(PromptIr ir) =>
@@ -334,6 +335,11 @@ public static class UsageNormalizer
             return NormalizedUsage.Unknown;
         }
 
+        return FromAnthropicUsage(usage);
+    }
+
+    public static NormalizedUsage FromAnthropicUsage(JsonElement usage)
+    {
         var extras = new Dictionary<string, long>(StringComparer.Ordinal);
         var cacheRead = Token(usage, "cache_read_input_tokens");
         var cacheCreate = Token(usage, "cache_creation_input_tokens");

@@ -20,8 +20,5 @@ public static class RuntimeManagementCatalog
         IpcSemanticTypes.CreateResultDependency or
         IpcSemanticTypes.UpdateResultDependency or
         IpcSemanticTypes.RefreshResultDependencyStatus or
-        IpcSemanticTypes.GetTaskHandoff or
-        IpcSemanticTypes.GetTaskExecutionSnapshot or
-        IpcSemanticTypes.PersistProviderInvocation or
-        IpcSemanticTypes.AuthorizeToolProposal;
+        IpcSemanticTypes.GetTaskHandoff;
 }

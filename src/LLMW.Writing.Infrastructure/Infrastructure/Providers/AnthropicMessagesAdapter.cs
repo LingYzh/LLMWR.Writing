@@ -35,25 +35,9 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
             return new ProviderPrepareResult(null, "MAX_OUTPUT_UNKNOWN");
         }
 
-        if (request.AdapterExtensions.TryGetValue("thinking", out var thinking))
+        if (ValidateThinking(request) is { } thinkingError)
         {
-            if (thinking == "enabled" &&
-                (!request.AdapterExtensions.TryGetValue("thinkingBudgetTokens", out var budget) ||
-                 !int.TryParse(budget, out var tokens) || tokens <= 0))
-            {
-                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
-            }
-
-            if (thinking == "adaptive" &&
-                !request.AdapterExtensions.TryGetValue("thinkingEffort", out _))
-            {
-                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
-            }
-
-            if (thinking is not "enabled" and not "adaptive")
-            {
-                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
-            }
+            return thinkingError;
         }
 
         var path = Combine(endpoint.CanonicalUri, "/v1/messages").AbsolutePath;
@@ -189,6 +173,14 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                         }
 
                         break;
+                    case "message_start":
+                        if (document.RootElement.TryGetProperty("message", out var started) &&
+                            started.TryGetProperty("usage", out var startUsage))
+                        {
+                            streamUsage = NormalizedUsage.Merge(streamUsage, UsageNormalizer.FromAnthropicUsage(startUsage));
+                        }
+
+                        break;
                     case "message_delta":
                         if (document.RootElement.TryGetProperty("delta", out var messageDelta) &&
                             messageDelta.TryGetProperty("stop_reason", out var streamedStop) &&
@@ -199,7 +191,7 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
 
                         if (document.RootElement.TryGetProperty("usage", out var usageEl))
                         {
-                            streamUsage = UsageNormalizer.FromAnthropic(JsonDocument.Parse("{\"usage\":" + usageEl.GetRawText() + "}").RootElement);
+                            streamUsage = NormalizedUsage.Merge(streamUsage, UsageNormalizer.FromAnthropicUsage(usageEl));
                         }
 
                         break;
@@ -316,6 +308,34 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
             writer.WriteString("role", "user");
             writer.WriteString("content", PromptWireMapping.JoinContext(request.Prompt));
             writer.WriteEndObject();
+            foreach (var turn in request.ToolContinuation ?? [])
+            {
+                writer.WriteStartObject();
+                writer.WriteString("role", "assistant");
+                writer.WritePropertyName("content");
+                writer.WriteStartArray();
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_use");
+                writer.WriteString("id", turn.CallId);
+                writer.WriteString("name", turn.ToolName);
+                writer.WritePropertyName("input");
+                WriteJsonOrString(writer, turn.ArgumentsJson);
+                writer.WriteEndObject();
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+                writer.WriteStartObject();
+                writer.WriteString("role", "user");
+                writer.WritePropertyName("content");
+                writer.WriteStartArray();
+                writer.WriteStartObject();
+                writer.WriteString("type", "tool_result");
+                writer.WriteString("tool_use_id", turn.CallId);
+                writer.WriteString("content", turn.ResultJson);
+                writer.WriteEndObject();
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+            }
+
             writer.WriteEndArray();
             if (request.Prompt.Tools.Count > 0)
             {
@@ -347,19 +367,88 @@ public sealed class AnthropicMessagesAdapter : IProviderProtocolAdapter
                 else if (thinking == "adaptive")
                 {
                     writer.WriteString("type", "adaptive");
-                    writer.WritePropertyName("output_config");
-                    writer.WriteStartObject();
-                    writer.WriteString("effort", request.AdapterExtensions["thinkingEffort"]);
-                    writer.WriteEndObject();
                 }
 
                 writer.WriteEndObject();
+                if (thinking == "adaptive" &&
+                    request.AdapterExtensions.TryGetValue("thinkingEffort", out var effort))
+                {
+                    writer.WritePropertyName("output_config");
+                    writer.WriteStartObject();
+                    writer.WriteString("effort", effort);
+                    writer.WriteEndObject();
+                }
             }
 
             writer.WriteEndObject();
         }
 
         return Encoding.UTF8.GetString(streamOut.ToArray());
+    }
+
+    private static ProviderPrepareResult? ValidateThinking(ProviderInvokeRequest request)
+    {
+        if (!request.AdapterExtensions.TryGetValue("thinking", out var thinking))
+        {
+            return null;
+        }
+
+        var profile = request.ProtocolProfile;
+        if (thinking == "enabled")
+        {
+            if (profile is null ||
+                !CapabilitySupportCodec.IsUsableAsSupported(profile.SupportFor(ProtocolCapabilityNames.ThinkingManual)))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            if (!request.AdapterExtensions.TryGetValue("thinkingBudgetTokens", out var budgetText) ||
+                !int.TryParse(budgetText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var budget) ||
+                budget < 1024 ||
+                budget >= request.Prompt.ReservedOutputTokens)
+            {
+                return new ProviderPrepareResult(null, "THINKING_BUDGET_INVALID");
+            }
+
+            return null;
+        }
+
+        if (thinking == "adaptive")
+        {
+            if (profile is null ||
+                !CapabilitySupportCodec.IsUsableAsSupported(profile.SupportFor(ProtocolCapabilityNames.ThinkingAdaptive)))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            if (request.AdapterExtensions.TryGetValue("thinkingEffort", out _) &&
+                !CapabilitySupportCodec.IsUsableAsSupported(profile.SupportFor(ProtocolCapabilityNames.ThinkingEffort)))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            if (!request.AdapterExtensions.TryGetValue("thinkingEffort", out _))
+            {
+                return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+            }
+
+            return null;
+        }
+
+        return new ProviderPrepareResult(null, "THINKING_UNSUPPORTED");
+    }
+
+    private static void WriteJsonOrString(Utf8JsonWriter writer, string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json);
+            document.RootElement.WriteTo(writer);
+        }
+        catch (JsonException)
+        {
+            writer.WriteStringValue(json);
+        }
     }
 
     private static Uri Combine(string endpoint, string path)

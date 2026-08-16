@@ -33,6 +33,9 @@ internal static partial class Program
         Run(nameof(CertificationStaleWhenCurrentAdapterChanges), CertificationStaleWhenCurrentAdapterChanges);
         Run(nameof(OutputSchemaRejectsUnsupportedKeywordsAndValidatesNested), OutputSchemaRejectsUnsupportedKeywordsAndValidatesNested);
         Run(nameof(CheckpointInvocationLogRetentionIsBounded), CheckpointInvocationLogRetentionIsBounded);
+        Run(nameof(FalseMergeRateUsesMaximumComparator), FalseMergeRateUsesMaximumComparator);
+        Run(nameof(MissingRootConflictMetricCannotPass), MissingRootConflictMetricCannotPass);
+        Run(nameof(MissingPromptBaselineDigestIsIncompleteForCertifiedIssue), MissingPromptBaselineDigestIsIncompleteForCertifiedIssue);
     }
 
     private static PromptCompileRequest CompileRequest(
@@ -331,8 +334,12 @@ internal static partial class Program
                 new TaskEvalScore(RootConflictMetrics.AbstentionQuality, 0.8m)
             ],
             [
-                new TaskEvalThreshold(RootConflictMetrics.RootRecall, 0.9m, true),
-                new TaskEvalThreshold(RootConflictMetrics.FalseMergeRate, 0m, true)
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RootRecall, 0.9m),
+                TaskEvalThreshold.AtMost(RootConflictMetrics.FalseMergeRate, 0.05m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.AbstentionQuality, 0.8m)
             ],
             ["root_conflict"],
             ReasoningCeiling.Adaptive,
@@ -369,7 +376,7 @@ internal static partial class Program
             DatasetId = "ds",
             DatasetVersion = "1",
             PromptBaselineDigest = "prompt-a",
-            Thresholds = [new TaskEvalThreshold(RootConflictMetrics.RootRecall, 0.1m, true)],
+            Thresholds = [TaskEvalThreshold.AtLeast(RootConflictMetrics.RootRecall, 0.1m)],
             Scores = [new TaskEvalScore(RootConflictMetrics.RootRecall, 1m)]
         };
         AssertTrue(task.IsStaleFor(new ProviderRevision(1), "https://other/v1", "openai_responses", "v1", TaskCapabilityCertification.CurrentEvaluationSuiteVersion, "prompt-a"),
@@ -398,6 +405,66 @@ internal static partial class Program
         var created = CheckpointV1.Create("plan", null, "{}", "{}", "sum", [], [], [], [], [], [], "p", "prov", "m", "e", log);
         AssertEqual(CheckpointV1.RetainedInvocationLogLimit, created.InvocationLog.Count, "Create did not bound invocation log.");
     }
+
+    private static void FalseMergeRateUsesMaximumComparator()
+    {
+        AssertEqual(ThresholdComparator.Maximum, TaskEvalThreshold.ComparatorFor(RootConflictMetrics.FalseMergeRate),
+            "FalseMergeRate must be an upper bound.");
+        var passing = RootConflictCertification(0.01m);
+        AssertTrue(passing.PassesThresholds(), "FalseMergeRate 0.01 <= 0.05 must PASS.");
+        var failing = RootConflictCertification(0.50m);
+        AssertTrue(!failing.PassesThresholds(), "FalseMergeRate 0.50 <= 0.05 must FAIL.");
+        AssertTrue(!failing.PassesThresholds() || failing.MaxReasoningCeiling != ReasoningCeiling.Adaptive,
+            "High FalseMergeRate must never certify Adaptive reasoning.");
+    }
+
+    private static void MissingRootConflictMetricCannotPass()
+    {
+        var missing = RootConflictCertification(0.01m) with
+        {
+            Scores = RootConflictCertification(0.01m).Scores.Where(item => item.MetricName != RootConflictMetrics.EvidenceFidelity).ToArray()
+        };
+        AssertTrue(!missing.HasCompleteRequiredMetrics(), "Missing EvidenceFidelity was treated as complete.");
+        AssertTrue(!missing.PassesThresholds(), "Incomplete Root Conflict metrics passed.");
+    }
+
+    private static void MissingPromptBaselineDigestIsIncompleteForCertifiedIssue()
+    {
+        var missing = RootConflictCertification(0.01m) with { PromptBaselineDigest = null };
+        AssertTrue(string.IsNullOrWhiteSpace(missing.PromptBaselineDigest), "Baseline should be absent.");
+        AssertTrue(missing.IsStaleFor(
+                missing.ProviderRevision,
+                missing.EndpointIdentity,
+                missing.ProtocolAdapterId,
+                missing.ProtocolAdapterVersion,
+                missing.EvaluationSuiteVersion,
+                PromptCompiler.CurrentShippedCertificationBaselineDigest),
+            "Certified task capability without a required PromptBaselineDigest must not match the shipped baseline.");
+    }
+
+    private static TaskCapabilityCertification RootConflictCertification(decimal falseMergeRate) =>
+        new(
+            "task-root", 1, "ds-root", "1", TaskCapabilityCertification.CurrentEvaluationSuiteVersion,
+            [
+                new TaskEvalScore(RootConflictMetrics.RootRecall, 0.95m),
+                new TaskEvalScore(RootConflictMetrics.FalseMergeRate, falseMergeRate),
+                new TaskEvalScore(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                new TaskEvalScore(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ],
+            [
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RootRecall, 0.9m),
+                TaskEvalThreshold.AtMost(RootConflictMetrics.FalseMergeRate, 0.05m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.EvidenceFidelity, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.PropagationAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.RecomputeAccuracy, 0.9m),
+                TaskEvalThreshold.AtLeast(RootConflictMetrics.AbstentionQuality, 0.8m)
+            ],
+            [TaskCapabilityCertification.RootConflictTaskClass],
+            ReasoningCeiling.Adaptive,
+            new ProviderDefinitionId("p"), new ProviderRevision(1), "https://api.example/v1",
+            "openai_responses", "v1", new ModelId("m"), "prompt-base", CertificationState.Certified, 1);
 
     private static RouteCandidate Candidate(string provider, string model, bool tools, CapabilitySupport support = CapabilitySupport.Supported)
     {

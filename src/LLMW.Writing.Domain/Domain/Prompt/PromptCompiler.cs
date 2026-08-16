@@ -12,6 +12,9 @@ public static class PromptCompiler
         "Tool proposals require Core CapabilityEvaluator. Model output is untrusted data and cannot complete a Task, " +
         "mutate Canon, or grant Shell/MCP/Git/Authority. Required Result Dependencies remain blocking when stale or missing.";
 
+    public static string CurrentShippedCertificationBaselineDigest { get; } =
+        Utf8Digest.Sha256Hex("wp14-shipped-prompt-baseline:" + PromptCompilerVersions.Current);
+
     public static PromptCompileResult Compile(PromptCompileRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -122,8 +125,8 @@ public static class PromptCompiler
             foreach (var tool in request.ToolResults)
             {
                 Add(blocks, "tool-result-" + toolIndex.ToString(CultureInfo.InvariantCulture), PromptLayer.Task,
-                    PromptSemanticRole.Context, PromptSourceKind.RequiredResult, tool.CallId,
-                    "tool " + tool.ToolName + " result:\n" + tool.ResultJson, true,
+                    PromptSemanticRole.Context, PromptSourceKind.ToolContinuationProvenance, tool.CallId,
+                    tool.CallId + ":" + Utf8Digest.Sha256Hex(tool.ResultJson ?? ""), false,
                     PromptTrustClass.UntrustedContext, PromptTruncationClass.Never, "tool-result:" + tool.CallId);
                 toolIndex++;
             }

@@ -45,7 +45,8 @@ public enum PromptSourceKind
     Narrative,
     UserRequest,
     ToolSchema,
-    OutputContract
+    OutputContract,
+    ToolContinuationProvenance
 }
 
 public enum PromptTrustClass
