@@ -12,10 +12,9 @@ internal sealed class WebViewRuntimeHost
     private readonly IBridgeLog _log;
     private readonly NavigationSessionLifecycle _navigationLifecycle = new();
     private readonly ExternalLinkCoordinator _externalLinks = new();
+    private readonly RendererOwnership _ownership = new();
     private CoreWebView2Environment? _environment;
     private bool _initialized;
-    private bool _handlersRegistered;
-    private int _rendererGeneration;
     private int _unresponsiveRecoveryCount;
 
     public WebViewRuntimeHost(
@@ -48,8 +47,15 @@ internal sealed class WebViewRuntimeHost
 
         try
         {
+            var renderer = _site.Renderer;
+            var generation = _ownership.AdoptRenderer(renderer);
             await CreateEnvironmentAsync().ConfigureAwait(true);
-            await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer).ConfigureAwait(true);
+            if (!_ownership.IsCurrent(generation, renderer))
+            {
+                return;
+            }
+
+            await ApplyPreNavigationHardeningAndNavigateAsync(renderer, generation).ConfigureAwait(true);
         }
         catch (Exception)
         {
@@ -76,29 +82,57 @@ internal sealed class WebViewRuntimeHost
         _environment = await CoreWebView2Environment.CreateWithOptionsAsync(null, userData, options);
     }
 
-    private async Task ApplyPreNavigationHardeningAndNavigateAsync(WebView2 webView)
+    private async Task ApplyPreNavigationHardeningAndNavigateAsync(WebView2 webView, int expectedGeneration)
     {
-        await webView.EnsureCoreWebView2Async(_environment);
-        _rendererGeneration++;
-        var core = webView.CoreWebView2;
-        var assets = RendererAssetLayout.FromApplicationBase(AppContext.BaseDirectory);
-        ApplySettings(core.Settings, WebViewSecuritySettings.ForCurrentBuild);
-        RegisterHandlers(core);
-        core.SetVirtualHostNameToFolderMapping(
-            AppOrigin.Host,
-            assets.DirectoryPath,
-            CoreWebView2HostResourceAccessKind.DenyCors);
-        core.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
-    }
-
-    private void RegisterHandlers(CoreWebView2 core)
-    {
-        if (_handlersRegistered)
+        if (!_ownership.IsCurrent(expectedGeneration, webView))
         {
             return;
         }
 
-        _handlersRegistered = true;
+        await webView.EnsureCoreWebView2Async(_environment);
+        if (!_ownership.IsCurrent(expectedGeneration, webView))
+        {
+            return;
+        }
+
+        var core = webView.CoreWebView2;
+        if (core is null)
+        {
+            return;
+        }
+
+        ApplySettings(core.Settings, WebViewSecuritySettings.ForCurrentBuild);
+        if (!_ownership.IsCurrent(expectedGeneration, webView))
+        {
+            return;
+        }
+
+        RegisterHandlers(webView, core, expectedGeneration);
+        if (!_ownership.IsCurrent(expectedGeneration, webView))
+        {
+            return;
+        }
+
+        var assets = RendererAssetLayout.FromApplicationBase(AppContext.BaseDirectory);
+        core.SetVirtualHostNameToFolderMapping(
+            AppOrigin.Host,
+            assets.DirectoryPath,
+            CoreWebView2HostResourceAccessKind.DenyCors);
+        if (!_ownership.IsCurrent(expectedGeneration, webView))
+        {
+            return;
+        }
+
+        core.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
+    }
+
+    private void RegisterHandlers(WebView2 webView, CoreWebView2 core, int expectedGeneration)
+    {
+        if (!_ownership.ShouldRegisterHandlers(expectedGeneration, webView, core))
+        {
+            return;
+        }
+
         core.AddWebResourceRequestedFilter(
             "*",
             CoreWebView2WebResourceContext.All,
@@ -113,6 +147,7 @@ internal sealed class WebViewRuntimeHost
         core.DownloadStarting += OnDownloadStarting;
         core.ProcessFailed += OnProcessFailed;
         core.WebMessageReceived += OnWebMessageReceived;
+        _ownership.MarkHandlersRegistered(expectedGeneration, webView, core);
     }
 
     private void OnWebResourceRequested(CoreWebView2 sender, CoreWebView2WebResourceRequestedEventArgs args)
@@ -263,7 +298,7 @@ internal sealed class WebViewRuntimeHost
             _unresponsiveRecoveryCount++;
         }
 
-        var request = new ProcessRecoveryRequest(_rendererGeneration, kind, action);
+        var request = new ProcessRecoveryRequest(_ownership.CurrentGeneration, kind, action);
         if (WebViewProcessRecoveryPolicy.LosesRendererDocument(kind))
         {
             _processor.InvalidateSession();
@@ -424,7 +459,7 @@ internal sealed class WebViewRuntimeHost
 
     private async Task RecoverFromProcessFailureAsync(ProcessRecoveryRequest request)
     {
-        if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _rendererGeneration))
+        if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _ownership.CurrentGeneration))
         {
             return;
         }
@@ -440,7 +475,7 @@ internal sealed class WebViewRuntimeHost
                 await ReloadApplicationShellAsync(request.RendererGeneration).ConfigureAwait(true);
                 break;
             case WebViewProcessRecoveryAction.FailClosedNoNavigate:
-                if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _rendererGeneration))
+                if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _ownership.CurrentGeneration))
                 {
                     return;
                 }
@@ -455,46 +490,61 @@ internal sealed class WebViewRuntimeHost
 
     private async Task RecreateControlAsync(int expectedGeneration)
     {
-        if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+        if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _ownership.CurrentGeneration))
         {
             return;
         }
 
-        _handlersRegistered = false;
         _navigationLifecycle.Reset();
         _processor.InvalidateSession();
+        if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _ownership.CurrentGeneration))
+        {
+            return;
+        }
+
+        WebView2 replacement;
+        int allocated;
         try
         {
-            var replacement = _site.RecreateRenderer();
+            replacement = _site.RecreateRenderer();
+            allocated = _ownership.AdoptRenderer(replacement);
+        }
+        catch (Exception)
+        {
+            _site.ShowNativeError("WEBVIEW_RECREATE_FAILED", "The renderer host could not be recreated.");
+            return;
+        }
+
+        try
+        {
             if (_environment is null)
             {
                 await CreateEnvironmentAsync().ConfigureAwait(true);
+                if (!_ownership.IsCurrent(allocated, replacement))
+                {
+                    return;
+                }
             }
 
-            if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
-            {
-                return;
-            }
-
-            await ApplyPreNavigationHardeningAndNavigateAsync(replacement).ConfigureAwait(true);
+            await ApplyPreNavigationHardeningAndNavigateAsync(replacement, allocated).ConfigureAwait(true);
         }
         catch (Exception)
         {
             try
             {
-                if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+                var current = _site.Renderer;
+                if (!_ownership.IsCurrent(allocated, current))
                 {
                     return;
                 }
 
                 await CreateEnvironmentAsync().ConfigureAwait(true);
-                if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+                if (!_ownership.IsCurrent(allocated, current))
                 {
                     return;
                 }
 
-                _handlersRegistered = false;
-                await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer).ConfigureAwait(true);
+                await ApplyPreNavigationHardeningAndNavigateAsync(current, allocated).ConfigureAwait(true);
             }
             catch (Exception)
             {
@@ -508,12 +558,18 @@ internal sealed class WebViewRuntimeHost
         try
         {
             await Task.Delay(250).ConfigureAwait(true);
-            if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+            if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _ownership.CurrentGeneration))
             {
                 return;
             }
 
-            var core = _site.Renderer.CoreWebView2;
+            var webView = _site.Renderer;
+            if (!_ownership.IsCurrent(expectedGeneration, webView))
+            {
+                return;
+            }
+
+            var core = webView.CoreWebView2;
             if (core is null)
             {
                 await RecreateControlAsync(expectedGeneration).ConfigureAwait(true);

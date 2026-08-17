@@ -25,6 +25,7 @@ internal static class Program
             count += Wp15CorrectiveLifecycleTests();
             count += Wp15CorrectivePass2Tests();
             count += Wp15CorrectivePass3Tests();
+            count += Wp15CorrectivePass4Tests();
             Console.WriteLine($"UI WebView bridge tests passed ({count}).");
             return 0;
         }
@@ -373,7 +374,8 @@ internal static class Program
         AssertTrue(hostText.Contains("ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal)
             && hostText.Contains("RecreateControlAsync", StringComparison.Ordinal), "recreate and hardening methods must exist.");
         AssertTrue(hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer)", StringComparison.Ordinal)
-            || hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(replacement)", StringComparison.Ordinal), "recreated WebView must reuse the pre-navigation hardening sequence.");
+            || hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(replacement)", StringComparison.Ordinal)
+            || hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(replacement, allocated)", StringComparison.Ordinal), "recreated WebView must reuse the pre-navigation hardening sequence.");
         AssertTrue(hostText.Contains("case WebViewProcessRecoveryAction.RecreateControl:", StringComparison.Ordinal), "BrowserProcessExited recovery must dispatch RecreateControl.");
         AssertTrue(!hostText.Contains("core.Navigate", StringComparison.Ordinal) || hostText.Contains("ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal), "Navigate must remain inside the hardening/reload paths.");
 
@@ -620,8 +622,8 @@ internal static class Program
         AssertTrue(!ProcessRecoveryGate.ShouldApply(staleRecreate.RendererGeneration, 2), "late G1 recreate must be discarded when G2 is current.");
 
         var hostText = File.ReadAllText(Path.Combine(FindRepoRoot(), "src", "LLMW.Writing.UI", "Hosting", "WebViewRuntimeHost.cs"));
-        AssertTrue(hostText.Contains("_rendererGeneration++", StringComparison.Ordinal), "WebView/Core recreate must increment renderer generation.");
-        AssertTrue(hostText.Contains("new ProcessRecoveryRequest(_rendererGeneration, kind, action)", StringComparison.Ordinal), "queued recovery must freeze the current renderer generation.");
+        AssertTrue(hostText.Contains("AdoptRenderer", StringComparison.Ordinal), "WebView/Core recreate must allocate renderer generation at control ownership.");
+        AssertTrue(hostText.Contains("new ProcessRecoveryRequest(_ownership.CurrentGeneration, kind, action)", StringComparison.Ordinal), "queued recovery must freeze the current renderer generation.");
         AssertTrue(hostText.Contains("ProcessRecoveryGate.ShouldApply", StringComparison.Ordinal), "queued recovery must re-check renderer generation before mutating.");
         AssertTrue(hostText.Contains("if (!IsCurrentCore(sender))", StringComparison.Ordinal)
             && hostText.Contains("OnProcessFailed", StringComparison.Ordinal), "ProcessFailed must ignore an obsolete CoreWebView2 sender.");
@@ -639,10 +641,163 @@ internal static class Program
         AssertTrue(hostText.Contains("RecreateControlAsync(int expectedGeneration)", StringComparison.Ordinal), "recreate recovery must bind to renderer generation.");
         var reload = hostText.IndexOf("private async Task ReloadApplicationShellAsync", StringComparison.Ordinal);
         var reloadBody = hostText.Substring(reload, hostText.IndexOf("private void BeginFreshDocumentSession", StringComparison.Ordinal) - reload);
-        AssertTrue(reloadBody.Contains("ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration)", StringComparison.Ordinal), "late reload must discard work when generation changed.");
+        AssertTrue(reloadBody.Contains("ProcessRecoveryGate.ShouldApply(expectedGeneration, _ownership.CurrentGeneration)", StringComparison.Ordinal), "late reload must discard work when generation changed.");
         AssertTrue(reloadBody.IndexOf("ProcessRecoveryGate.ShouldApply", StringComparison.Ordinal) < reloadBody.IndexOf("core.Navigate", StringComparison.Ordinal), "stale G1 recovery must not Navigate G2.");
 
         Console.WriteLine("WP15 corrective pass 3 tests passed.");
+        return 64;
+    }
+
+    private static int Wp15CorrectivePass4Tests()
+    {
+        var processor = new BridgeMessageProcessor();
+        var hello0 = processor.BeginDocumentSession();
+        var session0 = JsonDocument.Parse(hello0).RootElement.GetProperty("documentSessionId").GetString()!;
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.RendererReady, session0, "ready-s0-p4", "{}"))).Dispatched, "S0 ready must establish READY.");
+
+        var reverse = new NavigationSessionLifecycle();
+        processor.InvalidateSession();
+        AssertTrue(reverse.NoteStarting(1, hostCancelled: false, isAllowedApplicationNavigation: true) == NavigationTrackResult.Tracked, "N1 application start must track.");
+        AssertEqual(BridgeErrorCodes.StaleSession, processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session0, "ping-n1-p4", "{}"))).Error!.Code, "N1 NavigationStarting must stale S0.");
+        processor.InvalidateSession();
+        AssertTrue(reverse.NoteStarting(2, hostCancelled: true, isAllowedApplicationNavigation: false) == NavigationTrackResult.Tracked, "N2 external start must track as host-cancelled.");
+        AssertTrue(reverse.TryGet(1, out var n1Pending) && n1Pending.CanReplaceTopLevelDocument, "N1 must remain an active document replacer.");
+        AssertTrue(reverse.TryGet(2, out var n2Cancelled) && !n2Cancelled.CanReplaceTopLevelDocument, "N2 host-cancelled must not replace the top-level document.");
+
+        AssertTrue(reverse.NoteCompleted(2, isSuccess: false, isOperationCanceled: true, currentSourceIsApplicationDocument: true) == NavigationCompletionAction.None, "N2 OperationCanceled must not create a session while N1 can still replace the document.");
+        AssertTrue(processor.DocumentSessionId is null, "no transient session may exist after N2 cancelled completion.");
+        AssertTrue(!processor.IsReady, "bridge must remain stale after N2 cancelled completion.");
+        AssertTrue(reverse.TryGet(1, out var n1Owner) && n1Owner.CanReplaceTopLevelDocument, "N1 must still own pending document replacement.");
+        AssertTrue(reverse.LatestStartSequence == n1Owner.StartSequence, "ownership must transfer to the newest remaining active replacer.");
+        AssertTrue(!reverse.TryGet(2, out _), "completed N2 must not remain the start-sequence owner.");
+
+        AssertTrue(SameDocumentSessionPolicy.Evaluate(isNewDocument: true, currentSourceIsApplicationDocument: true) == SameDocumentSourceChangeAction.InvalidateOnly, "N1 SourceChanged(IsNewDocument=true) must not handshake.");
+        processor.InvalidateSession();
+        AssertTrue(processor.DocumentSessionId is null, "new-document SourceChanged during N1 load must not mint a session.");
+        AssertEqual(BridgeErrorCodes.StaleSession, processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session0, "ping-n1-source-p4", "{}"))).Error!.Code, "S0 must remain rejected through the N1 new-document interval.");
+
+        AssertTrue(reverse.NoteCompleted(1, isSuccess: true, isOperationCanceled: false, currentSourceIsApplicationDocument: true) == NavigationCompletionAction.BeginNewSession, "N1 success must mint exactly one fresh session.");
+        var hello2 = processor.BeginDocumentSession();
+        AssertTrue(hello2.Contains("\"semanticType\":\"host.hello\"", StringComparison.Ordinal), "owning N1 success must post host.hello.");
+        var session2 = JsonDocument.Parse(hello2).RootElement.GetProperty("documentSessionId").GetString()!;
+        AssertTrue(!string.Equals(session0, session2, StringComparison.Ordinal), "S2 must not resurrect S0.");
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.RendererReady, session2, "ready-s2-p4", "{}"))).Dispatched, "S2 renderer.ready must complete the handshake.");
+        AssertTrue(processor.IsReady, "S2 must be READY.");
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session2, "ping-s2-p4", "{}"))).Dispatched, "S2 ping must be accepted.");
+        AssertEqual(BridgeErrorCodes.StaleSession, processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session0, "ping-s0-after-p4", "{}"))).Error!.Code, "S0 must remain rejected after S2 READY.");
+
+        var failedReplacer = new NavigationSessionLifecycle();
+        failedReplacer.NoteStarting(11, hostCancelled: false, isAllowedApplicationNavigation: true);
+        failedReplacer.NoteStarting(12, hostCancelled: true, isAllowedApplicationNavigation: false);
+        AssertTrue(failedReplacer.NoteCompleted(12, false, true, true) == NavigationCompletionAction.None, "N2 cancelled completion must not reauthorize the old document.");
+        AssertTrue(failedReplacer.NoteCompleted(11, isSuccess: false, isOperationCanceled: false, currentSourceIsApplicationDocument: true) == NavigationCompletionAction.ShowNativeFailure, "N1 later failure must follow fail-closed native-error policy.");
+        AssertTrue(failedReplacer.NoteCompleted(12, false, true, true) == NavigationCompletionAction.IgnoreUnknown, "a finished cancelled navigation must not manufacture a later session.");
+
+        var manyCancelled = new NavigationSessionLifecycle();
+        manyCancelled.NoteStarting(21, hostCancelled: false, isAllowedApplicationNavigation: true);
+        manyCancelled.NoteStarting(22, hostCancelled: true, isAllowedApplicationNavigation: false);
+        manyCancelled.NoteStarting(23, hostCancelled: true, isAllowedApplicationNavigation: false);
+        AssertTrue(manyCancelled.NoteCompleted(23, false, true, true) == NavigationCompletionAction.None, "a later cancelled navigation must not block because it cannot replace the document.");
+        AssertTrue(manyCancelled.NoteCompleted(22, false, true, true) == NavigationCompletionAction.None, "multiple cancelled navigations must not handshake while a replacer is active.");
+        AssertTrue(manyCancelled.TryGet(21, out var remainingReplacer) && remainingReplacer.CanReplaceTopLevelDocument, "the active document replacer must remain tracked.");
+        AssertTrue(manyCancelled.LatestStartSequence == remainingReplacer.StartSequence, "ownership must settle on the remaining document-replacing navigation.");
+        AssertTrue(manyCancelled.NoteCompleted(21, true, false, true) == NavigationCompletionAction.BeginNewSession, "the remaining replacer must still be able to resolve a session.");
+
+        var onlyCancelled = new NavigationSessionLifecycle();
+        onlyCancelled.NoteStarting(31, hostCancelled: true, isAllowedApplicationNavigation: false);
+        onlyCancelled.NoteStarting(32, hostCancelled: true, isAllowedApplicationNavigation: false);
+        AssertTrue(onlyCancelled.NoteCompleted(31, false, true, true) == NavigationCompletionAction.None, "an older cancelled completion must not handshake.");
+        AssertTrue(onlyCancelled.NoteCompleted(32, false, true, true) == NavigationCompletionAction.BeginNewSession, "cancelled navigations must not block a safe session forever when none can replace the document.");
+
+        var redirect = new NavigationSessionLifecycle();
+        AssertTrue(redirect.NoteStarting(7, hostCancelled: false, isAllowedApplicationNavigation: true) == NavigationTrackResult.Tracked, "redirect start must track once.");
+        AssertTrue(redirect.NoteStarting(7, hostCancelled: true, isAllowedApplicationNavigation: false) == NavigationTrackResult.UpdatedRedirect, "same NavigationId redirect must remain one record.");
+        AssertEqual(1, redirect.ActiveCount, "bounded tracker must not duplicate redirect NavigationId records.");
+        AssertTrue(redirect.NoteCompleted(7, false, true, true) == NavigationCompletionAction.BeginNewSession, "a cancelled same-id redirect without an active replacer may restore a session.");
+
+        var ownership = new RendererOwnership();
+        var g1Control = new object();
+        var g1 = ownership.AdoptRenderer(g1Control);
+        AssertEqual(1, g1, "first control ownership must allocate G1 immediately.");
+        var r1 = new ProcessRecoveryRequest(g1, WebViewProcessFailedKind.BrowserProcessExited, WebViewProcessRecoveryAction.RecreateControl);
+        var r2 = new ProcessRecoveryRequest(g1, WebViewProcessFailedKind.BrowserProcessExited, WebViewProcessRecoveryAction.RecreateControl);
+        AssertTrue(ProcessRecoveryGate.ShouldApply(r1.RendererGeneration, ownership.CurrentGeneration), "R1(G1) must pass the gate while G1 is current.");
+        var controlA = new object();
+        var coreA = new object();
+        var g2 = ownership.AdoptRenderer(controlA);
+        AssertEqual(2, g2, "RecreateRenderer must allocate G2 before Ensure completes.");
+        AssertTrue(ReferenceEquals(ownership.CurrentRenderer, controlA), "A must be the current renderer after R1 replacement.");
+        AssertTrue(!ProcessRecoveryGate.ShouldApply(r2.RendererGeneration, ownership.CurrentGeneration), "R2(G1) must be stale after G2 is allocated.");
+        AssertTrue(!ownership.IsCurrent(g1, g1Control), "G1 recovery must not still own the renderer.");
+        AssertTrue(!ownership.ShouldRegisterHandlers(r2.RendererGeneration, controlA, coreA), "R2 must not mark handler state on A.");
+        AssertTrue(!ownership.IsCurrent(g1, controlA), "R2 must not Navigate or replace A.");
+
+        var mutated = false;
+        if (ProcessRecoveryGate.ShouldApply(r2.RendererGeneration, ownership.CurrentGeneration)
+            && ownership.IsCurrent(g1, controlA))
+        {
+            mutated = true;
+            ownership.AdoptRenderer(new object());
+        }
+
+        AssertTrue(!mutated, "R2 must not replace A, Navigate, or mutate session/handler state.");
+        AssertTrue(ownership.ShouldRegisterHandlers(g2, controlA, coreA), "A/G2 initialization must still be allowed to register handlers.");
+        ownership.MarkHandlersRegistered(g2, controlA, coreA);
+        AssertTrue(ownership.HasHandlersFor(g2, coreA), "G2 must have WP15 handlers after A initialization completes.");
+        AssertTrue(ReferenceEquals(ownership.CurrentRenderer, controlA), "exactly one current renderer must survive concurrent G1 recovery.");
+        AssertEqual(2, ownership.CurrentGeneration, "G2 must remain current after discarding R2.");
+
+        var detached = new RendererOwnership();
+        var first = new object();
+        var firstGeneration = detached.AdoptRenderer(first);
+        var replacementA = new object();
+        var coreDetached = new object();
+        var generationA = detached.AdoptRenderer(replacementA);
+        var mapped = false;
+        var navigated = false;
+        var hello = false;
+        var registeredDetached = false;
+        var replacementB = new object();
+        var coreB = new object();
+        var generationB = detached.AdoptRenderer(replacementB);
+        if (detached.IsCurrent(generationA, replacementA) && detached.ShouldRegisterHandlers(generationA, replacementA, coreDetached))
+        {
+            registeredDetached = true;
+            detached.MarkHandlersRegistered(generationA, replacementA, coreDetached);
+            mapped = true;
+            navigated = true;
+            hello = true;
+        }
+
+        AssertTrue(!detached.IsCurrent(generationA, replacementA), "A continuation must detect stale generation/control identity.");
+        AssertTrue(!detached.ShouldRegisterHandlers(generationA, replacementA, coreDetached), "detached A must not register handlers.");
+        AssertTrue(!registeredDetached && !mapped && !navigated && !hello, "detached A must not map, Navigate, or host.hello.");
+        AssertTrue(!detached.HasHandlersFor(generationA, coreDetached), "detached Core registration must have zero authority over the current Core.");
+        AssertTrue(detached.IsCurrent(generationB, replacementB), "B must remain the sole current renderer.");
+        AssertTrue(detached.ShouldRegisterHandlers(generationB, replacementB, coreB), "current Core B must still install handlers exactly once.");
+        detached.MarkHandlersRegistered(generationB, replacementB, coreB);
+        AssertTrue(detached.HasHandlersFor(generationB, coreB), "B must own current handler registration.");
+        AssertTrue(!detached.ShouldRegisterHandlers(generationB, replacementB, coreB), "current Core handlers must install exactly once.");
+        AssertTrue(firstGeneration == 1 && generationA == 2 && generationB == 3, "each control ownership change must allocate a new generation immediately.");
+
+        var hostText = File.ReadAllText(Path.Combine(FindRepoRoot(), "src", "LLMW.Writing.UI", "Hosting", "WebViewRuntimeHost.cs"));
+        AssertTrue(!hostText.Contains("_handlersRegistered", StringComparison.Ordinal), "global handler-registered flag must not skip the current Core.");
+        AssertTrue(!hostText.Contains("_rendererGeneration++", StringComparison.Ordinal), "generation must not wait for EnsureCoreWebView2Async.");
+        var recreate = hostText.IndexOf("private async Task RecreateControlAsync", StringComparison.Ordinal);
+        var recreateBody = hostText.Substring(recreate, hostText.IndexOf("private async Task ReloadApplicationShellAsync", StringComparison.Ordinal) - recreate);
+        AssertTrue(recreateBody.IndexOf("RecreateRenderer()", StringComparison.Ordinal) < recreateBody.IndexOf("AdoptRenderer", StringComparison.Ordinal), "G2 must be allocated immediately when RecreateRenderer changes control ownership.");
+        var apply = hostText.IndexOf("private async Task ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal);
+        var applyBody = hostText.Substring(apply, hostText.IndexOf("private void RegisterHandlers", StringComparison.Ordinal) - apply);
+        AssertTrue(applyBody.Contains("EnsureCoreWebView2Async", StringComparison.Ordinal)
+            && applyBody.IndexOf("EnsureCoreWebView2Async", StringComparison.Ordinal) < applyBody.LastIndexOf("_ownership.IsCurrent", StringComparison.Ordinal), "initialization must re-check generation/control identity after Ensure.");
+        AssertTrue(applyBody.Contains("SetVirtualHostNameToFolderMapping", StringComparison.Ordinal)
+            && applyBody.Contains("_ownership.IsCurrent", StringComparison.Ordinal), "virtual-host mapping must stay generation-bound.");
+        AssertTrue(applyBody.Contains("core.Navigate", StringComparison.Ordinal)
+            && applyBody.LastIndexOf("_ownership.IsCurrent", StringComparison.Ordinal) < applyBody.IndexOf("core.Navigate", StringComparison.Ordinal), "Navigate must not run on a detached control.");
+        AssertTrue(hostText.Contains("ShouldRegisterHandlers", StringComparison.Ordinal)
+            && hostText.Contains("MarkHandlersRegistered", StringComparison.Ordinal), "handler registration must be per Core/generation.");
+
+        Console.WriteLine("WP15 corrective pass 4 tests passed.");
         return 64;
     }
 

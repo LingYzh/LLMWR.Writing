@@ -116,6 +116,15 @@ internal sealed class NavigationSessionLifecycle
         var record = _active[index]!;
         _active[index] = null;
 
+        if (record.HostCancelled
+            && !isSuccess
+            && isOperationCanceled
+            && HasActiveDocumentReplacer())
+        {
+            TransferOwnershipToNewestActiveReplacer();
+            return NavigationCompletionAction.None;
+        }
+
         if (record.StartSequence != _latestStartSequence)
         {
             return NavigationCompletionAction.None;
@@ -173,6 +182,38 @@ internal sealed class NavigationSessionLifecycle
         _latestStartSequence = 0;
     }
 
+    private bool HasActiveDocumentReplacer()
+    {
+        for (var i = 0; i < _active.Length; i++)
+        {
+            if (_active[i] is NavigationRecord record && record.CanReplaceTopLevelDocument)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void TransferOwnershipToNewestActiveReplacer()
+    {
+        long newest = 0;
+        for (var i = 0; i < _active.Length; i++)
+        {
+            if (_active[i] is NavigationRecord record
+                && record.CanReplaceTopLevelDocument
+                && record.StartSequence > newest)
+            {
+                newest = record.StartSequence;
+            }
+        }
+
+        if (newest > 0)
+        {
+            _latestStartSequence = newest;
+        }
+    }
+
     private int IndexOf(ulong navigationId)
     {
         for (var i = 0; i < _active.Length; i++)
@@ -217,5 +258,6 @@ internal sealed class NavigationSessionLifecycle
         public long StartSequence { get; }
         public bool HostCancelled { get; set; }
         public bool IsAllowedApplicationNavigation { get; set; }
+        public bool CanReplaceTopLevelDocument => IsAllowedApplicationNavigation && !HostCancelled;
     }
 }
