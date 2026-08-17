@@ -51,6 +51,12 @@
   var projectSample = '<script>\nchrome.webview.postMessage({\n  semanticType: "externalLink.request"\n})\n</script>';
   setText("project-sample", projectSample);
 
+  window.llmwBridge = {
+    post: post,
+    uuid: uuid,
+    onEditorMessage: null
+  };
+
   if (!window.chrome || !chrome.webview) {
     setText("status", "bridge unavailable");
     return;
@@ -65,7 +71,7 @@
     if (msg.semanticType === "host.hello") {
       sessionId = msg.documentSessionId;
       setText("status", "host hello received");
-      post("renderer.ready", { shell: "wp15-static" });
+      post("renderer.ready", { shell: "wp16-editor" });
       return;
     }
 
@@ -83,22 +89,27 @@
       return;
     }
 
-    if (msg.semanticType === "bridge.error" && msg.payload) {
-      setText("error", String(msg.payload.code || "error"));
+    if (msg.semanticType === "bridge.error" || msg.semanticType === "editor.error") {
+      setText("error", (msg.payload && msg.payload.code) || "error");
+      return;
+    }
+
+    if (window.llmwBridge.onEditorMessage) {
+      window.llmwBridge.onEditorMessage(msg);
     }
   });
 
   var ping = document.getElementById("ping");
   if (ping) {
     ping.addEventListener("click", function () {
-      post("bridge.ping", {});
+      post("bridge.ping", { nonce: "n1" });
     });
   }
 
   var ext = document.getElementById("ext");
   if (ext) {
     ext.addEventListener("click", function () {
-      post("externalLink.request", { uri: "https://example.com/path" });
+      post("externalLink.request", { uri: "https://example.com/" });
     });
   }
 })();

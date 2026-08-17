@@ -1,2 +1,4 @@
 packages:
   - "src/web-editor"
+allowBuilds:
+  esbuild: true

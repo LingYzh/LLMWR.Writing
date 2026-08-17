@@ -1,3 +1,4 @@
+using LLMW.Writing.Application.Editor;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Application.Runtime;
@@ -23,6 +24,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
     private readonly string runtimeChannelInstanceId;
     private readonly TrustedNativePrincipalSource nativeUi;
     private readonly ProjectRunSessionServiceHolder runSessions;
+    private readonly EditorRuntimeHolder editors;
     private bool opened;
 
     public CoreOpenProjectHandler(
@@ -33,7 +35,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         string runtimeWorkerInstanceId,
         string runtimeChannelInstanceId,
         TrustedNativePrincipalSource nativeUi,
-        ProjectRunSessionServiceHolder runSessions)
+        ProjectRunSessionServiceHolder runSessions,
+        EditorRuntimeHolder editors)
     {
         this.commands = commands;
         this.bindings = bindings;
@@ -43,6 +46,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         this.runtimeChannelInstanceId = runtimeChannelInstanceId;
         this.nativeUi = nativeUi;
         this.runSessions = runSessions;
+        this.editors = editors;
     }
 
     public Task<IpcApplicationCommandResult?> HandleAsync(IpcApplicationCommandContext context)
@@ -74,6 +78,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
 
             var previousInner = commands.Inner;
             RunSessionService? published = null;
+            EditorRuntime? publishedEditor = null;
             var runtimeBindingInstalled = false;
             try
             {
@@ -137,7 +142,18 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new Wp13IpcCommandHandler(wp13, workspaceInstanceId),
                     new Wp14IpcCommandHandler(
                         new ProviderInvocationStateHandler(store, scheduler, authorization),
-                        workspaceInstanceId));
+                        workspaceInstanceId),
+                    new Wp16IpcCommandHandler(editors, workspaceInstanceId));
+                var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
+                var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
+                var draftStore = new DraftFileStore(pathResolver, new SelfWriteTracker());
+                var editor = new EditorRuntime(
+                    bind.ProjectId.ToString("D"),
+                    draftStore,
+                    blobStore,
+                    EditorSaveFaultEnvironment.FromEnvironment());
+                editors.PublishOnce(editor);
+                publishedEditor = editor;
                 wp13.RecoverBackgroundTasks();
                 runSessions.PublishOnce(sessions);
                 published = sessions;
@@ -150,6 +166,11 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 if (published is not null)
                 {
                     runSessions.TryAbandon(published);
+                }
+
+                if (publishedEditor is not null)
+                {
+                    editors.TryAbandon(publishedEditor);
                 }
 
                 if (runtimeBindingInstalled)

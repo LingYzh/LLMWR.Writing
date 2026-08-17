@@ -12,8 +12,8 @@ artifacts/
 # JavaScript tooling and generated editor assets
 node_modules/
 .pnpm-store/
-src/web-editor/dist/
-src/LLMW.Writing.UI/GeneratedAssets/
+src/web-editor/app/editor.bundle.js
+src/web-editor/app/editor.bundle.js.map
 
 # Project runtime state and generated diagnostics
 .llmw/

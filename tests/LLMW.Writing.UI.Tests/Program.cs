@@ -26,6 +26,7 @@ internal static class Program
             count += Wp15CorrectivePass2Tests();
             count += Wp15CorrectivePass3Tests();
             count += Wp15CorrectivePass4Tests();
+            count += Wp16UiTests.Run();
             Console.WriteLine($"UI WebView bridge tests passed ({count}).");
             return 0;
         }
@@ -42,6 +43,7 @@ internal static class Program
         AssertTrue(AppOriginPolicy.IsApplicationDocument(AppDocument), "index.html must be an application document.");
         AssertTrue(AppOriginPolicy.IsApplicationResource("https://app.llmw.invalid/bridge.js"), "bridge.js must be an application resource.");
         AssertTrue(AppOriginPolicy.IsApplicationResource("https://app.llmw.invalid/app.css"), "app.css must be an application resource.");
+        AssertTrue(AppOriginPolicy.IsApplicationResource("https://app.llmw.invalid/editor.bundle.js"), "editor.bundle.js must be an application resource.");
         AssertTrue(!AppOriginPolicy.IsApplicationDocument("http://app.llmw.invalid/"), "http app host must be rejected.");
         AssertTrue(!AppOriginPolicy.IsApplicationDocument("https://app.llmw.invalid.evil.example/"), "lookalike suffix host must be rejected.");
         AssertTrue(!AppOriginPolicy.IsApplicationDocument("https://app.llmw.invalid@evil.example/"), "userinfo lookalike must be rejected.");
@@ -51,7 +53,7 @@ internal static class Program
         AssertTrue(!AppOriginPolicy.IsApplicationDocument("https://app.llmw.invalid:444/"), "non-default port must be rejected.");
         AssertTrue(!AppOriginPolicy.IsTrustedMessageSource(AppDocument, "https://evil.example/"), "current document mismatch must fail.");
         Console.WriteLine("WP15 origin tests passed.");
-        return 12;
+        return 13;
     }
 
     private static int Wp15NavigationAndResourceTests()
@@ -68,12 +70,13 @@ internal static class Program
         AssertTrue(WebResourcePolicy.IsAllowed(AppDocument), "app index resource must be allowed.");
         AssertTrue(WebResourcePolicy.IsAllowed("https://app.llmw.invalid/bridge.js"), "app script resource must be allowed.");
         AssertTrue(WebResourcePolicy.IsAllowed("https://app.llmw.invalid/app.css"), "app css resource must be allowed.");
+        AssertTrue(WebResourcePolicy.IsAllowed("https://app.llmw.invalid/editor.bundle.js"), "editor bundle resource must be allowed.");
         AssertTrue(!WebResourcePolicy.IsAllowed("https://evil.example/x.js"), "external script fetch must be blocked.");
         AssertTrue(!WebResourcePolicy.IsAllowed("http://evil.example/"), "http fetch must be blocked.");
         AssertTrue(!WebResourcePolicy.IsAllowed("file:///C:/project/draft.md"), "file fetch must be blocked.");
         AssertTrue(!WebResourcePolicy.IsAllowed(@"X:\Project\Manuscript\chapter.md"), "project filesystem path must be blocked.");
         Console.WriteLine("WP15 navigation/resource tests passed.");
-        return 16;
+        return 17;
     }
 
     private static int Wp15ExternalUriTests()
@@ -264,10 +267,11 @@ internal static class Program
         var bootstrap = File.ReadAllText(Path.Combine(root, "src", "LLMW.Writing.UI", "ProcessBootstrapper.cs"));
         AssertTrue(bootstrap.Contains("LLMW_UI_BOOTSTRAP_TOKEN", StringComparison.Ordinal), "ProcessBootstrapper must remain native-only.");
         var app = File.ReadAllText(Path.Combine(root, "src", "LLMW.Writing.UI", "App.xaml.cs"));
-        AssertTrue(!app.Contains("ProcessBootstrapper", StringComparison.Ordinal), "WP15 must not start Core from App.");
+        AssertTrue(!app.Contains("LLMW_UI_BOOTSTRAP_TOKEN", StringComparison.Ordinal), "App must not embed bootstrap secrets.");
+        AssertTrue(app.Contains("CoreHostService", StringComparison.Ordinal), "WP16 UI process may start Core.");
 
         Console.WriteLine("WP15 security surface tests passed.");
-        return 38;
+        return 39;
     }
 
     private static int Wp15CorrectiveLifecycleTests()

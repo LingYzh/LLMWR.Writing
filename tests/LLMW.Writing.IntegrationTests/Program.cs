@@ -29,6 +29,7 @@ internal static partial class Program
             await RunWp12TestsAsync();
             RunWp13Tests();
             RunWp14Tests();
+            await RunWp16TestsAsync();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;
@@ -68,7 +69,11 @@ internal static partial class Program
         }
     }
 
-    private static Process StartCore(string workspaceInstanceId, string uiBootstrapToken, string runtimeBootstrapToken)
+    private static Process StartCore(
+        string workspaceInstanceId,
+        string uiBootstrapToken,
+        string runtimeBootstrapToken,
+        IReadOnlyDictionary<string, string>? extraEnvironment = null)
     {
         var coreAssembly = Path.Combine(
             Environment.CurrentDirectory,
@@ -92,6 +97,13 @@ internal static partial class Program
         startInfo.Environment["LLMW_WORKSPACE_INSTANCE_ID"] = workspaceInstanceId;
         startInfo.Environment["LLMW_UI_BOOTSTRAP_TOKEN"] = uiBootstrapToken;
         startInfo.Environment["LLMW_RUNTIME_BOOTSTRAP_TOKEN"] = runtimeBootstrapToken;
+        if (extraEnvironment is not null)
+        {
+            foreach (var pair in extraEnvironment)
+            {
+                startInfo.Environment[pair.Key] = pair.Value;
+            }
+        }
 
         return Process.Start(startInfo) ?? throw new InvalidOperationException("Core process did not start.");
     }

@@ -32,6 +32,7 @@ internal static class Program
         var runtimeWorkerInstanceId = "runtime-" + Guid.NewGuid().ToString("N");
         var runtimeChannelInstanceId = "runtime-channel-" + Guid.NewGuid().ToString("N");
         var runSessions = new ProjectRunSessionServiceHolder();
+        var editors = new EditorRuntimeHolder();
         commands.Inner = new CoreOpenProjectHandler(
             commands,
             bindings,
@@ -40,7 +41,8 @@ internal static class Program
             runtimeWorkerInstanceId,
             runtimeChannelInstanceId,
             nativeUi,
-            runSessions);
+            runSessions,
+            editors);
 
         var uiOptions = new IpcServerOptions
         {
@@ -50,7 +52,14 @@ internal static class Program
             EventRing = eventRing,
             Bindings = bindings,
             NativeUi = nativeUi,
-            Commands = commands
+            Commands = commands,
+            OnAuthenticatedConnectionClosed = (kind, connectionId) =>
+            {
+                if (kind == IpcClientKind.Ui)
+                {
+                    editors.ReleaseByConnection(connectionId);
+                }
+            }
         };
         var runtimeOptions = new IpcServerOptions
         {

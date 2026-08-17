@@ -220,6 +220,21 @@ public static class IpcErrorCodes
     public const string InvocationIdentityConflict = "INVOCATION_IDENTITY_CONFLICT";
     public const string InvocationLifecycleConflict = "INVOCATION_LIFECYCLE_CONFLICT";
     public const string InvocationProvenanceConflict = "INVOCATION_PROVENANCE_CONFLICT";
+    public const string EditorSessionInvalid = "EDITOR_SESSION_INVALID";
+    public const string EditorDocumentNotWritable = "EDITOR_DOCUMENT_NOT_WRITABLE";
+    public const string EditorLeaseConflict = "EDITOR_LEASE_CONFLICT";
+    public const string EditorLeaseLost = "EDITOR_LEASE_LOST";
+    public const string EditorStaleBase = "EDITOR_STALE_BASE";
+    public const string EditorSaveIdentityConflict = "EDITOR_SAVE_IDENTITY_CONFLICT";
+    public const string EditorUploadInvalid = "EDITOR_UPLOAD_INVALID";
+    public const string EditorUploadHashMismatch = "EDITOR_UPLOAD_HASH_MISMATCH";
+    public const string EditorDocumentTooLarge = "EDITOR_DOCUMENT_TOO_LARGE";
+    public const string EditorEncodingUnsupported = "EDITOR_ENCODING_UNSUPPORTED";
+    public const string EditorPatchInvalid = "EDITOR_PATCH_INVALID";
+    public const string EditorPatchSequence = "EDITOR_PATCH_SEQUENCE";
+    public const string EditorRecoveryAvailable = "EDITOR_RECOVERY_AVAILABLE";
+    public const string EditorRecoveryBaseChanged = "EDITOR_RECOVERY_BASE_CHANGED";
+    public const string EditorSaveOutcomeUnknown = "EDITOR_SAVE_OUTCOME_UNKNOWN";
 }
 
 public static class IpcServerCapabilities

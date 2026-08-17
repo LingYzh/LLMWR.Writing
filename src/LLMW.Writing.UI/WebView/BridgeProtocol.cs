@@ -12,7 +12,8 @@ internal static class BridgeProtocol
     public const int MaximumSafeErrorChars = 256;
     public const int MaximumReplayCache = 4096;
     public const string AppName = "LLMW.Writing";
-    public const string ShellName = "wp15-static";
+    public const string ShellName = "wp16-editor";
+    public const int MaximumEditorInsertChars = 256 * 1024;
 }
 
 internal static class BridgeSemanticTypes
@@ -20,14 +21,36 @@ internal static class BridgeSemanticTypes
     public const string RendererReady = "renderer.ready";
     public const string BridgePing = "bridge.ping";
     public const string ExternalLinkRequest = "externalLink.request";
+    public const string EditorBindAck = "editor.bind.ack";
+    public const string EditorChange = "editor.change";
+    public const string EditorShadowResyncBegin = "editor.shadow.resync.begin";
+    public const string EditorShadowResyncChunk = "editor.shadow.resync.chunk";
+    public const string EditorShadowResyncCommit = "editor.shadow.resync.commit";
+    public const string EditorSaveRequest = "editor.save.request";
+    public const string EditorRecoveryResponse = "editor.recovery.response";
+    public const string EditorSelectionChanged = "editor.selection.changed";
+    public const string EditorCloseRequest = "editor.close.request";
     public const string HostHello = "host.hello";
     public const string BridgePong = "bridge.pong";
     public const string BridgeAck = "bridge.ack";
     public const string BridgeError = "bridge.error";
     public const string HostStatus = "host.status";
+    public const string EditorBind = "editor.bind";
+    public const string EditorDocumentBegin = "editor.document.begin";
+    public const string EditorDocumentChunk = "editor.document.chunk";
+    public const string EditorDocumentCommit = "editor.document.commit";
+    public const string EditorState = "editor.state";
+    public const string EditorSaveResult = "editor.save.result";
+    public const string EditorLeaseState = "editor.lease.state";
+    public const string EditorRecoveryOffer = "editor.recovery.offer";
+    public const string EditorRecoveryConflict = "editor.recovery.conflict";
+    public const string EditorError = "editor.error";
 
     public static bool IsInbound(string semanticType)
-        => semanticType is RendererReady or BridgePing or ExternalLinkRequest;
+        => semanticType is RendererReady or BridgePing or ExternalLinkRequest
+            or EditorBindAck or EditorChange or EditorShadowResyncBegin or EditorShadowResyncChunk
+            or EditorShadowResyncCommit or EditorSaveRequest or EditorRecoveryResponse
+            or EditorSelectionChanged or EditorCloseRequest;
 }
 
 internal static class BridgeErrorCodes
@@ -46,6 +69,8 @@ internal static class BridgeErrorCodes
     public const string NavigationBlocked = "NAVIGATION_BLOCKED";
     public const string ExternalUrlDenied = "EXTERNAL_URL_DENIED";
     public const string ExternalLinkBusy = "EXTERNAL_LINK_BUSY";
+    public const string EditorPatchInvalid = "EDITOR_PATCH_INVALID";
+    public const string EditorPatchSequence = "EDITOR_PATCH_SEQUENCE";
 }
 
 internal sealed class BridgeError
@@ -125,9 +150,13 @@ internal sealed class RendererAssetLayout
     public string IndexHtmlPath => Path.Combine(DirectoryPath, "index.html");
     public string BridgeJsPath => Path.Combine(DirectoryPath, "bridge.js");
     public string AppCssPath => Path.Combine(DirectoryPath, "app.css");
+    public string EditorBundlePath => Path.Combine(DirectoryPath, "editor.bundle.js");
 
     public bool Exists =>
-        File.Exists(IndexHtmlPath) && File.Exists(BridgeJsPath) && File.Exists(AppCssPath);
+        File.Exists(IndexHtmlPath)
+        && File.Exists(BridgeJsPath)
+        && File.Exists(AppCssPath)
+        && File.Exists(EditorBundlePath);
 
     public static RendererAssetLayout FromApplicationBase(string applicationBaseDirectory)
         => new(Path.Combine(applicationBaseDirectory, "web-editor", "app"));

@@ -10,6 +10,7 @@ internal sealed class WebViewRuntimeHost
     private readonly BridgeMessageProcessor _processor;
     private readonly IExternalBrowserLauncher _launcher;
     private readonly IBridgeLog _log;
+    private readonly IEditorBridgeHost? _editor;
     private readonly NavigationSessionLifecycle _navigationLifecycle = new();
     private readonly ExternalLinkCoordinator _externalLinks = new();
     private readonly RendererOwnership _ownership = new();
@@ -20,11 +21,13 @@ internal sealed class WebViewRuntimeHost
     public WebViewRuntimeHost(
         IWebViewRendererSite site,
         IExternalBrowserLauncher? launcher = null,
-        IBridgeLog? log = null)
+        IBridgeLog? log = null,
+        IEditorBridgeHost? editor = null)
     {
         _site = site;
         _launcher = launcher ?? new ShellExecuteExternalBrowserLauncher();
         _log = log ?? NullBridgeLog.Instance;
+        _editor = editor;
         _processor = new BridgeMessageProcessor(_log);
     }
 
@@ -334,6 +337,18 @@ internal sealed class WebViewRuntimeHost
         {
             PostToRenderer(outbound);
         }
+
+        if (result.BecameReady && !string.IsNullOrEmpty(result.RequestDocumentSessionId))
+        {
+            _editor?.OnDocumentSessionReady(result.RequestDocumentSessionId);
+        }
+
+        if (result.Editor is not null
+            && !string.IsNullOrEmpty(result.RequestDocumentSessionId)
+            && !string.IsNullOrEmpty(result.RequestMessageId))
+        {
+            _editor?.HandleEditorMessage(result.Editor, result.RequestDocumentSessionId, result.RequestMessageId);
+        }
     }
 
     private async Task CompleteExternalFromBridgeAsync(BridgeProcessResult result)
@@ -591,6 +606,10 @@ internal sealed class WebViewRuntimeHost
         sender.PostWebMessageAsJson(hello);
         _site.ShowNativeStatus("HOST_HELLO", "Application origin loaded.");
     }
+
+    public int CurrentRendererGeneration => _ownership.CurrentGeneration;
+
+    public void PostEditorJson(string json) => PostToRenderer(json);
 
     private bool IsCurrentCore(CoreWebView2 sender)
         => _site.Renderer.CoreWebView2 is CoreWebView2 current && ReferenceEquals(sender, current);

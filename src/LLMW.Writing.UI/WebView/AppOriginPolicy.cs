@@ -13,6 +13,7 @@ internal static class AppOrigin
     public const string RootPath = "/";
     public const string BridgeScriptPath = "/bridge.js";
     public const string AppCssPath = "/app.css";
+    public const string EditorBundlePath = "/editor.bundle.js";
 }
 
 internal static class AppOriginPolicy
@@ -28,7 +29,8 @@ internal static class AppOriginPolicy
         AppOrigin.RootPath,
         AppOrigin.IndexPath,
         AppOrigin.BridgeScriptPath,
-        AppOrigin.AppCssPath
+        AppOrigin.AppCssPath,
+        AppOrigin.EditorBundlePath
     };
 
     public static bool TryParseAbsolute(string? value, [NotNullWhen(true)] out Uri? uri)

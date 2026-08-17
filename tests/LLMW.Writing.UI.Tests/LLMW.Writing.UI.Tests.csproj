@@ -12,8 +12,9 @@
     <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
-  <ItemGroup>
+    <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" />
+    <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
     <Compile Include="..\..\src\LLMW.Writing.UI\WebView\**\*.cs" Link="LinkedWebView\%(RecursiveDir)%(Filename)%(Extension)" />
     <Compile Include="..\..\src\LLMW.Writing.UI\Hosting\WebViewProcessFailedKindMapper.cs" Link="LinkedHosting\WebViewProcessFailedKindMapper.cs" />
     <Content Include="..\..\src\web-editor\app\**\*">

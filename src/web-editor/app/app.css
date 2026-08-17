@@ -15,3 +15,15 @@ button {
   border: 1px solid #d0d0d0;
   padding: 12px;
 }
+
+#editor-host {
+  min-height: 320px;
+  background: #fff;
+  border: 1px solid #d0d0d0;
+  margin: 12px 0;
+}
+
+.cm-editor {
+  height: 100%;
+  font-size: 14px;
+}

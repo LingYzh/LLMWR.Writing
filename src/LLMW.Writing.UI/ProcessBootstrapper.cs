@@ -26,7 +26,7 @@ internal sealed class ProcessBootstrapper
         try
         {
             var runtime = StartChild(runtimeAssemblyPath, workspaceInstanceId, runtimeBootstrapToken, null);
-            return new LaunchedProcessShells(core, runtime);
+            return new LaunchedProcessShells(core, runtime, uiBootstrapToken, workspaceInstanceId);
         }
         catch
         {
@@ -68,11 +68,17 @@ internal sealed class LaunchedProcessShells : IDisposable
     private readonly Process _core;
     private readonly Process _runtime;
 
-    public LaunchedProcessShells(Process core, Process runtime)
+    public LaunchedProcessShells(Process core, Process runtime, string uiBootstrapToken, string workspaceInstanceId)
     {
         _core = core;
         _runtime = runtime;
+        UiBootstrapToken = uiBootstrapToken;
+        WorkspaceInstanceId = workspaceInstanceId;
     }
+
+    public string UiBootstrapToken { get; }
+
+    public string WorkspaceInstanceId { get; }
 
     public void Dispose()
     {

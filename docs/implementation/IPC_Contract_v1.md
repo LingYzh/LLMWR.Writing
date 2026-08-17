@@ -287,6 +287,26 @@ WP14 error codes include: `TASK_OWNERSHIP_DENIED`, `RESULT_REQUIRED_STALE`, `PRO
 
 Agent RunSession mutations (`submitResultArtifact`, `requestTaskCompletion`, `proposeResultDependencyChange`) require the durable Task to belong to `principal.RunId`. Envelope `runId` plus a payload TaskId from another Run is denied. `createWorkflowRun.storylineId` is persisted on `workflow_runs.storyline_id` when the Storyline exists. Runtime Grill resolution reloads the durable pause request from Checkpoint; the caller may select only a persisted option. Background stop maps by `BackgroundExecutionKind` and never falls back to cancelling the owner Run.
 
+## WP16 Draft editor commands
+
+These commands are the typed Core IPC for user TXT/MD Draft editing. They are not generic filesystem RPC, not Authority mutations, and not WebView bridge types. Ordinary user editing requires an authenticated USER_INTERACTIVE UI channel and a Core-issued EditorSession. A RunSession is not required. EditorSession and writer leases are Core in-memory runtime state; Core restart invalidates them. Draft bytes remain the persisted truth. Save is a business mutation and is **not** in `IsSafeToReplayAfterReconnect`.
+
+Request `chapterId` + `draftFileName` is request data only. Core independently validates Draft root, chapter identity, extension, canonical containment, and reparse policy. Renderer/UI absolute paths are never authority. `BlobRef` identifies uploaded UTF-8 bytes; it does not select a filesystem target.
+
+| semanticType | Request | Response |
+|---|---|---|
+| `openDraftEditorSession` | `chapterId`, `draftFileName`, `requestWritable` | EditorSession + relative Draft identity + digests + writable/lease |
+| `getDraftEditorSessionState` | `editorSessionId` | current persisted digest/revision/lease/writable |
+| `releaseDraftEditorSession` | `editorSessionId` | `released` (idempotent) |
+| `beginEditorContentUpload` | session + `saveOperationId` + declared UTF-8 length + SHA-256 | `uploadId`, max chunk |
+| `editorContentUploadChunk` | `uploadId`, index, count, base64 | accepted index |
+| `commitEditorContentUpload` | `uploadId` | `BlobRef{digest,size,locator}` |
+| `saveDraftEditorSession` | session + `saveOperationId` + expected digest + `BlobRef` | persisted digest/revision; `idempotentReplay` |
+
+WP16 error codes include: `EDITOR_SESSION_INVALID`, `EDITOR_DOCUMENT_NOT_WRITABLE`, `EDITOR_LEASE_CONFLICT`, `EDITOR_LEASE_LOST`, `EDITOR_STALE_BASE`, `EDITOR_SAVE_IDENTITY_CONFLICT`, `EDITOR_UPLOAD_INVALID`, `EDITOR_UPLOAD_HASH_MISMATCH`, `EDITOR_DOCUMENT_TOO_LARGE`, `EDITOR_ENCODING_UNSUPPORTED`, `EDITOR_PATCH_INVALID`, `EDITOR_PATCH_SEQUENCE`, `EDITOR_RECOVERY_AVAILABLE`, `EDITOR_RECOVERY_BASE_CHANGED`, `EDITOR_SAVE_OUTCOME_UNKNOWN`.
+
+Maximum IPC frame remains 1 MiB. Editor documents may use bounded chunked upload up to a 32 MiB UTF-8 resource-safety bound.
+
 ## BlobRef
 
 `{digest,size,locator}` where locator is an artifact/read handle resolved by Core, never a general filesystem path capability.

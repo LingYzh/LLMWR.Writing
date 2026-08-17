@@ -17,9 +17,10 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
-  <ItemGroup>
+    <ItemGroup>
     <PackageReference Include="Microsoft.WindowsAppSDK" />
     <ProjectReference Include="..\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
     <Content Include="..\web-editor\app\**\*">
       <Link>web-editor\app\%(RecursiveDir)%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

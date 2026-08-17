@@ -32,6 +32,8 @@ public sealed class IpcServerOptions
 
     public TrustedNativePrincipalSource? NativeUi { get; init; }
 
+    public Action<IpcClientKind, string>? OnAuthenticatedConnectionClosed { get; init; }
+
     public ISecurityClock Clock { get; init; } = SystemSecurityClock.Instance;
 
     public TimeSpan HeartbeatTimeout { get; init; } =
@@ -154,6 +156,16 @@ public static class IpcServerSession
             options.EventRing.Published -= OnPublished;
             connectionLifetime.Cancel();
             RevokeBoundSessions();
+            if (connectionId is not null)
+            {
+                try
+                {
+                    options.OnAuthenticatedConnectionClosed?.Invoke(options.ExpectedClientKind, connectionId);
+                }
+                catch (Exception)
+                {
+                }
+            }
             foreach (var item in inFlight.SnapshotAndClear())
             {
                 item.Cancellation.Cancel();

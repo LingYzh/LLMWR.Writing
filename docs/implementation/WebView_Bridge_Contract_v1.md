@@ -99,6 +99,38 @@ Inbound host-only types are treated as unknown commands.
 
 Forbidden in WP15 (must remain unknown): `readFile`, `writeFile`, `listDirectory`, `runCommand`, `shell`, `git`, `provider`, `credential`, `mcp`, `core.invoke`, `agent.invoke`.
 
+## 4.1 WP16 editor extension (closed additive set)
+
+Renderer → host:
+
+| `semanticType` | Payload |
+|---|---|
+| `editor.bind.ack` | `editorSessionId`, `transferId` |
+| `editor.change` | `editorSessionId`, `sequence`, `expectedSequence`, `from`, `to`, `text` |
+| `editor.shadow.resync.begin` | `editorSessionId`, `transferId`, `totalBytes`, `sha256` |
+| `editor.shadow.resync.chunk` | `editorSessionId`, `transferId`, `index`, `count`, `data` |
+| `editor.shadow.resync.commit` | `editorSessionId`, `transferId` |
+| `editor.save.request` | `editorSessionId`, `explicit` |
+| `editor.recovery.response` | `editorSessionId`, `action` = `restore` \| `discard` |
+| `editor.selection.changed` | `editorSessionId`, `from`, `to`, `head` |
+| `editor.close.request` | `editorSessionId` |
+
+Host → renderer:
+
+| `semanticType` | Payload |
+|---|---|
+| `editor.bind` | session/format/title/writable/saveState/recovery/digest. **No filesystem path.** |
+| `editor.document.begin` / `chunk` / `commit` | bounded UTF-8 transfer |
+| `editor.state` | saveState, dirty, digest, revision |
+| `editor.save.result` | saveOperationId, succeeded, digest |
+| `editor.lease.state` | writable, leaseOwnerKind |
+| `editor.recovery.offer` / `editor.recovery.conflict` | editorSessionId |
+| `editor.error` | typed `code` + safe `message` |
+
+Every editor message remains bound to the current WP15 `documentSessionId`. The renderer cannot switch `EditorSessionId`. There is no `editor.openPath`, `readFile`, or `writeFile`. WebMessage max remains 1 MiB.
+
+`host.hello.shell` is `wp16-editor`. CodeMirror styles use CSP nonce `llmw-editor` (`style-src 'self' 'nonce-llmw-editor'`). `unsafe-inline` / `unsafe-eval` remain forbidden.
+
 ## 5. Handshake and session
 
 1. Security handlers and virtual-host mapping are installed **before** navigation.
@@ -143,7 +175,7 @@ Renderer errors contain only `code` + safe `message` + `replyTo`. No stack trace
 Single application origin: `https://app.llmw.invalid/` (RFC 2606 `.invalid`).
 
 Allowed top-level documents: `/`, `/index.html`.  
-Allowed application resources: `/`, `/index.html`, `/bridge.js`, `/app.css`.
+Allowed application resources: `/`, `/index.html`, `/bridge.js`, `/app.css`, `/editor.bundle.js`.
 
 Comparison uses parsed scheme/host/port, empty user-info, and exact host `app.llmw.invalid`. Prefix/wildcard matching is not authority.
 

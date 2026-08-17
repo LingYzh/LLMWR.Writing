@@ -115,6 +115,8 @@ internal sealed class BridgeMessageProcessor
                     return new BridgeProcessResult
                     {
                         Dispatched = true,
+                        BecameReady = true,
+                        RequestDocumentSessionId = envelope.DocumentSessionId,
                         OutboundJson =
                         [
                             BridgeOutboundJson.BridgeAck(envelope.DocumentSessionId, NewId(), envelope.MessageId, accepted: true),
@@ -150,6 +152,33 @@ internal sealed class BridgeMessageProcessor
                     {
                         Dispatched = true,
                         ExternalUri = validated,
+                        RequestMessageId = envelope.MessageId,
+                        RequestDocumentSessionId = envelope.DocumentSessionId,
+                        OutboundJson = []
+                    };
+                case BridgeSemanticTypes.EditorBindAck:
+                case BridgeSemanticTypes.EditorChange:
+                case BridgeSemanticTypes.EditorShadowResyncBegin:
+                case BridgeSemanticTypes.EditorShadowResyncChunk:
+                case BridgeSemanticTypes.EditorShadowResyncCommit:
+                case BridgeSemanticTypes.EditorSaveRequest:
+                case BridgeSemanticTypes.EditorRecoveryResponse:
+                case BridgeSemanticTypes.EditorSelectionChanged:
+                case BridgeSemanticTypes.EditorCloseRequest:
+                    if (!_session.IsReady)
+                    {
+                        return ErrorResult(new BridgeError(BridgeErrorCodes.NotReady, "Bridge handshake is not complete."), envelope.MessageId);
+                    }
+
+                    if (envelope.Editor is null)
+                    {
+                        return ErrorResult(new BridgeError(BridgeErrorCodes.InvalidSchema, "Editor payload is missing."), envelope.MessageId);
+                    }
+
+                    return new BridgeProcessResult
+                    {
+                        Dispatched = true,
+                        Editor = envelope.Editor,
                         RequestMessageId = envelope.MessageId,
                         RequestDocumentSessionId = envelope.DocumentSessionId,
                         OutboundJson = []

@@ -38,6 +38,11 @@ jobs:
         with:
           global-json-file: global.json
 
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
       - name: Run hosted release test gate
         shell: pwsh
         run: ./.github/scripts/run-hosted-gate.ps1 -Gate Core -Configuration Release
@@ -55,6 +60,11 @@ jobs:
         uses: actions/setup-dotnet@v5
         with:
           global-json-file: global.json
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
 
       - name: Run hosted release integration gate
         shell: pwsh

@@ -93,6 +93,8 @@ internal sealed class BridgeProcessResult
     public ValidatedExternalUri? ExternalUri { get; init; }
     public string? RequestMessageId { get; init; }
     public string? RequestDocumentSessionId { get; init; }
+    public EditorInboundMessage? Editor { get; init; }
+    public bool BecameReady { get; init; }
     public bool NotifyRenderer => Error is not null && Error.Code != BridgeErrorCodes.WrongOrigin
         && Error.Code != BridgeErrorCodes.AdditionalObjectsDenied;
 }

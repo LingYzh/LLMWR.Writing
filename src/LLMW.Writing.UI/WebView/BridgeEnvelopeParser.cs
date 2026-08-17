@@ -15,6 +15,7 @@ internal sealed class ParsedBridgeMessage
     public string? Shell { get; init; }
     public string? Nonce { get; init; }
     public string? ExternalUri { get; init; }
+    public EditorInboundMessage? Editor { get; init; }
 }
 
 internal readonly struct BridgeParseResult
@@ -176,6 +177,7 @@ internal static class BridgeEnvelopeParser
             string? shell = null;
             string? nonce = null;
             string? externalUri = null;
+            EditorInboundMessage? editor = null;
             switch (semanticType)
             {
                 case BridgeSemanticTypes.RendererReady:
@@ -199,6 +201,23 @@ internal static class BridgeEnvelopeParser
                     }
 
                     break;
+                case BridgeSemanticTypes.EditorBindAck:
+                case BridgeSemanticTypes.EditorChange:
+                case BridgeSemanticTypes.EditorShadowResyncBegin:
+                case BridgeSemanticTypes.EditorShadowResyncChunk:
+                case BridgeSemanticTypes.EditorShadowResyncCommit:
+                case BridgeSemanticTypes.EditorSaveRequest:
+                case BridgeSemanticTypes.EditorRecoveryResponse:
+                case BridgeSemanticTypes.EditorSelectionChanged:
+                case BridgeSemanticTypes.EditorCloseRequest:
+                    var editorParsed = EditorInboundParser.Parse(semanticType!, payload);
+                    if (!editorParsed.Success)
+                    {
+                        return new BridgeParseResult(editorParsed.Error!);
+                    }
+
+                    editor = editorParsed.Message;
+                    break;
             }
 
             return new BridgeParseResult(new ParsedBridgeMessage
@@ -211,7 +230,8 @@ internal static class BridgeEnvelopeParser
                 ReplyTo = replyTo,
                 Shell = shell,
                 Nonce = nonce,
-                ExternalUri = externalUri
+                ExternalUri = externalUri,
+                Editor = editor
             });
         }
     }

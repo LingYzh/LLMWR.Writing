@@ -30,25 +30,36 @@ function Invoke-CheckedCommand {
     }
 }
 
+function Initialize-WebToolchain {
+    if ($null -eq (Get-Command node -ErrorAction SilentlyContinue)) {
+        throw 'Node.js 24 LTS is required to build src/web-editor but node was not found on PATH.'
+    }
+
+    if ($null -eq (Get-Command corepack -ErrorAction SilentlyContinue)) {
+        throw 'Corepack is required to activate the repository-pinned pnpm 11.19.0.'
+    }
+
+    & corepack enable
+    if ($LASTEXITCODE -ne 0) {
+        throw "corepack enable failed with exit code $LASTEXITCODE"
+    }
+
+    & corepack prepare pnpm@11.19.0 --activate
+    if ($LASTEXITCODE -ne 0) {
+        throw "corepack prepare pnpm@11.19.0 failed with exit code $LASTEXITCODE"
+    }
+}
+
 function Invoke-WebEditorBuild {
     if (-not (Test-Path -LiteralPath $webEditorManifest)) {
         throw "Web editor workspace manifest is missing: $webEditorManifest"
     }
 
-    $manifest = Get-Content -Raw -LiteralPath $webEditorManifest | ConvertFrom-Json
-    $buildProperty = $manifest.scripts.PSObject.Properties['build']
-    $buildScript = if ($null -ne $buildProperty) { [string]$buildProperty.Value } else { $null }
-
-    if ([string]::IsNullOrWhiteSpace($buildScript)) {
-        Write-Host 'web-editor: WP15 ships static renderer assets under src/web-editor/app; the pnpm web build stage is a no-op until WP16.'
-        return
-    }
-
-    if ($null -eq (Get-Command pnpm -ErrorAction SilentlyContinue)) {
-        throw 'pnpm is required to build src/web-editor but was not found on PATH.'
-    }
-
-    Invoke-CheckedCommand -FilePath 'pnpm' -Arguments @('--dir', (Join-Path $repositoryRoot 'src\web-editor'), 'run', 'build')
+    Initialize-WebToolchain
+    $webDir = Join-Path $repositoryRoot 'src\web-editor'
+    Invoke-CheckedCommand -FilePath 'pnpm' -Arguments @('--dir', $repositoryRoot, 'install', '--frozen-lockfile')
+    Invoke-CheckedCommand -FilePath 'pnpm' -Arguments @('--dir', $webDir, 'run', 'test')
+    Invoke-CheckedCommand -FilePath 'pnpm' -Arguments @('--dir', $webDir, 'run', 'build')
 }
 
 function Invoke-Restore {

@@ -138,7 +138,17 @@
         "resolved": "9.0.0",
         "contentHash": "hyJB4UlpAi19Xr9AXzu2NuagKC4lPfHObNMEAA0HmqFz2rX7wKgzeYzO/jM/eBHDhnUGFFEjk5cOoJaxqg5J4A=="
       },
+      "llmw.writing.application": {
+        "type": "Project",
+        "dependencies": {
+          "LLMW.Writing.Contracts": "[0.1.0, )",
+          "LLMW.Writing.Domain": "[0.1.0, )"
+        }
+      },
       "llmw.writing.contracts": {
+        "type": "Project"
+      },
+      "llmw.writing.domain": {
         "type": "Project"
       }
     }

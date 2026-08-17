@@ -65,6 +65,13 @@ public static class IpcSemanticTypes
     public const string GetTaskExecutionSnapshot = "getTaskExecutionSnapshot";
     public const string PersistProviderInvocation = "persistProviderInvocation";
     public const string AuthorizeToolProposal = "authorizeToolProposal";
+    public const string OpenDraftEditorSession = "openDraftEditorSession";
+    public const string GetDraftEditorSessionState = "getDraftEditorSessionState";
+    public const string ReleaseDraftEditorSession = "releaseDraftEditorSession";
+    public const string BeginEditorContentUpload = "beginEditorContentUpload";
+    public const string EditorContentUploadChunk = "editorContentUploadChunk";
+    public const string CommitEditorContentUpload = "commitEditorContentUpload";
+    public const string SaveDraftEditorSession = "saveDraftEditorSession";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -127,7 +134,14 @@ public static class IpcSemanticTypes
         StopBackgroundTask,
         GetTaskExecutionSnapshot,
         PersistProviderInvocation,
-        AuthorizeToolProposal
+        AuthorizeToolProposal,
+        OpenDraftEditorSession,
+        GetDraftEditorSessionState,
+        ReleaseDraftEditorSession,
+        BeginEditorContentUpload,
+        EditorContentUploadChunk,
+        CommitEditorContentUpload,
+        SaveDraftEditorSession
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();

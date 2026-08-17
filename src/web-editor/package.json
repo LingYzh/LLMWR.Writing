@@ -2,7 +2,23 @@
   "name": "@llmw/writing-web-editor",
   "private": true,
   "version": "0.1.0",
-  "description": "WP15 static renderer assets live in app/; CodeMirror and the pnpm build pipeline begin in WP16.",
+  "description": "WP16 CodeMirror TXT/MD renderer bundled by esbuild for the WP15 virtual origin.",
   "packageManager": "pnpm@11.19.0",
-  "scripts": {}
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.7",
+    "@codemirror/commands": "6.10.4",
+    "@codemirror/lang-markdown": "6.5.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.1"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
 }
