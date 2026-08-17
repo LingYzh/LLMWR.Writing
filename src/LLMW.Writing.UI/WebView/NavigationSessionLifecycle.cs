@@ -17,16 +17,23 @@ internal enum NavigationTrackResult
 
 internal readonly struct NavigationTrackSnapshot
 {
-    public NavigationTrackSnapshot(ulong navigationId, bool hostCancelled, bool isAllowedApplicationNavigation)
+    public NavigationTrackSnapshot(
+        ulong navigationId,
+        long startSequence,
+        bool hostCancelled,
+        bool isAllowedApplicationNavigation)
     {
         NavigationId = navigationId;
+        StartSequence = startSequence;
         HostCancelled = hostCancelled;
         IsAllowedApplicationNavigation = isAllowedApplicationNavigation;
     }
 
     public ulong NavigationId { get; }
+    public long StartSequence { get; }
     public bool HostCancelled { get; }
     public bool IsAllowedApplicationNavigation { get; }
+    public bool CanReplaceTopLevelDocument => IsAllowedApplicationNavigation && !HostCancelled;
 }
 
 internal sealed class NavigationSessionLifecycle
@@ -34,7 +41,8 @@ internal sealed class NavigationSessionLifecycle
     public const int MaximumActiveNavigations = 8;
 
     private readonly NavigationRecord?[] _active = new NavigationRecord?[MaximumActiveNavigations];
-    private bool _applicationHandshakeIssued;
+    private long _nextStartSequence;
+    private long _latestStartSequence;
 
     public int ActiveCount
     {
@@ -52,6 +60,8 @@ internal sealed class NavigationSessionLifecycle
             return count;
         }
     }
+
+    public long LatestStartSequence => _latestStartSequence;
 
     public NavigationTrackResult NoteStarting(
         ulong navigationId,
@@ -81,7 +91,13 @@ internal sealed class NavigationSessionLifecycle
             return NavigationTrackResult.Overflow;
         }
 
-        _active[slot] = new NavigationRecord(navigationId, hostCancelled, isAllowedApplicationNavigation);
+        var startSequence = ++_nextStartSequence;
+        _latestStartSequence = startSequence;
+        _active[slot] = new NavigationRecord(
+            navigationId,
+            startSequence,
+            hostCancelled,
+            isAllowedApplicationNavigation);
         return NavigationTrackResult.Tracked;
     }
 
@@ -99,19 +115,17 @@ internal sealed class NavigationSessionLifecycle
 
         var record = _active[index]!;
         _active[index] = null;
-        var othersRemain = ActiveCount > 0;
+
+        if (record.StartSequence != _latestStartSequence)
+        {
+            return NavigationCompletionAction.None;
+        }
 
         if (isSuccess
             && currentSourceIsApplicationDocument
             && record.IsAllowedApplicationNavigation
             && !record.HostCancelled)
         {
-            _applicationHandshakeIssued = true;
-            if (!othersRemain)
-            {
-                _applicationHandshakeIssued = false;
-            }
-
             return NavigationCompletionAction.BeginNewSession;
         }
 
@@ -120,33 +134,12 @@ internal sealed class NavigationSessionLifecycle
             && isOperationCanceled
             && currentSourceIsApplicationDocument)
         {
-            if (othersRemain || _applicationHandshakeIssued)
-            {
-                if (!othersRemain)
-                {
-                    _applicationHandshakeIssued = false;
-                }
-
-                return NavigationCompletionAction.None;
-            }
-
             return NavigationCompletionAction.BeginNewSession;
         }
 
         if (!isSuccess && !record.HostCancelled)
         {
-            if (othersRemain)
-            {
-                return NavigationCompletionAction.None;
-            }
-
-            _applicationHandshakeIssued = false;
             return NavigationCompletionAction.ShowNativeFailure;
-        }
-
-        if (!othersRemain)
-        {
-            _applicationHandshakeIssued = false;
         }
 
         return NavigationCompletionAction.None;
@@ -164,6 +157,7 @@ internal sealed class NavigationSessionLifecycle
         var record = _active[index]!;
         snapshot = new NavigationTrackSnapshot(
             record.NavigationId,
+            record.StartSequence,
             record.HostCancelled,
             record.IsAllowedApplicationNavigation);
         return true;
@@ -176,7 +170,7 @@ internal sealed class NavigationSessionLifecycle
             _active[i] = null;
         }
 
-        _applicationHandshakeIssued = false;
+        _latestStartSequence = 0;
     }
 
     private int IndexOf(ulong navigationId)
@@ -207,14 +201,20 @@ internal sealed class NavigationSessionLifecycle
 
     private sealed class NavigationRecord
     {
-        public NavigationRecord(ulong navigationId, bool hostCancelled, bool isAllowedApplicationNavigation)
+        public NavigationRecord(
+            ulong navigationId,
+            long startSequence,
+            bool hostCancelled,
+            bool isAllowedApplicationNavigation)
         {
             NavigationId = navigationId;
+            StartSequence = startSequence;
             HostCancelled = hostCancelled;
             IsAllowedApplicationNavigation = isAllowedApplicationNavigation;
         }
 
         public ulong NavigationId { get; }
+        public long StartSequence { get; }
         public bool HostCancelled { get; set; }
         public bool IsAllowedApplicationNavigation { get; set; }
     }

@@ -2,9 +2,8 @@ namespace LLMW.Writing.UI.WebView;
 
 internal enum SameDocumentSourceChangeAction
 {
-    IgnoreNewDocument = 0,
-    InvalidateOnly = 1,
-    BeginNewSession = 2
+    InvalidateOnly = 0,
+    BeginNewSession = 1
 }
 
 internal static class SameDocumentSessionPolicy
@@ -13,7 +12,7 @@ internal static class SameDocumentSessionPolicy
     {
         if (isNewDocument)
         {
-            return SameDocumentSourceChangeAction.IgnoreNewDocument;
+            return SameDocumentSourceChangeAction.InvalidateOnly;
         }
 
         return currentSourceIsApplicationDocument

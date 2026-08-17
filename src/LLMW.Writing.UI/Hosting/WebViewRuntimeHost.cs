@@ -15,6 +15,7 @@ internal sealed class WebViewRuntimeHost
     private CoreWebView2Environment? _environment;
     private bool _initialized;
     private bool _handlersRegistered;
+    private int _rendererGeneration;
     private int _unresponsiveRecoveryCount;
 
     public WebViewRuntimeHost(
@@ -78,6 +79,7 @@ internal sealed class WebViewRuntimeHost
     private async Task ApplyPreNavigationHardeningAndNavigateAsync(WebView2 webView)
     {
         await webView.EnsureCoreWebView2Async(_environment);
+        _rendererGeneration++;
         var core = webView.CoreWebView2;
         var assets = RendererAssetLayout.FromApplicationBase(AppContext.BaseDirectory);
         ApplySettings(core.Settings, WebViewSecuritySettings.ForCurrentBuild);
@@ -184,11 +186,6 @@ internal sealed class WebViewRuntimeHost
         var action = SameDocumentSessionPolicy.Evaluate(
             args.IsNewDocument,
             AppOriginPolicy.IsApplicationDocument(sender.Source));
-        if (action == SameDocumentSourceChangeAction.IgnoreNewDocument)
-        {
-            return;
-        }
-
         _processor.InvalidateSession();
         if (action == SameDocumentSourceChangeAction.BeginNewSession)
         {
@@ -253,7 +250,11 @@ internal sealed class WebViewRuntimeHost
 
     private void OnProcessFailed(CoreWebView2 sender, CoreWebView2ProcessFailedEventArgs args)
     {
-        _ = sender;
+        if (!IsCurrentCore(sender))
+        {
+            return;
+        }
+
         var kind = WebViewProcessFailedKindMapper.Map(args.ProcessFailedKind);
         var action = WebViewProcessRecoveryPolicy.Evaluate(kind, _unresponsiveRecoveryCount);
         if (kind == WebViewProcessFailedKind.RenderProcessUnresponsive
@@ -262,13 +263,14 @@ internal sealed class WebViewRuntimeHost
             _unresponsiveRecoveryCount++;
         }
 
+        var request = new ProcessRecoveryRequest(_rendererGeneration, kind, action);
         if (WebViewProcessRecoveryPolicy.LosesRendererDocument(kind))
         {
             _processor.InvalidateSession();
             _navigationLifecycle.Reset();
         }
 
-        _ = _site.DispatcherQueue.TryEnqueue(() => _ = RecoverFromProcessFailureAsync(action));
+        _ = _site.DispatcherQueue.TryEnqueue(() => _ = RecoverFromProcessFailureAsync(request));
     }
 
     private void OnWebMessageReceived(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
@@ -420,19 +422,29 @@ internal sealed class WebViewRuntimeHost
         return consent == ContentDialogResult.Primary;
     }
 
-    private async Task RecoverFromProcessFailureAsync(WebViewProcessRecoveryAction action)
+    private async Task RecoverFromProcessFailureAsync(ProcessRecoveryRequest request)
     {
-        switch (action)
+        if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _rendererGeneration))
+        {
+            return;
+        }
+
+        switch (request.Action)
         {
             case WebViewProcessRecoveryAction.RecreateControl:
                 _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The browser process failed and the renderer is being recreated.");
-                await RecreateControlAsync().ConfigureAwait(true);
+                await RecreateControlAsync(request.RendererGeneration).ConfigureAwait(true);
                 break;
             case WebViewProcessRecoveryAction.ReloadApplicationDocument:
                 _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer process failed.");
-                await ReloadApplicationShellAsync().ConfigureAwait(true);
+                await ReloadApplicationShellAsync(request.RendererGeneration).ConfigureAwait(true);
                 break;
             case WebViewProcessRecoveryAction.FailClosedNoNavigate:
+                if (!ProcessRecoveryGate.ShouldApply(request.RendererGeneration, _rendererGeneration))
+                {
+                    return;
+                }
+
                 _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer failed and was not automatically recovered.");
                 break;
             case WebViewProcessRecoveryAction.ObserveKeepSession:
@@ -441,8 +453,13 @@ internal sealed class WebViewRuntimeHost
         }
     }
 
-    private async Task RecreateControlAsync()
+    private async Task RecreateControlAsync(int expectedGeneration)
     {
+        if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+        {
+            return;
+        }
+
         _handlersRegistered = false;
         _navigationLifecycle.Reset();
         _processor.InvalidateSession();
@@ -454,13 +471,28 @@ internal sealed class WebViewRuntimeHost
                 await CreateEnvironmentAsync().ConfigureAwait(true);
             }
 
+            if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+            {
+                return;
+            }
+
             await ApplyPreNavigationHardeningAndNavigateAsync(replacement).ConfigureAwait(true);
         }
         catch (Exception)
         {
             try
             {
+                if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+                {
+                    return;
+                }
+
                 await CreateEnvironmentAsync().ConfigureAwait(true);
+                if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+                {
+                    return;
+                }
+
                 _handlersRegistered = false;
                 await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer).ConfigureAwait(true);
             }
@@ -471,15 +503,20 @@ internal sealed class WebViewRuntimeHost
         }
     }
 
-    private async Task ReloadApplicationShellAsync()
+    private async Task ReloadApplicationShellAsync(int expectedGeneration)
     {
         try
         {
             await Task.Delay(250).ConfigureAwait(true);
+            if (!ProcessRecoveryGate.ShouldApply(expectedGeneration, _rendererGeneration))
+            {
+                return;
+            }
+
             var core = _site.Renderer.CoreWebView2;
             if (core is null)
             {
-                await RecreateControlAsync().ConfigureAwait(true);
+                await RecreateControlAsync(expectedGeneration).ConfigureAwait(true);
                 return;
             }
 
