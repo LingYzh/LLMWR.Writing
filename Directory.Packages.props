@@ -8,5 +8,6 @@
     <PackageVersion Include="Microsoft.Data.Sqlite" Version="[8.0.29]" />
     <!-- Security servicing pin: do not fall back to the provider's 2.1.6 minimum native bundle. -->
     <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="[2.1.12]" />
+    <PackageVersion Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
   </ItemGroup>
 </Project>

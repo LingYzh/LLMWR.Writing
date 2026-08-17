@@ -2,7 +2,7 @@
   "name": "@llmw/writing-web-editor",
   "private": true,
   "version": "0.1.0",
-  "description": "WP00 pnpm workspace shell; editor implementation begins in WP15.",
+  "description": "WP15 static renderer assets live in app/; CodeMirror and the pnpm build pipeline begin in WP16.",
   "packageManager": "pnpm@11.19.0",
   "scripts": {}
 }
