@@ -1,0 +1,17 @@
+body {
+  font-family: Segoe UI, sans-serif;
+  margin: 24px;
+  color: #1b1b1b;
+  background: #f3f3f3;
+}
+
+button {
+  margin-right: 8px;
+}
+
+#project-sample {
+  white-space: pre-wrap;
+  background: #fff;
+  border: 1px solid #d0d0d0;
+  padding: 12px;
+}

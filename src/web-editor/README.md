@@ -1,3 +1,5 @@
 # web-editor
 
-This is the WP00 pnpm workspace shell. It intentionally has no editor source, build script, or dependencies. CodeMirror and the secure WebView2 bridge are out of scope until their designated work packages.
+WP15 ships a dependency-free static renderer shell in `app/` (`index.html`, `bridge.js`, `app.css`). Those files are copied into the WinUI output directory. There is no npm/pnpm package install and no bundler.
+
+CodeMirror and the real web build pipeline remain WP16.

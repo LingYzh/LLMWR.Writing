@@ -40,7 +40,7 @@ function Invoke-WebEditorBuild {
     $buildScript = if ($null -ne $buildProperty) { [string]$buildProperty.Value } else { $null }
 
     if ([string]::IsNullOrWhiteSpace($buildScript)) {
-        Write-Host 'web-editor: WP00 workspace shell has no build script; web build stage is a no-op.'
+        Write-Host 'web-editor: WP15 ships static renderer assets under src/web-editor/app; the pnpm web build stage is a no-op until WP16.'
         return
     }
 
@@ -92,6 +92,14 @@ function Invoke-InfrastructureTests {
         '--no-build')
 }
 
+function Invoke-UITests {
+    Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @(
+        'run',
+        '--project', (Join-Path $repositoryRoot 'tests\LLMW.Writing.UI.Tests\LLMW.Writing.UI.Tests.csproj'),
+        '--configuration', $Configuration,
+        '--no-build')
+}
+
 function Invoke-IntegrationTests {
     Invoke-CheckedCommand -FilePath 'dotnet' -Arguments @(
         'run',
@@ -115,6 +123,7 @@ switch ($Target) {
         Invoke-DomainTests
         Invoke-ApplicationTests
         Invoke-InfrastructureTests
+        Invoke-UITests
     }
     'IntegrationTest' {
         Invoke-Restore
@@ -131,6 +140,7 @@ switch ($Target) {
         Invoke-DomainTests
         Invoke-ApplicationTests
         Invoke-InfrastructureTests
+        Invoke-UITests
         Invoke-IntegrationTests
         throw 'Packaging is intentionally deferred to WP23; no package artifact is produced by WP00.'
     }

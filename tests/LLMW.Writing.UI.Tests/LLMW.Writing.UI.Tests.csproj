@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>LLMW.Writing.UI.Tests</AssemblyName>
+    <RootNamespace>LLMW.Writing.UI.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\LLMW.Writing.UI\WebView\**\*.cs" Link="LinkedWebView\%(RecursiveDir)%(Filename)%(Extension)" />
+    <Content Include="..\..\src\web-editor\app\**\*">
+      <Link>web-editor\app\%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+</Project>

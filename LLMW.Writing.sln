@@ -18,6 +18,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LLMW.Writing.Worker", "src\
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LLMW.Writing.UI", "src\LLMW.Writing.UI\LLMW.Writing.UI.csproj", "{54BB8D73-D27F-4B67-BA05-CFB33843C2D5}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LLMW.Writing.UI.Tests", "tests\LLMW.Writing.UI.Tests\LLMW.Writing.UI.Tests.csproj", "{B8E4C2A1-7F13-4D9E-A6B0-1C2D3E4F5A6B}"
+EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LLMW.Writing.Domain.Tests", "tests\LLMW.Writing.Domain.Tests\LLMW.Writing.Domain.Tests.csproj", "{DEAF5BE7-D5F5-4E1F-8C00-E939FA1C8B49}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "LLMW.Writing.Application.Tests", "tests\LLMW.Writing.Application.Tests\LLMW.Writing.Application.Tests.csproj", "{AC44F0A3-4E9B-4F54-B727-5D1C611B6925}"
@@ -70,6 +72,10 @@ Global
 		{54BB8D73-D27F-4B67-BA05-CFB33843C2D5}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{54BB8D73-D27F-4B67-BA05-CFB33843C2D5}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{54BB8D73-D27F-4B67-BA05-CFB33843C2D5}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B8E4C2A1-7F13-4D9E-A6B0-1C2D3E4F5A6B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B8E4C2A1-7F13-4D9E-A6B0-1C2D3E4F5A6B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B8E4C2A1-7F13-4D9E-A6B0-1C2D3E4F5A6B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B8E4C2A1-7F13-4D9E-A6B0-1C2D3E4F5A6B}.Release|Any CPU.Build.0 = Release|Any CPU
 		{DEAF5BE7-D5F5-4E1F-8C00-E939FA1C8B49}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{DEAF5BE7-D5F5-4E1F-8C00-E939FA1C8B49}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{DEAF5BE7-D5F5-4E1F-8C00-E939FA1C8B49}.Release|Any CPU.ActiveCfg = Release|Any CPU

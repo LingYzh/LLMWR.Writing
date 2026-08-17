@@ -1,0 +1,13 @@
+<Window
+    x:Class="LLMW.Writing.UI.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Grid>
+        <WebView2 x:Name="RendererView" />
+        <TextBlock
+            x:Name="NativeStatus"
+            Margin="16"
+            VerticalAlignment="Bottom"
+            TextWrapping="Wrap" />
+    </Grid>
+</Window>

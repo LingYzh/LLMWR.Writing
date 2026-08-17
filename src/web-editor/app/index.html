@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>LLMW.Writing</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <main>
+    <h1>LLMW.Writing</h1>
+    <p id="origin-label">application origin</p>
+    <p id="status">loading</p>
+    <p id="ping-status"></p>
+    <p id="error"></p>
+    <button type="button" id="ping">Ping</button>
+    <button type="button" id="ext">Open example.com</button>
+    <pre id="project-sample"></pre>
+  </main>
+  <script src="bridge.js"></script>
+</body>
+</html>

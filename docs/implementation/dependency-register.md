@@ -8,6 +8,7 @@ with NuGet audit during the owning work package.
 |---|---:|---|---|---|---|
 | `Microsoft.Data.Sqlite` | 8.0.29 | Frozen-design ADO.NET provider for the project SQLite database, migration runner, and hand-written SQL persistence adapters. | MIT | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `SQLitePCLRaw.bundle_e_sqlite3` | 2.1.12 | Explicit patched native SQLite bundle pin; prevents resolution to the provider's older 2.1.6 minimum. | Apache-2.0 | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
+| `Microsoft.WindowsAppSDK` | 2.4.0 | Current supported stable Windows App SDK / WinUI 3 host, including WebView2 APIs for the unpackaged WP15 UI process. | MIT | LLMW.Writing maintainers | `LLMW.Writing.UI` executable host only |
 
 ## WP02 resolved dependency audit
 
