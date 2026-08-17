@@ -107,8 +107,12 @@ Forbidden in WP15 (must remain unknown): `readFile`, `writeFile`, `listDirectory
 4. Renderer posts `renderer.ready` with that session.
 5. Host posts `bridge.ack` and `host.status`. Bridge is READY.
 6. `NavigationStarting`, reload, renderer process failure, WebView recreation, and navigation failure **immediately** invalidate the previous session.
+7. A host-cancelled navigation (`Cancel = true`) that completes with `WebErrorStatus.OperationCanceled` while `CoreWebView2.Source` is still the exact application document **does not** surface `NAVIGATION_FAILED`. The host mints a **new** `documentSessionId`, posts `host.hello`, and requires `renderer.ready` again. The previous session remains permanently invalid and is never resurrected.
+8. A genuine failed **application** navigation does not mint a replacement session; the native `NAVIGATION_FAILED` error remains.
 
 Stale session → `BRIDGE_STALE_SESSION`. Duplicate `messageId` in the same session → `BRIDGE_REPLAY`. Replay cache is per session and bounded; overflow fail-closes the session.
+
+Request/response operations (`bridge.ack`, `bridge.error` for `externalLink.request`, including `EXTERNAL_LINK_BUSY`) set `replyTo` to the original request `messageId`. They do not emit `replyTo: null`.
 
 ## 6. Error codes
 
@@ -127,6 +131,7 @@ Stale session → `BRIDGE_STALE_SESSION`. Duplicate `messageId` in the same sess
 | `BRIDGE_ADDITIONAL_OBJECTS_DENIED` | `AdditionalObjects.Count > 0` |
 | `NAVIGATION_BLOCKED` | Top-level/frame/new-window navigation denied |
 | `EXTERNAL_URL_DENIED` | External URI failed policy |
+| `EXTERNAL_LINK_BUSY` | An external-link confirmation is already pending for this window |
 
 Renderer errors contain only `code` + safe `message` + `replyTo`. No stack traces, native paths, LocalAppData, Project paths, or exception text.
 
@@ -139,7 +144,15 @@ Allowed application resources: `/`, `/index.html`, `/bridge.js`, `/app.css`.
 
 Comparison uses parsed scheme/host/port, empty user-info, and exact host `app.llmw.invalid`. Prefix/wildcard matching is not authority.
 
-External http(s) URLs are never loaded in WebView. Native host validates then opens the system browser via `ProcessStartInfo { FileName = absoluteUri, UseShellExecute = true }` after optional native consent. This is not `cmd.exe` / PowerShell / `Shell.Execute` string interpolation.
+External http(s) URLs are never loaded in WebView. Native host always cancels top-level external navigation. Native consent is offered only for the controlled user-intent flow (trusted WebView `IsUserInitiated` plus `CancelAndOfferExternal`). Script-created external navigation is cancelled and must not open native dialogs.
+
+The host keeps at most one pending external confirmation per window. A second `externalLink.request` while a confirmation is open receives `EXTERNAL_LINK_BUSY` and does not create another `ContentDialog`, queue entry, or `ProcessStart`.
+
+An accepted bridge `externalLink.request` freezes `documentSessionId`, request `messageId`, and the validated URI. Immediately before `ProcessStart` the host re-checks that the frozen session is still current and READY and that the top-level Source is still the application document. If navigation, reload, or process failure invalidated that session while the dialog was open, the host does not launch the browser and returns a typed stale/cancelled result.
+
+Native host validates then opens the system browser via `ProcessStartInfo { FileName = absoluteUri, UseShellExecute = true }` after native consent. This is not `cmd.exe` / PowerShell / `Shell.Execute` string interpolation.
+
+Ordinary logs record only safe origin descriptors (`scheme`, `host`, non-default `port`) plus event category and bridge error code. Path, query, fragment, userinfo, and full project/user-controlled URLs are not logged.
 
 ## 8. Source-of-truth / trust-surface map
 
@@ -161,3 +174,17 @@ External http(s) URLs are never loaded in WebView. Native host validates then op
 | Core pipe / credentials / Project FS | Core / later WPs | None in WP15 | Not via this bridge | No bridge types |
 
 WP15 must not widen renderer→native privilege beyond ping and validated external http(s) open.
+
+## 9. ProcessFailed recovery
+
+`CoreWebView2.ProcessFailed` is classified by `ProcessFailedKind`. The host does not `Navigate` the existing control for every kind.
+
+| Kind | Recovery |
+|---|---|
+| `BrowserProcessExited` | Recreate the WebView2 control, rebind the runtime host, create/attach the environment, apply every secure setting, register every handler, map the virtual host, navigate the application origin, then start a fresh document-session handshake |
+| `RenderProcessExited` | Reload/navigate the application document on the existing control when it is still usable; otherwise recreate. Fresh session |
+| `FrameRenderProcessExited` | WP15 allows no frames; fail closed without a navigation loop |
+| `GpuProcessExited` / `UtilityProcessExited` / `SandboxIdleProcessExited` | Runtime auto-recovery; do not destroy, recreate, or navigate |
+| `RenderProcessUnresponsive` | One bounded reload, then fail closed; no dialog/reload loop |
+
+The document session is invalidated whenever the renderer document is lost. Recreated controls reuse the same pre-navigation hardening sequence used at first initialization.

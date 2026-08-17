@@ -20,6 +20,7 @@ internal static class Program
             count += Wp15BridgeContractTests();
             count += Wp15SessionAndReplayTests();
             count += Wp15SecuritySurfaceTests();
+            count += Wp15CorrectiveLifecycleTests();
             Console.WriteLine($"UI WebView bridge tests passed ({count}).");
             return 0;
         }
@@ -231,6 +232,13 @@ internal static class Program
         AssertTrue(hostText.Contains("CoreWebView2WebResourceRequestSourceKinds", StringComparison.Ordinal), "resource filter must include request source kinds.");
         AssertTrue(hostText.Contains("AdditionalObjects", StringComparison.Ordinal), "AdditionalObjects must be inspected.");
         AssertTrue(!hostText.Contains("LLMW_UI_BOOTSTRAP_TOKEN", StringComparison.Ordinal), "bootstrap token must not enter the WebView host.");
+        AssertTrue(hostText.Contains("ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal), "pre-navigation hardening sequence must be extracted.");
+        AssertTrue(hostText.Contains("WebViewProcessRecoveryPolicy.Evaluate", StringComparison.Ordinal), "ProcessFailed must use the recovery policy.");
+        AssertTrue(hostText.Contains("RecreateRenderer", StringComparison.Ordinal), "Browser process recovery must recreate the WebView control.");
+        AssertTrue(hostText.Contains("IsUserInitiated", StringComparison.Ordinal), "native consent must require trusted user-initiated facts.");
+        AssertTrue(hostText.Contains("ExternalLinkCoordinator", StringComparison.Ordinal), "external links must use the single-flight coordinator.");
+        AssertTrue(hostText.Contains("ExternalLinkBridgeReply.Busy", StringComparison.Ordinal), "busy external-link replies must be typed.");
+        AssertTrue(!hostText.Contains("replyTo: null", StringComparison.Ordinal), "request/response replies must not use a null replyTo.");
 
         var index = File.ReadAllText(Path.Combine(root, "src", "web-editor", "app", "index.html"));
         var bridge = File.ReadAllText(Path.Combine(root, "src", "web-editor", "app", "bridge.js"));
@@ -252,7 +260,129 @@ internal static class Program
         AssertTrue(!app.Contains("ProcessBootstrapper", StringComparison.Ordinal), "WP15 must not start Core from App.");
 
         Console.WriteLine("WP15 security surface tests passed.");
-        return 28;
+        return 36;
+    }
+
+    private static int Wp15CorrectiveLifecycleTests()
+    {
+        var lifecycle = new NavigationSessionLifecycle();
+        var processor = new BridgeMessageProcessor();
+        var hello1 = processor.BeginDocumentSession();
+        var session1 = JsonDocument.Parse(hello1).RootElement.GetProperty("documentSessionId").GetString()!;
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.RendererReady, session1, "ready-s1", "{}"))).Dispatched, "S1 ready must be accepted.");
+
+        processor.InvalidateSession();
+        lifecycle.NoteStarting(41, hostCancelled: true);
+        var staleS1 = processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session1, "ping-after-cancel", "{}")));
+        AssertEqual(BridgeErrorCodes.StaleSession, staleS1.Error!.Code, "cancelled navigation must invalidate S1 immediately.");
+
+        var cancelledAction = lifecycle.NoteCompleted(41, isSuccess: false, isOperationCanceled: true, currentSourceIsApplicationDocument: true);
+        AssertTrue(cancelledAction == NavigationCompletionAction.BeginNewSession, "host-cancelled navigation that kept the app document must mint a new session.");
+        var hello2 = processor.BeginDocumentSession();
+        var session2 = JsonDocument.Parse(hello2).RootElement.GetProperty("documentSessionId").GetString()!;
+        AssertTrue(!string.Equals(session1, session2, StringComparison.Ordinal), "S2 must not resurrect S1.");
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.RendererReady, session2, "ready-s2", "{}"))).Dispatched, "S2 renderer.ready must be accepted.");
+        AssertTrue(processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session2, "ping-s2", "{}"))).Dispatched, "S2 ping must be accepted.");
+        AssertEqual(BridgeErrorCodes.StaleSession, processor.ProcessIncoming(Msg(Envelope(BridgeSemanticTypes.BridgePing, session1, "ping-s1-after-s2", "{}"))).Error!.Code, "S1 must remain permanently stale.");
+
+        var failedLifecycle = new NavigationSessionLifecycle();
+        failedLifecycle.NoteStarting(42, hostCancelled: false);
+        var failedAction = failedLifecycle.NoteCompleted(42, isSuccess: false, isOperationCanceled: false, currentSourceIsApplicationDocument: true);
+        AssertTrue(failedAction == NavigationCompletionAction.ShowNativeFailure, "genuine application navigation failure must remain a native error.");
+        AssertTrue(failedAction != NavigationCompletionAction.BeginNewSession, "genuine application navigation failure must not re-handshake.");
+
+        var coordinator = new ExternalLinkCoordinator();
+        var launcher = new RecordingExternalBrowserLauncher();
+        AssertTrue(ExternalUriPolicy.TryValidate("https://example.com/one", out var firstUri, out _), "first external URI must validate.");
+        AssertTrue(ExternalUriPolicy.TryValidate("https://example.com/two", out var secondUri, out _), "second external URI must validate.");
+        var first = new PendingExternalLink
+        {
+            Source = ExternalLinkSource.BridgeRequest,
+            DocumentSessionId = session2,
+            RequestMessageId = "ext-first",
+            Uri = firstUri!
+        };
+        var second = new PendingExternalLink
+        {
+            Source = ExternalLinkSource.BridgeRequest,
+            DocumentSessionId = session2,
+            RequestMessageId = "ext-second",
+            Uri = secondUri!
+        };
+        AssertTrue(coordinator.TryAdmit(first) == ExternalLinkAdmitResult.Admitted, "first external confirmation must be admitted.");
+        AssertTrue(coordinator.TryAdmit(second) == ExternalLinkAdmitResult.Busy, "second concurrent external confirmation must be busy.");
+        AssertTrue(coordinator.HasPending, "busy rejection must not queue a second pending confirmation.");
+        var busyJson = ExternalLinkBridgeReply.Busy(session2, "ext-second");
+        AssertTrue(busyJson.Contains("\"code\":\"EXTERNAL_LINK_BUSY\"", StringComparison.Ordinal), "busy reply must use EXTERNAL_LINK_BUSY.");
+        AssertTrue(busyJson.Contains("\"replyTo\":\"ext-second\"", StringComparison.Ordinal), "busy reply must correlate to the blocked request.");
+        var launched = coordinator.Complete(first, userAccepted: true, session2, sessionReady: true, currentSourceIsApplicationDocument: true, launcher);
+        AssertTrue(launched == ExternalLinkLaunchResult.Launched, "accepted current-session confirmation must launch.");
+        AssertEqual(1, launcher.Opened.Count, "single-flight must not start a second ProcessStart.");
+        AssertEqual("https://example.com/one", launcher.Opened[0], "only the admitted URI may launch.");
+
+        var decision = NavigationPolicy.EvaluateTopLevel("https://evil.example/scripted?q=1");
+        for (var i = 0; i < 32; i++)
+        {
+            AssertTrue(!ExternalNavigationIntent.MayOfferNativeDialog(decision, isUserInitiated: false), "script-driven external navigation must not offer native consent.");
+        }
+
+        AssertTrue(ExternalNavigationIntent.MayOfferNativeDialog(decision, isUserInitiated: true), "user-initiated external navigation may offer native consent.");
+
+        var staleCoordinator = new ExternalLinkCoordinator();
+        var staleLauncher = new RecordingExternalBrowserLauncher();
+        var pendingS1 = new PendingExternalLink
+        {
+            Source = ExternalLinkSource.BridgeRequest,
+            DocumentSessionId = session1,
+            RequestMessageId = "ext-stale-s1",
+            Uri = firstUri!
+        };
+        AssertTrue(staleCoordinator.TryAdmit(pendingS1) == ExternalLinkAdmitResult.Admitted, "S1 confirmation must admit before reload.");
+        var staleLaunch = staleCoordinator.Complete(
+            pendingS1,
+            userAccepted: true,
+            currentSessionId: session2,
+            sessionReady: true,
+            currentSourceIsApplicationDocument: true,
+            staleLauncher);
+        AssertTrue(staleLaunch == ExternalLinkLaunchResult.StaleSession, "reload to S2 must cancel the S1 side effect.");
+        AssertEqual(0, staleLauncher.Opened.Count, "S1 URI must never launch after the session is replaced.");
+
+        var ack = BridgeMessageProcessor.CompleteExternalLink(session2, "ext-first", accepted: true);
+        AssertTrue(ack.Contains("\"semanticType\":\"bridge.ack\"", StringComparison.Ordinal), "external completion must be bridge.ack.");
+        AssertTrue(ack.Contains("\"replyTo\":\"ext-first\"", StringComparison.Ordinal), "bridge.ack replyTo must equal the original request MessageId.");
+        AssertTrue(!ack.Contains("\"replyTo\":null", StringComparison.Ordinal), "bridge.ack must not emit replyTo null.");
+
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.BrowserProcessExited, 0) == WebViewProcessRecoveryAction.RecreateControl, "BrowserProcessExited must recreate the control.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.RenderProcessExited, 0) == WebViewProcessRecoveryAction.ReloadApplicationDocument, "RenderProcessExited must reload the application document.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.GpuProcessExited, 0) == WebViewProcessRecoveryAction.IgnoreAutoRecovered, "GPU process exit must not force navigation/recreation.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.UtilityProcessExited, 0) == WebViewProcessRecoveryAction.IgnoreAutoRecovered, "utility process exit must not force navigation/recreation.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.SandboxIdleProcessExited, 0) == WebViewProcessRecoveryAction.IgnoreAutoRecovered, "sandbox idle exit must not force navigation/recreation.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.FrameRenderProcessExited, 0) == WebViewProcessRecoveryAction.FailClosedNoNavigate, "unexpected frame process failure must fail closed.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.RenderProcessUnresponsive, 0) == WebViewProcessRecoveryAction.ReloadApplicationDocument, "first unresponsive recovery may reload.");
+        AssertTrue(WebViewProcessRecoveryPolicy.Evaluate(WebViewProcessFailedKind.RenderProcessUnresponsive, 1) == WebViewProcessRecoveryAction.FailClosedNoNavigate, "repeated unresponsive recovery must not loop.");
+
+        var hostPath = Path.Combine(FindRepoRoot(), "src", "LLMW.Writing.UI", "Hosting", "WebViewRuntimeHost.cs");
+        var hostText = File.ReadAllText(hostPath);
+        AssertTrue(hostText.Contains("ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal)
+            && hostText.Contains("RecreateControlAsync", StringComparison.Ordinal), "recreate and hardening methods must exist.");
+        AssertTrue(hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer)", StringComparison.Ordinal)
+            || hostText.Contains("await ApplyPreNavigationHardeningAndNavigateAsync(replacement)", StringComparison.Ordinal), "recreated WebView must reuse the pre-navigation hardening sequence.");
+        AssertTrue(hostText.Contains("case WebViewProcessRecoveryAction.RecreateControl:", StringComparison.Ordinal), "BrowserProcessExited recovery must dispatch RecreateControl.");
+        AssertTrue(!hostText.Contains("core.Navigate", StringComparison.Ordinal) || hostText.Contains("ApplyPreNavigationHardeningAndNavigateAsync", StringComparison.Ordinal), "Navigate must remain inside the hardening/reload paths.");
+
+        var log = new RecordingBridgeLog();
+        log.Write(BridgeErrorCodes.NavigationBlocked, "navigation", "mid", "sid", "https://evil.example:8443/secret/path?token=abc#frag");
+        AssertEqual(1, log.Entries.Count, "blocked navigation must emit one sanitized log entry.");
+        AssertTrue(log.Entries[0].Contains("https://evil.example:8443", StringComparison.Ordinal), "safe log must keep scheme/host/port.");
+        AssertTrue(!log.Entries[0].Contains("/secret/path", StringComparison.Ordinal), "safe log must not emit the URI path.");
+        AssertTrue(!log.Entries[0].Contains("token=abc", StringComparison.Ordinal), "safe log must not emit the URI query.");
+        AssertTrue(!log.Entries[0].Contains("#frag", StringComparison.Ordinal), "safe log must not emit the URI fragment.");
+        AssertEqual("https://evil.example", SafeOriginLog.Describe("https://user:pass@evil.example/hidden"), "safe log must not emit userinfo.");
+        AssertTrue(!SafeOriginLog.Describe("https://user:pass@evil.example/hidden").Contains("user:pass", StringComparison.Ordinal), "userinfo must be stripped.");
+
+        Console.WriteLine("WP15 corrective lifecycle tests passed.");
+        return 32;
     }
 
     private static IncomingWebMessage Msg(string json, string? source = AppDocument, string? current = AppDocument, int additional = 0)

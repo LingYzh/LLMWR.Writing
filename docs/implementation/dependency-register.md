@@ -1,14 +1,23 @@
 # Dependency Register
 
 All third-party dependencies require explicit human approval. Resolved transitive versions are
-captured in `src/LLMW.Writing.Infrastructure/packages.lock.json`; vulnerability state is verified
-with NuGet audit during the owning work package.
+captured in the owning project's NuGet lock file; vulnerability state is verified with NuGet
+audit during the owning work package.
 
 | Package | Approved version | Purpose | License | Security/update owner | Replacement boundary |
 |---|---:|---|---|---|---|
 | `Microsoft.Data.Sqlite` | 8.0.29 | Frozen-design ADO.NET provider for the project SQLite database, migration runner, and hand-written SQL persistence adapters. | MIT | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `SQLitePCLRaw.bundle_e_sqlite3` | 2.1.12 | Explicit patched native SQLite bundle pin; prevents resolution to the provider's older 2.1.6 minimum. | Apache-2.0 | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `Microsoft.WindowsAppSDK` | 2.4.0 | Current supported stable Windows App SDK / WinUI 3 host, including WebView2 APIs for the unpackaged WP15 UI process. | MIT | LLMW.Writing maintainers | `LLMW.Writing.UI` executable host only |
+
+## Lock files
+
+| Project | Lock file | Owns |
+|---|---|---|
+| `LLMW.Writing.Infrastructure` | `src/LLMW.Writing.Infrastructure/packages.lock.json` | SQLite provider graph (`Microsoft.Data.Sqlite` and the pinned native bundle) |
+| `LLMW.Writing.UI` | `src/LLMW.Writing.UI/packages.lock.json` | Windows App SDK / WinUI 3 / WebView2 graph |
+
+Do not infer the UI transitive graph from the Infrastructure lock file. Do not edit either lock file by hand; regenerate with `dotnet restore` on the owning project.
 
 ## WP02 resolved dependency audit
 
@@ -35,3 +44,40 @@ Resolved by the WP02 locked restore:
 
 Exact content hashes and dependency edges are locked in
 `src/LLMW.Writing.Infrastructure/packages.lock.json`.
+
+## WP15 Windows App SDK provenance and UI graph
+
+First-party stable identification for `Microsoft.WindowsAppSDK` 2.4.0 (keep; do not downgrade to 2.3.1):
+
+- Microsoft Learn Windows App SDK downloads: https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads (`ms.date` 2026-08-13). Stable table lists **2.4.0** dated **08/13/2026**, with 2.3.1 retained below as **07/16/2026**.
+- Windows App SDK GitHub release: https://github.com/microsoft/WindowsAppSDK/releases/tag/v2.4.0 — latest stable release on the 2.x line, published 2026-08-13.
+- WinUI 3 GitHub release: https://github.com/microsoft/microsoft-ui-xaml/releases/tag/winui3%2Frelease%2F2.4.0
+
+Package existence on nuget.org is not by itself a stable-support statement. The sources above are the first-party stable identification used to keep 2.4.0.
+
+The authoritative UI graph is `src/LLMW.Writing.UI/packages.lock.json`, produced by `dotnet restore` (not hand-edited). WP15 corrective pass recorded:
+
+Direct: `Microsoft.WindowsAppSDK` 2.4.0.
+
+Resolved transitives from `dotnet list src/LLMW.Writing.UI/LLMW.Writing.UI.csproj package --include-transitive`:
+
+| Resolved package | Version | Dependency kind |
+|---|---:|---|
+| `Microsoft.WindowsAppSDK` | 2.4.0 | Direct |
+| `Microsoft.Web.WebView2` | 1.0.3719.77 | Transitive (via `Microsoft.WindowsAppSDK.WinUI` 2.3.6) |
+| `Microsoft.WindowsAppSDK.WinUI` | 2.3.6 | Transitive |
+| `Microsoft.WindowsAppSDK.Runtime` | 2.4.0 | Transitive |
+| `Microsoft.WindowsAppSDK.Foundation` | 2.3.9 | Transitive |
+| `Microsoft.WindowsAppSDK.Base` | 2.0.4 | Transitive |
+| `Microsoft.WindowsAppSDK.AI` | 2.4.4 | Transitive |
+| `Microsoft.WindowsAppSDK.Search` | 2.4.4 | Transitive |
+| `Microsoft.WindowsAppSDK.InteractiveExperiences` | 2.1.6 | Transitive |
+| `Microsoft.WindowsAppSDK.DWrite` | 2.1.0 | Transitive |
+| `Microsoft.WindowsAppSDK.ML` | 2.1.74 | Transitive |
+| `Microsoft.WindowsAppSDK.Widgets` | 2.0.5 | Transitive |
+| `Microsoft.Windows.AI.MachineLearning` | 2.1.74 | Transitive |
+| `Microsoft.Windows.SDK.BuildTools` | 10.0.26100.4654 | Transitive |
+| `Microsoft.Windows.SDK.BuildTools.MSIX` | 1.7.251221100 | Transitive |
+| `System.Numerics.Tensors` | 9.0.0 | Transitive |
+
+`dotnet list src/LLMW.Writing.UI/LLMW.Writing.UI.csproj package --vulnerable --include-transitive` reported no known vulnerable packages against nuget.org.

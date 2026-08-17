@@ -50,3 +50,9 @@ internal static class WebResourcePolicy
 {
     public static bool IsAllowed(string? uri) => AppOriginPolicy.IsApplicationResource(uri);
 }
+
+internal static class ExternalNavigationIntent
+{
+    public static bool MayOfferNativeDialog(NavigationDecision decision, bool isUserInitiated)
+        => decision == NavigationDecision.CancelAndOfferExternal && isUserInitiated;
+}

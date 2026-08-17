@@ -1,4 +1,3 @@
-using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.Web.WebView2.Core;
 using LLMW.Writing.UI.WebView;
@@ -7,26 +6,23 @@ namespace LLMW.Writing.UI.Hosting;
 
 internal sealed class WebViewRuntimeHost
 {
-    private readonly WebView2 _webView;
-    private readonly TextBlock _nativeStatus;
-    private readonly XamlRoot _xamlRoot;
+    private readonly IWebViewRendererSite _site;
     private readonly BridgeMessageProcessor _processor;
     private readonly IExternalBrowserLauncher _launcher;
     private readonly IBridgeLog _log;
+    private readonly NavigationSessionLifecycle _navigationLifecycle = new();
+    private readonly ExternalLinkCoordinator _externalLinks = new();
     private CoreWebView2Environment? _environment;
     private bool _initialized;
     private bool _handlersRegistered;
+    private int _unresponsiveRecoveryCount;
 
     public WebViewRuntimeHost(
-        WebView2 webView,
-        TextBlock nativeStatus,
-        XamlRoot xamlRoot,
+        IWebViewRendererSite site,
         IExternalBrowserLauncher? launcher = null,
         IBridgeLog? log = null)
     {
-        _webView = webView;
-        _nativeStatus = nativeStatus;
-        _xamlRoot = xamlRoot;
+        _site = site;
         _launcher = launcher ?? new ShellExecuteExternalBrowserLauncher();
         _log = log ?? NullBridgeLog.Instance;
         _processor = new BridgeMessageProcessor(_log);
@@ -45,33 +41,19 @@ internal sealed class WebViewRuntimeHost
         var assets = RendererAssetLayout.FromApplicationBase(AppContext.BaseDirectory);
         if (!assets.Exists)
         {
-            ShowNativeError("RENDERER_ASSETS_MISSING", "Application renderer assets are missing.");
+            _site.ShowNativeError("RENDERER_ASSETS_MISSING", "Application renderer assets are missing.");
             return;
         }
-
-        var userData = WebViewUserDataFolder.Resolve();
-        Directory.CreateDirectory(userData);
 
         try
         {
-            var options = new CoreWebView2EnvironmentOptions();
-            _environment = await CoreWebView2Environment.CreateWithOptionsAsync(null, userData, options);
-            await _webView.EnsureCoreWebView2Async(_environment);
+            await CreateEnvironmentAsync().ConfigureAwait(true);
+            await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer).ConfigureAwait(true);
         }
         catch (Exception)
         {
-            ShowNativeError("WEBVIEW_INIT_FAILED", "The renderer host could not start.");
-            return;
+            _site.ShowNativeError("WEBVIEW_INIT_FAILED", "The renderer host could not start.");
         }
-
-        var core = _webView.CoreWebView2;
-        ApplySettings(core.Settings, WebViewSecuritySettings.ForCurrentBuild);
-        RegisterHandlers(core);
-        core.SetVirtualHostNameToFolderMapping(
-            AppOrigin.Host,
-            assets.DirectoryPath,
-            CoreWebView2HostResourceAccessKind.DenyCors);
-        core.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
     }
 
     internal static void ApplySettings(CoreWebView2Settings settings, WebViewSecuritySettings requested)
@@ -83,6 +65,28 @@ internal sealed class WebViewRuntimeHost
         settings.IsPasswordAutosaveEnabled = requested.IsPasswordAutosaveEnabled;
         settings.IsWebMessageEnabled = requested.IsWebMessageEnabled;
         settings.AreDefaultScriptDialogsEnabled = requested.AreDefaultScriptDialogsEnabled;
+    }
+
+    private async Task CreateEnvironmentAsync()
+    {
+        var userData = WebViewUserDataFolder.Resolve();
+        Directory.CreateDirectory(userData);
+        var options = new CoreWebView2EnvironmentOptions();
+        _environment = await CoreWebView2Environment.CreateWithOptionsAsync(null, userData, options);
+    }
+
+    private async Task ApplyPreNavigationHardeningAndNavigateAsync(WebView2 webView)
+    {
+        await webView.EnsureCoreWebView2Async(_environment);
+        var core = webView.CoreWebView2;
+        var assets = RendererAssetLayout.FromApplicationBase(AppContext.BaseDirectory);
+        ApplySettings(core.Settings, WebViewSecuritySettings.ForCurrentBuild);
+        RegisterHandlers(core);
+        core.SetVirtualHostNameToFolderMapping(
+            AppOrigin.Host,
+            assets.DirectoryPath,
+            CoreWebView2HostResourceAccessKind.DenyCors);
+        core.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
     }
 
     private void RegisterHandlers(CoreWebView2 core)
@@ -110,6 +114,11 @@ internal sealed class WebViewRuntimeHost
 
     private void OnWebResourceRequested(CoreWebView2 sender, CoreWebView2WebResourceRequestedEventArgs args)
     {
+        if (!IsCurrentCore(sender))
+        {
+            return;
+        }
+
         if (WebResourcePolicy.IsAllowed(args.Request.Uri))
         {
             return;
@@ -121,18 +130,25 @@ internal sealed class WebViewRuntimeHost
 
     private void OnNavigationStarting(CoreWebView2 sender, CoreWebView2NavigationStartingEventArgs args)
     {
-        _processor.InvalidateSession();
-        var decision = NavigationPolicy.EvaluateTopLevel(args.Uri);
-        if (decision == NavigationDecision.AllowApplication)
+        if (!IsCurrentCore(sender))
         {
             return;
         }
 
-        args.Cancel = true;
-        _log.Write(BridgeErrorCodes.NavigationBlocked, "navigation", null, null, args.Uri);
-        if (decision == NavigationDecision.CancelAndOfferExternal)
+        _processor.InvalidateSession();
+        var decision = NavigationPolicy.EvaluateTopLevel(args.Uri);
+        if (decision == NavigationDecision.AllowApplication)
         {
-            _ = OpenExternalAsync(args.Uri, replyTo: null);
+            _navigationLifecycle.NoteStarting(args.NavigationId, hostCancelled: false);
+            return;
+        }
+
+        args.Cancel = true;
+        _navigationLifecycle.NoteStarting(args.NavigationId, hostCancelled: true);
+        _log.Write(BridgeErrorCodes.NavigationBlocked, "navigation", null, null, args.Uri);
+        if (ExternalNavigationIntent.MayOfferNativeDialog(decision, args.IsUserInitiated))
+        {
+            _ = OpenExternalFromNavigationAsync(args.Uri);
         }
     }
 
@@ -143,30 +159,44 @@ internal sealed class WebViewRuntimeHost
 
     private void OnNavigationCompleted(CoreWebView2 sender, CoreWebView2NavigationCompletedEventArgs args)
     {
-        if (!args.IsSuccess || !AppOriginPolicy.IsApplicationDocument(sender.Source))
+        if (!IsCurrentCore(sender))
         {
-            _processor.InvalidateSession();
-            if (!args.IsSuccess)
-            {
-                ShowNativeError("NAVIGATION_FAILED", "The application renderer failed to load.");
-            }
-
             return;
         }
 
-        var hello = _processor.BeginDocumentSession();
-        sender.PostWebMessageAsJson(hello);
-        ShowNativeStatus("HOST_HELLO", "Application origin loaded.");
+        var sourceIsApp = AppOriginPolicy.IsApplicationDocument(sender.Source);
+        var action = _navigationLifecycle.NoteCompleted(
+            args.NavigationId,
+            args.IsSuccess,
+            args.WebErrorStatus == CoreWebView2WebErrorStatus.OperationCanceled,
+            sourceIsApp);
+
+        if (action == NavigationCompletionAction.BeginNewSession)
+        {
+            BeginFreshDocumentSession(sender);
+            return;
+        }
+
+        if (action == NavigationCompletionAction.ShowNativeFailure)
+        {
+            _processor.InvalidateSession();
+            _site.ShowNativeError("NAVIGATION_FAILED", "The application renderer failed to load.");
+        }
     }
 
     private void OnNewWindowRequested(CoreWebView2 sender, CoreWebView2NewWindowRequestedEventArgs args)
     {
         args.Handled = true;
+        if (!IsCurrentCore(sender))
+        {
+            return;
+        }
+
         var decision = NavigationPolicy.EvaluateNewWindow(args.Uri);
         _log.Write(BridgeErrorCodes.NavigationBlocked, "new-window", null, _processor.DocumentSessionId, args.Uri);
-        if (decision == NavigationDecision.CancelAndOfferExternal)
+        if (ExternalNavigationIntent.MayOfferNativeDialog(decision, args.IsUserInitiated))
         {
-            _ = OpenExternalAsync(args.Uri, replyTo: null);
+            _ = OpenExternalFromNavigationAsync(args.Uri);
         }
     }
 
@@ -184,13 +214,30 @@ internal sealed class WebViewRuntimeHost
 
     private void OnProcessFailed(CoreWebView2 sender, CoreWebView2ProcessFailedEventArgs args)
     {
-        _processor.InvalidateSession();
-        ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer process failed.");
-        _ = ReloadApplicationShellAsync();
+        _ = sender;
+        var kind = WebViewProcessFailedKindMapper.Map(args.ProcessFailedKind);
+        var action = WebViewProcessRecoveryPolicy.Evaluate(kind, _unresponsiveRecoveryCount);
+        if (kind == WebViewProcessFailedKind.RenderProcessUnresponsive
+            && action == WebViewProcessRecoveryAction.ReloadApplicationDocument)
+        {
+            _unresponsiveRecoveryCount++;
+        }
+
+        if (action != WebViewProcessRecoveryAction.IgnoreAutoRecovered)
+        {
+            _processor.InvalidateSession();
+        }
+
+        _ = _site.DispatcherQueue.TryEnqueue(() => _ = RecoverFromProcessFailureAsync(action));
     }
 
     private void OnWebMessageReceived(CoreWebView2 sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
+        if (!IsCurrentCore(sender))
+        {
+            return;
+        }
+
         var additional = args.AdditionalObjects is null ? 0 : args.AdditionalObjects.Count;
         var result = _processor.ProcessIncoming(new IncomingWebMessage
         {
@@ -202,7 +249,7 @@ internal sealed class WebViewRuntimeHost
 
         if (result.ExternalUri is not null)
         {
-            _ = CompleteExternalFromBridgeAsync(sender, result);
+            _ = CompleteExternalFromBridgeAsync(result);
             return;
         }
 
@@ -212,25 +259,113 @@ internal sealed class WebViewRuntimeHost
         }
     }
 
-    private async Task CompleteExternalFromBridgeAsync(CoreWebView2 sender, BridgeProcessResult result)
+    private async Task CompleteExternalFromBridgeAsync(BridgeProcessResult result)
     {
-        var sessionId = _processor.DocumentSessionId ?? "none";
-        var opened = await OpenValidatedAsync(result.ExternalUri!).ConfigureAwait(true);
-        sender.PostWebMessageAsJson(BridgeMessageProcessor.CompleteExternalLink(sessionId, replyTo: null, opened));
+        if (result.ExternalUri is null
+            || string.IsNullOrEmpty(result.RequestMessageId)
+            || string.IsNullOrEmpty(result.RequestDocumentSessionId))
+        {
+            return;
+        }
+
+        var request = new PendingExternalLink
+        {
+            Source = ExternalLinkSource.BridgeRequest,
+            DocumentSessionId = result.RequestDocumentSessionId,
+            RequestMessageId = result.RequestMessageId,
+            Uri = result.ExternalUri
+        };
+
+        if (_externalLinks.TryAdmit(request) == ExternalLinkAdmitResult.Busy)
+        {
+            PostToRenderer(ExternalLinkBridgeReply.Busy(request.DocumentSessionId, request.RequestMessageId));
+            return;
+        }
+
+        var accepted = false;
+        try
+        {
+            accepted = await ConfirmExternalAsync(request.Uri).ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            _externalLinks.Clear();
+            PostToRenderer(ExternalLinkBridgeReply.FromLaunch(request, ExternalLinkLaunchResult.Cancelled));
+            _site.ShowNativeError("EXTERNAL_URL_DENIED", "The external link could not be confirmed.");
+            return;
+        }
+
+        ExternalLinkLaunchResult launch;
+        try
+        {
+            launch = _externalLinks.Complete(
+                request,
+                accepted,
+                _processor.DocumentSessionId,
+                _processor.IsReady,
+                CurrentSourceIsApplicationDocument(),
+                _launcher);
+        }
+        catch (Exception)
+        {
+            _externalLinks.Clear();
+            PostToRenderer(ExternalLinkBridgeReply.FromLaunch(request, ExternalLinkLaunchResult.Cancelled));
+            _site.ShowNativeError("EXTERNAL_URL_DENIED", "The external link could not be opened.");
+            return;
+        }
+
+        PostToRenderer(ExternalLinkBridgeReply.FromLaunch(request, launch));
     }
 
-    private async Task OpenExternalAsync(string? raw, string? replyTo)
+    private async Task OpenExternalFromNavigationAsync(string? raw)
     {
-        _ = replyTo;
         if (!ExternalUriPolicy.TryValidate(raw, out var validated, out _))
         {
             return;
         }
 
-        await OpenValidatedAsync(validated).ConfigureAwait(true);
+        var request = new PendingExternalLink
+        {
+            Source = ExternalLinkSource.UserInitiatedNavigation,
+            DocumentSessionId = _processor.DocumentSessionId ?? "none",
+            RequestMessageId = Guid.NewGuid().ToString("D"),
+            Uri = validated
+        };
+
+        if (_externalLinks.TryAdmit(request) == ExternalLinkAdmitResult.Busy)
+        {
+            return;
+        }
+
+        var accepted = false;
+        try
+        {
+            accepted = await ConfirmExternalAsync(validated).ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            _externalLinks.Clear();
+            return;
+        }
+
+        try
+        {
+            _ = _externalLinks.Complete(
+                request,
+                accepted,
+                _processor.DocumentSessionId,
+                _processor.IsReady,
+                CurrentSourceIsApplicationDocument(),
+                _launcher);
+        }
+        catch (Exception)
+        {
+            _externalLinks.Clear();
+            _site.ShowNativeError("EXTERNAL_URL_DENIED", "The external link could not be opened.");
+        }
     }
 
-    private async Task<bool> OpenValidatedAsync(ValidatedExternalUri validated)
+    private async Task<bool> ConfirmExternalAsync(ValidatedExternalUri validated)
     {
         var dialog = new ContentDialog
         {
@@ -238,24 +373,59 @@ internal sealed class WebViewRuntimeHost
             Content = validated.DisplayHost + Environment.NewLine + validated.AbsoluteUri,
             PrimaryButtonText = "Open",
             CloseButtonText = "Cancel",
-            XamlRoot = _xamlRoot
+            XamlRoot = _site.XamlRoot
         };
 
         var consent = await dialog.ShowAsync();
-        if (consent != ContentDialogResult.Primary)
-        {
-            return false;
-        }
+        return consent == ContentDialogResult.Primary;
+    }
 
+    private async Task RecoverFromProcessFailureAsync(WebViewProcessRecoveryAction action)
+    {
+        switch (action)
+        {
+            case WebViewProcessRecoveryAction.RecreateControl:
+                _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The browser process failed and the renderer is being recreated.");
+                await RecreateControlAsync().ConfigureAwait(true);
+                break;
+            case WebViewProcessRecoveryAction.ReloadApplicationDocument:
+                _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer process failed.");
+                await ReloadApplicationShellAsync().ConfigureAwait(true);
+                break;
+            case WebViewProcessRecoveryAction.FailClosedNoNavigate:
+                _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer failed and was not automatically recovered.");
+                break;
+            default:
+                _log.Write("RENDERER_PROCESS_AUTO_RECOVERED", "process", null, _processor.DocumentSessionId, AppOrigin.Origin);
+                break;
+        }
+    }
+
+    private async Task RecreateControlAsync()
+    {
+        _handlersRegistered = false;
         try
         {
-            _launcher.Open(validated);
-            return true;
+            var replacement = _site.RecreateRenderer();
+            if (_environment is null)
+            {
+                await CreateEnvironmentAsync().ConfigureAwait(true);
+            }
+
+            await ApplyPreNavigationHardeningAndNavigateAsync(replacement).ConfigureAwait(true);
         }
         catch (Exception)
         {
-            ShowNativeError("EXTERNAL_URL_DENIED", "The external link could not be opened.");
-            return false;
+            try
+            {
+                await CreateEnvironmentAsync().ConfigureAwait(true);
+                _handlersRegistered = false;
+                await ApplyPreNavigationHardeningAndNavigateAsync(_site.Renderer).ConfigureAwait(true);
+            }
+            catch (Exception)
+            {
+                _site.ShowNativeError("WEBVIEW_RECREATE_FAILED", "The renderer host could not be recreated.");
+            }
         }
     }
 
@@ -264,26 +434,36 @@ internal sealed class WebViewRuntimeHost
         try
         {
             await Task.Delay(250).ConfigureAwait(true);
-            if (_webView.CoreWebView2 is not null)
+            var core = _site.Renderer.CoreWebView2;
+            if (core is null)
             {
-                _webView.CoreWebView2.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
+                await RecreateControlAsync().ConfigureAwait(true);
+                return;
             }
+
+            core.Navigate(AppOrigin.IndexHtmlAbsoluteUri);
         }
         catch (Exception)
         {
-            ShowNativeError("RENDERER_RELOAD_FAILED", "The renderer could not be reloaded.");
+            _site.ShowNativeError("RENDERER_RELOAD_FAILED", "The renderer could not be reloaded.");
         }
     }
 
-    private void ShowNativeError(string code, string message)
+    private void BeginFreshDocumentSession(CoreWebView2 sender)
     {
-        _nativeStatus.Text = code + ": " + message;
-        _nativeStatus.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
+        _unresponsiveRecoveryCount = 0;
+        var hello = _processor.BeginDocumentSession();
+        sender.PostWebMessageAsJson(hello);
+        _site.ShowNativeStatus("HOST_HELLO", "Application origin loaded.");
     }
 
-    private void ShowNativeStatus(string code, string message)
-    {
-        _nativeStatus.Text = code + ": " + message;
-        _nativeStatus.Visibility = Microsoft.UI.Xaml.Visibility.Visible;
-    }
+    private bool IsCurrentCore(CoreWebView2 sender)
+        => _site.Renderer.CoreWebView2 is CoreWebView2 current && ReferenceEquals(sender, current);
+
+    private bool CurrentSourceIsApplicationDocument()
+        => _site.Renderer.CoreWebView2 is CoreWebView2 core
+           && AppOriginPolicy.IsApplicationDocument(core.Source);
+
+    private void PostToRenderer(string json)
+        => _site.Renderer.CoreWebView2?.PostWebMessageAsJson(json);
 }

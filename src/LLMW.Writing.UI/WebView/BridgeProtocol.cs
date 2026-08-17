@@ -45,6 +45,7 @@ internal static class BridgeErrorCodes
     public const string AdditionalObjectsDenied = "BRIDGE_ADDITIONAL_OBJECTS_DENIED";
     public const string NavigationBlocked = "NAVIGATION_BLOCKED";
     public const string ExternalUrlDenied = "EXTERNAL_URL_DENIED";
+    public const string ExternalLinkBusy = "EXTERNAL_LINK_BUSY";
 }
 
 internal sealed class BridgeError
@@ -132,6 +133,31 @@ internal sealed class RendererAssetLayout
         => new(Path.Combine(applicationBaseDirectory, "web-editor", "app"));
 }
 
+internal static class SafeOriginLog
+{
+    public static string Describe(string? uri)
+    {
+        if (!AppOriginPolicy.TryParseAbsolute(uri, out var parsed))
+        {
+            return "invalid";
+        }
+
+        var host = string.IsNullOrWhiteSpace(parsed.IdnHost) ? parsed.Host : parsed.IdnHost;
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return parsed.Scheme;
+        }
+
+        var defaultPort = string.Equals(parsed.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase) ? 443
+            : string.Equals(parsed.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase) ? 80
+            : parsed.Port;
+        var port = parsed.IsDefaultPort || parsed.Port == defaultPort
+            ? string.Empty
+            : ":" + parsed.Port.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return parsed.Scheme + "://" + host + port;
+    }
+}
+
 internal interface IBridgeLog
 {
     void Write(string code, string? semanticType, string? messageId, string? sessionId, string? origin);
@@ -143,6 +169,7 @@ internal sealed class NullBridgeLog : IBridgeLog
 
     public void Write(string code, string? semanticType, string? messageId, string? sessionId, string? origin)
     {
+        _ = SafeOriginLog.Describe(origin);
     }
 }
 
@@ -152,6 +179,6 @@ internal sealed class RecordingBridgeLog : IBridgeLog
 
     public void Write(string code, string? semanticType, string? messageId, string? sessionId, string? origin)
     {
-        Entries.Add($"{code}|{semanticType}|{messageId}|{sessionId}|{origin}");
+        Entries.Add($"{code}|{semanticType}|{messageId}|{sessionId}|{SafeOriginLog.Describe(origin)}");
     }
 }

@@ -91,6 +91,8 @@ internal sealed class BridgeProcessResult
     public BridgeError? Error { get; init; }
     public IReadOnlyList<string> OutboundJson { get; init; } = [];
     public ValidatedExternalUri? ExternalUri { get; init; }
+    public string? RequestMessageId { get; init; }
+    public string? RequestDocumentSessionId { get; init; }
     public bool NotifyRenderer => Error is not null && Error.Code != BridgeErrorCodes.WrongOrigin
         && Error.Code != BridgeErrorCodes.AdditionalObjectsDenied;
 }

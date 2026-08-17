@@ -150,6 +150,8 @@ internal sealed class BridgeMessageProcessor
                     {
                         Dispatched = true,
                         ExternalUri = validated,
+                        RequestMessageId = envelope.MessageId,
+                        RequestDocumentSessionId = envelope.DocumentSessionId,
                         OutboundJson = []
                     };
                 default:
@@ -158,8 +160,11 @@ internal sealed class BridgeMessageProcessor
         }
     }
 
-    public static string CompleteExternalLink(string documentSessionId, string? replyTo, bool accepted)
-        => BridgeOutboundJson.BridgeAck(documentSessionId, NewId(), replyTo, accepted);
+    public static string CompleteExternalLink(string documentSessionId, string replyTo, bool accepted)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(replyTo);
+        return BridgeOutboundJson.BridgeAck(documentSessionId, NewId(), replyTo, accepted);
+    }
 
     private BridgeProcessResult ErrorResult(BridgeError error, string? replyTo)
     {
