@@ -106,9 +106,12 @@ Forbidden in WP15 (must remain unknown): `readFile`, `writeFile`, `listDirectory
 3. Host posts `host.hello`.
 4. Renderer posts `renderer.ready` with that session.
 5. Host posts `bridge.ack` and `host.status`. Bridge is READY.
-6. `NavigationStarting`, reload, renderer process failure, WebView recreation, and navigation failure **immediately** invalidate the previous session.
-7. A host-cancelled navigation (`Cancel = true`) that completes with `WebErrorStatus.OperationCanceled` while `CoreWebView2.Source` is still the exact application document **does not** surface `NAVIGATION_FAILED`. The host mints a **new** `documentSessionId`, posts `host.hello`, and requires `renderer.ready` again. The previous session remains permanently invalid and is never resurrected.
-8. A genuine failed **application** navigation does not mint a replacement session; the native `NAVIGATION_FAILED` error remains.
+6. `NavigationStarting`, same-document `SourceChanged` (`IsNewDocument = false`), reload, renderer process failure that loses the document, WebView recreation, and navigation failure **immediately** invalidate the previous session.
+7. Navigation tracking is a bounded per-`NavigationId` table. Overlapping navigations keep independent records. Redirects reuse the same `NavigationId` and update that record. If any hop is host-cancelled, the navigation stays host-cancelled. Completing N1 does not clear N2. An unknown completion id is ignored. Overflow fail-closes without growing the table. WebView recreation resets tracking.
+8. A host-cancelled navigation (`Cancel = true`) that completes with `WebErrorStatus.OperationCanceled` while `CoreWebView2.Source` is still the exact application document, and that is not overlapping an in-flight application navigation, **does not** surface `NAVIGATION_FAILED`. The host mints a **new** `documentSessionId`, posts `host.hello`, and requires `renderer.ready` again. The previous session remains permanently invalid and is never resurrected.
+9. A genuine failed **application** navigation does not mint a replacement session; the native `NAVIGATION_FAILED` error remains.
+10. Same-document `SourceChanged` (fragment / History API, `IsNewDocument = false`) is a session event. Leaving the exact application document invalidates the session immediately. Returning to the exact application document mints a **new** session; it does not resurrect the previous one. `SourceChanged(IsNewDocument = true)` does not handshake; `NavigationCompleted` remains the singular successful-document handshake.
+11. The renderer accepts `host.hello` as the session-establishing message. Every other host message whose `documentSessionId` is not the renderer's current session is ignored.
 
 Stale session → `BRIDGE_STALE_SESSION`. Duplicate `messageId` in the same session → `BRIDGE_REPLAY`. Replay cache is per session and bounded; overflow fail-closes the session.
 
@@ -183,8 +186,9 @@ WP15 must not widen renderer→native privilege beyond ping and validated extern
 |---|---|
 | `BrowserProcessExited` | Recreate the WebView2 control, rebind the runtime host, create/attach the environment, apply every secure setting, register every handler, map the virtual host, navigate the application origin, then start a fresh document-session handshake |
 | `RenderProcessExited` | Reload/navigate the application document on the existing control when it is still usable; otherwise recreate. Fresh session |
-| `FrameRenderProcessExited` | WP15 allows no frames; fail closed without a navigation loop |
-| `GpuProcessExited` / `UtilityProcessExited` / `SandboxIdleProcessExited` | Runtime auto-recovery; do not destroy, recreate, or navigate |
 | `RenderProcessUnresponsive` | One bounded reload, then fail closed; no dialog/reload loop |
+| `FrameRenderProcessExited` | WP15 allows no frames; fail closed without a navigation loop. Does not by itself prove top-level document loss |
+| `GpuProcessExited` / `UtilityProcessExited` / `SandboxHelperProcessExited` / `PpapiPluginProcessExited` / `PpapiBrokerProcessExited` | Nonfatal. Observe; do not invalidate the document session, reload, or recreate |
+| `UnknownProcessExited` | Observe / safe diagnostic. Must not inherit BrowserProcessExited or RenderProcessExited recovery |
 
 The document session is invalidated whenever the renderer document is lost. Recreated controls reuse the same pre-navigation hardening sequence used at first initialization.

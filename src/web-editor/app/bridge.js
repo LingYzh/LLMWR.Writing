@@ -69,6 +69,10 @@
       return;
     }
 
+    if (!sessionId || msg.documentSessionId !== sessionId) {
+      return;
+    }
+
     if (msg.semanticType === "host.status") {
       setText("status", "bridge ready");
       return;

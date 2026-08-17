@@ -49,11 +49,10 @@ Exact content hashes and dependency edges are locked in
 
 First-party stable identification for `Microsoft.WindowsAppSDK` 2.4.0 (keep; do not downgrade to 2.3.1):
 
-- Microsoft Learn Windows App SDK downloads: https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/downloads (`ms.date` 2026-08-13). Stable table lists **2.4.0** dated **08/13/2026**, with 2.3.1 retained below as **07/16/2026**.
-- Windows App SDK GitHub release: https://github.com/microsoft/WindowsAppSDK/releases/tag/v2.4.0 — latest stable release on the 2.x line, published 2026-08-13.
+- Windows App SDK GitHub release: https://github.com/microsoft/WindowsAppSDK/releases/tag/v2.4.0 — published 2026-08-13 and marked as the latest stable release on the 2.x line. This is the sufficient first-party provenance for keeping 2.4.0.
 - WinUI 3 GitHub release: https://github.com/microsoft/microsoft-ui-xaml/releases/tag/winui3%2Frelease%2F2.4.0
 
-Package existence on nuget.org is not by itself a stable-support statement. The sources above are the first-party stable identification used to keep 2.4.0.
+Microsoft Learn search/crawl of the downloads table may lag a GitHub stable release and is not required to list 2.4.0 for this pin to remain valid. Package existence on nuget.org is not by itself a stable-support statement.
 
 The authoritative UI graph is `src/LLMW.Writing.UI/packages.lock.json`, produced by `dotnet restore` (not hand-edited). WP15 corrective pass recorded:
 

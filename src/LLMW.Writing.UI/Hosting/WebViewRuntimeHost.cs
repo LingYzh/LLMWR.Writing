@@ -104,6 +104,7 @@ internal sealed class WebViewRuntimeHost
         core.WebResourceRequested += OnWebResourceRequested;
         core.NavigationStarting += OnNavigationStarting;
         core.FrameNavigationStarting += OnFrameNavigationStarting;
+        core.SourceChanged += OnSourceChanged;
         core.NavigationCompleted += OnNavigationCompleted;
         core.NewWindowRequested += OnNewWindowRequested;
         core.PermissionRequested += OnPermissionRequested;
@@ -137,14 +138,30 @@ internal sealed class WebViewRuntimeHost
 
         _processor.InvalidateSession();
         var decision = NavigationPolicy.EvaluateTopLevel(args.Uri);
-        if (decision == NavigationDecision.AllowApplication)
+        var isAllowedApplication = decision == NavigationDecision.AllowApplication;
+        if (!isAllowedApplication)
         {
-            _navigationLifecycle.NoteStarting(args.NavigationId, hostCancelled: false);
+            args.Cancel = true;
+        }
+
+        var tracked = _navigationLifecycle.NoteStarting(
+            args.NavigationId,
+            hostCancelled: !isAllowedApplication,
+            isAllowedApplicationNavigation: isAllowedApplication);
+        if (tracked == NavigationTrackResult.Overflow)
+        {
+            args.Cancel = true;
+            _navigationLifecycle.Reset();
+            _processor.InvalidateSession();
+            _site.ShowNativeError("NAVIGATION_FAILED", "The renderer navigation tracker is exhausted.");
             return;
         }
 
-        args.Cancel = true;
-        _navigationLifecycle.NoteStarting(args.NavigationId, hostCancelled: true);
+        if (isAllowedApplication)
+        {
+            return;
+        }
+
         _log.Write(BridgeErrorCodes.NavigationBlocked, "navigation", null, null, args.Uri);
         if (ExternalNavigationIntent.MayOfferNativeDialog(decision, args.IsUserInitiated))
         {
@@ -155,6 +172,28 @@ internal sealed class WebViewRuntimeHost
     private static void OnFrameNavigationStarting(CoreWebView2 sender, CoreWebView2NavigationStartingEventArgs args)
     {
         args.Cancel = true;
+    }
+
+    private void OnSourceChanged(CoreWebView2 sender, CoreWebView2SourceChangedEventArgs args)
+    {
+        if (!IsCurrentCore(sender))
+        {
+            return;
+        }
+
+        var action = SameDocumentSessionPolicy.Evaluate(
+            args.IsNewDocument,
+            AppOriginPolicy.IsApplicationDocument(sender.Source));
+        if (action == SameDocumentSourceChangeAction.IgnoreNewDocument)
+        {
+            return;
+        }
+
+        _processor.InvalidateSession();
+        if (action == SameDocumentSourceChangeAction.BeginNewSession)
+        {
+            BeginFreshDocumentSession(sender);
+        }
     }
 
     private void OnNavigationCompleted(CoreWebView2 sender, CoreWebView2NavigationCompletedEventArgs args)
@@ -223,9 +262,10 @@ internal sealed class WebViewRuntimeHost
             _unresponsiveRecoveryCount++;
         }
 
-        if (action != WebViewProcessRecoveryAction.IgnoreAutoRecovered)
+        if (WebViewProcessRecoveryPolicy.LosesRendererDocument(kind))
         {
             _processor.InvalidateSession();
+            _navigationLifecycle.Reset();
         }
 
         _ = _site.DispatcherQueue.TryEnqueue(() => _ = RecoverFromProcessFailureAsync(action));
@@ -255,7 +295,7 @@ internal sealed class WebViewRuntimeHost
 
         foreach (var outbound in result.OutboundJson)
         {
-            sender.PostWebMessageAsJson(outbound);
+            PostToRenderer(outbound);
         }
     }
 
@@ -395,8 +435,8 @@ internal sealed class WebViewRuntimeHost
             case WebViewProcessRecoveryAction.FailClosedNoNavigate:
                 _site.ShowNativeError("RENDERER_PROCESS_FAILED", "The renderer failed and was not automatically recovered.");
                 break;
-            default:
-                _log.Write("RENDERER_PROCESS_AUTO_RECOVERED", "process", null, _processor.DocumentSessionId, AppOrigin.Origin);
+            case WebViewProcessRecoveryAction.ObserveKeepSession:
+                _log.Write("RENDERER_PROCESS_OBSERVED", "process", null, _processor.DocumentSessionId, AppOrigin.Origin);
                 break;
         }
     }
@@ -404,6 +444,8 @@ internal sealed class WebViewRuntimeHost
     private async Task RecreateControlAsync()
     {
         _handlersRegistered = false;
+        _navigationLifecycle.Reset();
+        _processor.InvalidateSession();
         try
         {
             var replacement = _site.RecreateRenderer();
@@ -465,5 +507,12 @@ internal sealed class WebViewRuntimeHost
            && AppOriginPolicy.IsApplicationDocument(core.Source);
 
     private void PostToRenderer(string json)
-        => _site.Renderer.CoreWebView2?.PostWebMessageAsJson(json);
+    {
+        if (!HostToRendererDelivery.ShouldPost(json, _processor.DocumentSessionId))
+        {
+            return;
+        }
+
+        _site.Renderer.CoreWebView2?.PostWebMessageAsJson(json);
+    }
 }

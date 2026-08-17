@@ -6,10 +6,12 @@ internal enum WebViewProcessFailedKind
     RenderProcessExited = 1,
     RenderProcessUnresponsive = 2,
     FrameRenderProcessExited = 3,
-    GpuProcessExited = 4,
-    UtilityProcessExited = 5,
-    SandboxIdleProcessExited = 6,
-    Other = 7
+    UtilityProcessExited = 4,
+    SandboxHelperProcessExited = 5,
+    GpuProcessExited = 6,
+    PpapiPluginProcessExited = 7,
+    PpapiBrokerProcessExited = 8,
+    UnknownProcessExited = 9
 }
 
 internal enum WebViewProcessRecoveryAction
@@ -17,7 +19,7 @@ internal enum WebViewProcessRecoveryAction
     RecreateControl = 0,
     ReloadApplicationDocument = 1,
     FailClosedNoNavigate = 2,
-    IgnoreAutoRecovered = 3
+    ObserveKeepSession = 3
 }
 
 internal static class WebViewProcessRecoveryPolicy
@@ -28,14 +30,22 @@ internal static class WebViewProcessRecoveryPolicy
         {
             WebViewProcessFailedKind.BrowserProcessExited => WebViewProcessRecoveryAction.RecreateControl,
             WebViewProcessFailedKind.RenderProcessExited => WebViewProcessRecoveryAction.ReloadApplicationDocument,
-            WebViewProcessFailedKind.FrameRenderProcessExited => WebViewProcessRecoveryAction.FailClosedNoNavigate,
-            WebViewProcessFailedKind.GpuProcessExited => WebViewProcessRecoveryAction.IgnoreAutoRecovered,
-            WebViewProcessFailedKind.UtilityProcessExited => WebViewProcessRecoveryAction.IgnoreAutoRecovered,
-            WebViewProcessFailedKind.SandboxIdleProcessExited => WebViewProcessRecoveryAction.IgnoreAutoRecovered,
             WebViewProcessFailedKind.RenderProcessUnresponsive => unresponsiveRecoveryCount >= 1
                 ? WebViewProcessRecoveryAction.FailClosedNoNavigate
                 : WebViewProcessRecoveryAction.ReloadApplicationDocument,
-            _ => WebViewProcessRecoveryAction.FailClosedNoNavigate
+            WebViewProcessFailedKind.FrameRenderProcessExited => WebViewProcessRecoveryAction.FailClosedNoNavigate,
+            WebViewProcessFailedKind.UtilityProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            WebViewProcessFailedKind.SandboxHelperProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            WebViewProcessFailedKind.GpuProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            WebViewProcessFailedKind.PpapiPluginProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            WebViewProcessFailedKind.PpapiBrokerProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            WebViewProcessFailedKind.UnknownProcessExited => WebViewProcessRecoveryAction.ObserveKeepSession,
+            _ => WebViewProcessRecoveryAction.ObserveKeepSession
         };
     }
+
+    public static bool LosesRendererDocument(WebViewProcessFailedKind kind)
+        => kind is WebViewProcessFailedKind.BrowserProcessExited
+            or WebViewProcessFailedKind.RenderProcessExited
+            or WebViewProcessFailedKind.RenderProcessUnresponsive;
 }

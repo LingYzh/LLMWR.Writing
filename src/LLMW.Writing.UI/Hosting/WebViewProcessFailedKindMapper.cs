@@ -13,9 +13,13 @@ internal static class WebViewProcessFailedKindMapper
             CoreWebView2ProcessFailedKind.RenderProcessExited => WebViewProcessFailedKind.RenderProcessExited,
             CoreWebView2ProcessFailedKind.RenderProcessUnresponsive => WebViewProcessFailedKind.RenderProcessUnresponsive,
             CoreWebView2ProcessFailedKind.FrameRenderProcessExited => WebViewProcessFailedKind.FrameRenderProcessExited,
-            CoreWebView2ProcessFailedKind.GpuProcessExited => WebViewProcessFailedKind.GpuProcessExited,
             CoreWebView2ProcessFailedKind.UtilityProcessExited => WebViewProcessFailedKind.UtilityProcessExited,
-            _ => WebViewProcessFailedKind.Other
+            CoreWebView2ProcessFailedKind.SandboxHelperProcessExited => WebViewProcessFailedKind.SandboxHelperProcessExited,
+            CoreWebView2ProcessFailedKind.GpuProcessExited => WebViewProcessFailedKind.GpuProcessExited,
+            CoreWebView2ProcessFailedKind.PpapiPluginProcessExited => WebViewProcessFailedKind.PpapiPluginProcessExited,
+            CoreWebView2ProcessFailedKind.PpapiBrokerProcessExited => WebViewProcessFailedKind.PpapiBrokerProcessExited,
+            CoreWebView2ProcessFailedKind.UnknownProcessExited => WebViewProcessFailedKind.UnknownProcessExited,
+            _ => WebViewProcessFailedKind.UnknownProcessExited
         };
     }
 }
