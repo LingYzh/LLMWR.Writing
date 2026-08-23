@@ -124,6 +124,14 @@ public sealed partial class MainWindow : Window, IWebViewRendererSite
         }
     }
 
+    private async void OnRestoreHistoryClick(object sender, RoutedEventArgs args)
+    {
+        if (_editor is not null)
+        {
+            await _editor.RestoreLocalHistoryAsync(HistoryIdBox.Text?.Trim() ?? "");
+        }
+    }
+
     private void OnRestoreClick(object sender, RoutedEventArgs args) => _editor?.RestoreRecovery();
 
     private void OnDiscardClick(object sender, RoutedEventArgs args) => _editor?.DiscardRecovery();

@@ -84,7 +84,7 @@ public static class IpcJson
 [JsonSourceGenerationOptions(
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-    Converters = [typeof(IpcMessageTypeJsonConverter), typeof(IpcClientKindJsonConverter), typeof(EditorFormatKindJsonConverter), typeof(EditorLeaseOwnerKindJsonConverter)])]
+    Converters = [typeof(IpcMessageTypeJsonConverter), typeof(IpcClientKindJsonConverter), typeof(EditorFormatKindJsonConverter), typeof(EditorLeaseOwnerKindJsonConverter), typeof(HistoryCheckpointTriggerKindJsonConverter)])]
 [JsonSerializable(typeof(IpcWireEnvelope), TypeInfoPropertyName = "IpcWireEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<HelloRequest>), TypeInfoPropertyName = "HelloRequestEnvelope")]
 [JsonSerializable(typeof(IpcEnvelope<HelloAck>), TypeInfoPropertyName = "HelloAckEnvelope")]

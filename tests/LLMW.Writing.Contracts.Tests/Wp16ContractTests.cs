@@ -67,6 +67,9 @@ internal static class Wp16ContractTests
         Program.AssertTrue(
             IpcErrorCodes.EditorSaveOutcomeUnknown != IpcErrorCodes.EditorStaleBase,
             "Unknown save outcome must remain distinct from stale base.");
+        Program.AssertTrue(
+            IpcErrorCodes.HistoryRestoreConflict != IpcErrorCodes.EditorStaleBase,
+            "Local History conflict must remain distinct from ordinary editor save conflict.");
     }
 
     private static void GoldenJsonForWp16Dtos()
@@ -174,11 +177,11 @@ internal static class Wp16ContractTests
             Program.Envelope(
                 IpcMessageType.Request,
                 IpcSemanticTypes.SaveDraftEditorSession,
-                new SaveDraftEditorSessionRequest(SessionId, "op-1", DigestA, blob)),
+                new SaveDraftEditorSessionRequest(SessionId, "op-1", DigestA, blob, HistoryCheckpointTriggerKind.Autosave)),
             IpcJsonContext.Default.SaveDraftEditorSessionRequestEnvelope,
             Payload("saveDraftEditorSession", "request",
                 "{\"editorSessionId\":\"" + SessionId + "\",\"saveOperationId\":\"op-1\",\"expectedPersistedDigest\":\"" + DigestA +
-                "\",\"content\":{\"digest\":\"" + DigestB + "\",\"size\":4,\"locator\":\"blob:" + DigestB + "\"}}"));
+                "\",\"content\":{\"digest\":\"" + DigestB + "\",\"size\":4,\"locator\":\"blob:" + DigestB + "\"},\"checkpointTrigger\":\"autosave\"}"));
         AssertGolden(
             Program.Envelope(
                 IpcMessageType.Response,
@@ -219,7 +222,8 @@ internal static class Wp16ContractTests
         IpcSemanticTypes.BeginEditorContentUpload,
         IpcSemanticTypes.EditorContentUploadChunk,
         IpcSemanticTypes.CommitEditorContentUpload,
-        IpcSemanticTypes.SaveDraftEditorSession
+        IpcSemanticTypes.SaveDraftEditorSession,
+        IpcSemanticTypes.RestoreHistoryEntry
     ];
 
     private static string Payload(string semanticType, string messageType, string payload) =>

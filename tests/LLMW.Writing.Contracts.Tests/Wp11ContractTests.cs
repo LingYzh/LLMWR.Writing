@@ -240,14 +240,14 @@ internal static class Wp11ContractTests
             "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"searchNarrative\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"hits\":[{\"objectId\":\"obj-1\",\"artifactDigest\":\"digest\",\"sectionKey\":\"sec\",\"title\":\"Title\",\"currentStatus\":\"current\",\"rank\":1.5}]}}");
 
         AssertGolden(
-            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.RestoreHistoryEntry, new RestoreHistoryEntryRequest("hist-1")),
+            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.RestoreHistoryEntry, new RestoreHistoryEntryRequest("018f3e78-1234-7abc-8def-0123456789a1", "018f3e78-1234-7abc-8def-0123456789b1", new string('a', 64))),
             IpcJsonContext.Default.RestoreHistoryEntryRequestEnvelope,
-            "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"restoreHistoryEntry\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"historyId\":\"hist-1\"}}");
+            "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"restoreHistoryEntry\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"historyId\":\"018f3e78-1234-7abc-8def-0123456789a1\",\"editorSessionId\":\"018f3e78-1234-7abc-8def-0123456789b1\",\"expectedPersistedDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}");
 
         AssertGolden(
-            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.RestoreHistoryEntry, new RestoreHistoryEntryResponse("hist-1", true)),
+            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.RestoreHistoryEntry, new RestoreHistoryEntryResponse("018f3e78-1234-7abc-8def-0123456789a1", new string('b', 64), 2, true)),
             IpcJsonContext.Default.RestoreHistoryEntryResponseEnvelope,
-            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"restoreHistoryEntry\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"historyId\":\"hist-1\",\"restored\":true}}");
+            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"restoreHistoryEntry\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"historyId\":\"018f3e78-1234-7abc-8def-0123456789a1\",\"persistedDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"persistedRevision\":2,\"restored\":true}}");
 
         AssertGolden(
             Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.ActivateExtension, new ActivateExtensionRequest("ext-1")),

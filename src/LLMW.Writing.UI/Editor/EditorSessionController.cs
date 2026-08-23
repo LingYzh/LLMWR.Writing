@@ -153,6 +153,63 @@ internal sealed class EditorSessionController : IEditorBridgeHost
 
     public Task FlushSaveAsync() => SaveAsync(explicitSave: true);
 
+    public async Task RestoreLocalHistoryAsync(string historyId)
+    {
+        IEditorCoreClient? core;
+        OpenDraftEditorSessionResponse? open;
+        EditorCrashShadow? shadow;
+        lock (_gate)
+        {
+            core = _core;
+            open = _open;
+            shadow = _shadow;
+        }
+
+        if (core is null || open is null || shadow is null || string.IsNullOrWhiteSpace(historyId))
+        {
+            return;
+        }
+
+        try
+        {
+            var restored = await core.RestoreHistoryAsync(
+                    historyId,
+                    open.EditorSessionId,
+                    shadow.LastPersistedDigest,
+                    CancellationToken.None)
+                .ConfigureAwait(true);
+            var text = await core.DownloadLogicalTextAsync(
+                    open.EditorSessionId,
+                    restored.PersistedDigest,
+                    CancellationToken.None)
+                .ConfigureAwait(true);
+            shadow.LoadCleanDisk(text, restored.PersistedDigest, restored.PersistedRevision);
+            lock (_gate)
+            {
+                _open = open with
+                {
+                    BaseDiskDigest = restored.PersistedDigest,
+                    LastPersistedDigest = restored.PersistedDigest,
+                    LastPersistedRevision = restored.PersistedRevision
+                };
+                _autosave.Cancel();
+                _fsm.Force(EditorSaveUiState.Clean);
+                _pendingRecoveryKind = "none";
+            }
+
+            RebindLocked();
+            PublishStatus();
+        }
+        catch (IpcProtocolException exception)
+        {
+            _site.ShowNativeError(exception.ErrorCode, "Local History restore did not complete.");
+        }
+        catch (Exception)
+        {
+            _site.ShowNativeError(IpcErrorCodes.HistoryStorageFailure, "Local History restore did not complete.");
+        }
+    }
+
     public void RestoreRecovery() => ApplyRecovery("restore");
 
     public void DiscardRecovery() => ApplyRecovery("discard");
@@ -323,6 +380,9 @@ internal sealed class EditorSessionController : IEditorBridgeHost
                     saveOp,
                     shadow.LastPersistedDigest,
                     blob,
+                    explicitSave
+                        ? HistoryCheckpointTriggerKind.ExplicitSave
+                        : HistoryCheckpointTriggerKind.Autosave,
                     CancellationToken.None)
                 .ConfigureAwait(true);
 

@@ -15,6 +15,13 @@ public enum EditorLeaseOwnerKind
     AgentWrite
 }
 
+public enum HistoryCheckpointTriggerKind
+{
+    ExplicitSave,
+    Autosave,
+    CrashRecovery
+}
+
 public sealed record IpcBlobRef(string Digest, long Size, string Locator);
 
 public sealed record OpenDraftEditorSessionRequest(string ChapterId, string DraftFileName, bool RequestWritable);
@@ -85,7 +92,8 @@ public sealed record SaveDraftEditorSessionRequest(
     string EditorSessionId,
     string SaveOperationId,
     string ExpectedPersistedDigest,
-    IpcBlobRef Content);
+    IpcBlobRef Content,
+    HistoryCheckpointTriggerKind CheckpointTrigger = HistoryCheckpointTriggerKind.ExplicitSave);
 
 public sealed record SaveDraftEditorSessionResponse(
     string SaveOperationId,
@@ -104,6 +112,14 @@ public sealed class EditorFormatKindJsonConverter : JsonStringEnumConverter<Edit
 public sealed class EditorLeaseOwnerKindJsonConverter : JsonStringEnumConverter<EditorLeaseOwnerKind>
 {
     public EditorLeaseOwnerKindJsonConverter()
+        : base(System.Text.Json.JsonNamingPolicy.CamelCase)
+    {
+    }
+}
+
+public sealed class HistoryCheckpointTriggerKindJsonConverter : JsonStringEnumConverter<HistoryCheckpointTriggerKind>
+{
+    public HistoryCheckpointTriggerKindJsonConverter()
         : base(System.Text.Json.JsonNamingPolicy.CamelCase)
     {
     }

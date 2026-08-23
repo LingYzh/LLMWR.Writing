@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Authority;
+using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Editor;
 using LLMW.Writing.Contracts.Ipc;
@@ -15,6 +16,7 @@ public sealed class EditorRuntime
     private readonly EditorLeaseCoordinator leases = new();
     private readonly EditorContentUploadService uploads;
     private readonly DraftSaveService saves;
+    private readonly LocalHistoryService? history;
     private readonly IDocxDocumentAdapter docx;
     private readonly Dictionary<string, EditorSession> sessions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, PendingDownload> downloads = new(StringComparer.Ordinal);
@@ -25,15 +27,17 @@ public sealed class EditorRuntime
         IDraftFileStore files,
         IImmutableBlobStore blobs,
         IEditorSaveFaultInjector? faults = null,
-        IDocxDocumentAdapter? docx = null)
+        IDocxDocumentAdapter? docx = null,
+        LocalHistoryService? history = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(projectId);
         this.projectId = projectId;
         this.files = files ?? throw new ArgumentNullException(nameof(files));
         this.docx = docx ?? UnavailableDocxDocumentAdapter.Instance;
+        this.history = history;
         var injector = faults ?? NoEditorSaveFaultInjector.Instance;
         uploads = new EditorContentUploadService(blobs, injector);
-        saves = new DraftSaveService(files, blobs, leases, this.docx, injector);
+        saves = new DraftSaveService(files, blobs, leases, this.docx, injector, history);
     }
 
     public string ProjectId => projectId;
@@ -378,6 +382,7 @@ public sealed class EditorRuntime
                 request.SaveOperationId,
                 request.ExpectedPersistedDigest,
                 request.Content,
+                request.CheckpointTrigger,
                 cancellationToken);
         }
         catch (EditorSaveFaultInjectedException exception) when (exception.Point == EditorSaveFaultPoint.BeforeIpcResponse)
@@ -399,6 +404,91 @@ public sealed class EditorRuntime
         session.Value!.LastPersistedDigest = saved.Value!.PersistedDigest;
         session.Value.LastPersistedRevision = saved.Value.PersistedRevision;
         return saved;
+    }
+
+    public EditorResult<RestoreHistoryEntryResponse> RestoreHistory(
+        CallerPrincipal principal,
+        string connectionId,
+        string? envelopeProjectId,
+        RestoreHistoryEntryRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (!ProjectMatches(envelopeProjectId))
+        {
+            return EditorResult<RestoreHistoryEntryResponse>.Fail(IpcErrorCodes.HistoryEntryInvalid);
+        }
+
+        var session = RequireWritable(principal, connectionId, request.EditorSessionId);
+        if (!session.Succeeded)
+        {
+            return EditorResult<RestoreHistoryEntryResponse>.Fail(session.ErrorCode!);
+        }
+
+        if (history is null)
+        {
+            return EditorResult<RestoreHistoryEntryResponse>.Fail(IpcErrorCodes.CommandUnavailable);
+        }
+
+        if (!ContentDigest.IsSha256Hex(request.ExpectedPersistedDigest))
+        {
+            return EditorResult<RestoreHistoryEntryResponse>.Fail(IpcErrorCodes.HistoryEntryInvalid);
+        }
+
+        return leases.WithDocumentLock(session.Value!.LeaseKey, () =>
+        {
+            if (!leases.Owns(
+                    session.Value.LeaseKey,
+                    EditorLeaseOwnerKind.UserEditor,
+                    connectionId,
+                    session.Value.EditorSessionId))
+            {
+                return EditorResult<RestoreHistoryEntryResponse>.Fail(IpcErrorCodes.EditorLeaseLost);
+            }
+
+            var current = files.Read(session.Value.Document.RelativePath);
+            if (!current.Succeeded)
+            {
+                return EditorResult<RestoreHistoryEntryResponse>.Fail(current.ErrorCode!);
+            }
+
+            if (!StringComparer.Ordinal.Equals(current.Value!.Digest, ContentDigest.Normalize(request.ExpectedPersistedDigest)))
+            {
+                return EditorResult<RestoreHistoryEntryResponse>.Fail(IpcErrorCodes.HistoryRestoreConflict);
+            }
+
+            var recovered = history.ReadForRestore(
+                new LocalHistoryRestoreRequest(
+                    projectId,
+                    HistoryDocumentIdentity.From(session.Value.Document),
+                    request.HistoryId,
+                    current.Value.Digest),
+                cancellationToken);
+            if (!recovered.Succeeded)
+            {
+                return EditorResult<RestoreHistoryEntryResponse>.Fail(recovered.ErrorCode!);
+            }
+
+            var restored = files.AtomicReplace(
+                session.Value.Document.RelativePath,
+                current.Value.Digest,
+                recovered.Value!.Content,
+                NoEditorSaveFaultInjector.Instance);
+            if (!restored.Succeeded)
+            {
+                return EditorResult<RestoreHistoryEntryResponse>.Fail(
+                    restored.ErrorCode == IpcErrorCodes.EditorStaleBase
+                        ? IpcErrorCodes.HistoryRestoreConflict
+                        : restored.ErrorCode!);
+            }
+
+            session.Value.LastPersistedDigest = restored.Value!.Digest;
+            session.Value.LastPersistedRevision++;
+            return EditorResult<RestoreHistoryEntryResponse>.Ok(new RestoreHistoryEntryResponse(
+                recovered.Value.Entry.HistoryId,
+                restored.Value.Digest,
+                session.Value.LastPersistedRevision,
+                true));
+        });
     }
 
     public EditorResult<EditorLease> AcquireAgentWrite(
