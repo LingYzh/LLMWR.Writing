@@ -1,0 +1,6 @@
+This internal package is a controlled native-runtime replacement for
+LibGit2Sharp.NativeBinaries 2.0.324. It provides libgit2 1.9.6, whose
+licence is GPLv2 with the libgit2 linking exception. The audited standard
+Windows x64 binary uses the Windows native HTTPS backend and carries no
+libssh2/OpenSSL payload. See eng/native/LibGit2Sharp.NativeBinaries.audit.json
+for exact origin URLs, licence attribution, and SHA-256 values.

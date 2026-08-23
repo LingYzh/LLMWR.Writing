@@ -10,6 +10,28 @@ audit during the owning work package.
 | `SQLitePCLRaw.bundle_e_sqlite3` | 2.1.12 | Explicit patched native SQLite bundle pin; prevents resolution to the provider's older 2.1.6 minimum. | Apache-2.0 | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `Microsoft.WindowsAppSDK` | 2.4.0 | Current supported stable Windows App SDK / WinUI 3 host, including WebView2 APIs for the unpackaged WP15 UI process. | MIT | LLMW.Writing maintainers | `LLMW.Writing.UI` executable host only |
 | `DocumentFormat.OpenXml` | 3.5.1 | DOCX parser/serializer behind the isolated WP17 document adapter. | MIT | LLMW.Writing maintainers | `LLMW.Writing.Infrastructure` DOCX adapter only |
+| `LibGit2Sharp` | 0.32.0 | Infrastructure Git adapter implementation. | MIT | Infrastructure maintainers | `IGitService` |
+| `LibGit2Sharp.NativeBinaries` (internal/maintained) | 2.0.324 / libgit2 1.9.6 | Provide patched libgit2 native runtime for LibGit2Sharp. | libgit2 GPLv2 with linking exception | Infrastructure maintainers | Can be replaced without changing `IGitService` contract |
+
+### WP19 native Git runtime audit
+
+`LibGit2Sharp` 0.32.0 pins `LibGit2Sharp.NativeBinaries` 2.0.324. The public
+package at that compatibility version ships libgit2 1.8.x, so Infrastructure
+resolves the same package ID/version exclusively from the repository-controlled
+`eng/native/feed` source. `NuGet.Config` source mapping prevents nuget.org from
+supplying that ID. The package is consumed directly only by
+`LLMW.Writing.Infrastructure`; it is not visible to Application, Domain,
+Contracts, Core IPC contracts, UI, or renderer code.
+
+- Package SHA-256: `8099eb0836f2236473b303b16d628fc3f7cf3ca494067a957b01e7178a70806e`
+- libgit2 binary SHA-256: `9de746ab87a1d0f733c6cf2b340ca7c356481754b208b6c43c97ce2ae6067ffe`
+- Source archive SHA-256: `c4800ad2643e0cb540f802973866b16480d45da2c8237a56c0b9405460ea97e6`
+- This standard Windows build uses WinHTTP and contains no libssh2/OpenSSL runtime payload.
+
+The auditable provenance and native asset hash are in
+`eng/native/LibGit2Sharp.NativeBinaries.audit.json`. Rebuild only through
+`eng/native/build-libgit2sharp-nativebinaries.ps1`; deployment happens through
+the NuGet package, never by manually copying a DLL into an application output.
 
 ## Lock files
 

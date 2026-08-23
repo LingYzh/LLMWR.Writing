@@ -74,6 +74,12 @@ public static class IpcSemanticTypes
     public const string EditorContentUploadChunk = "editorContentUploadChunk";
     public const string CommitEditorContentUpload = "commitEditorContentUpload";
     public const string SaveDraftEditorSession = "saveDraftEditorSession";
+    public const string GetGitStatus = "getGitStatus";
+    public const string GetGitDiffSummary = "getGitDiffSummary";
+    public const string GetGitCurrentBranch = "getGitCurrentBranch";
+    public const string ListGitCommitHistory = "listGitCommitHistory";
+    public const string GetGitCommitMetadata = "getGitCommitMetadata";
+    public const string CommitGitChanges = "commitGitChanges";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -145,7 +151,13 @@ public static class IpcSemanticTypes
         BeginEditorContentUpload,
         EditorContentUploadChunk,
         CommitEditorContentUpload,
-        SaveDraftEditorSession
+        SaveDraftEditorSession,
+        GetGitStatus,
+        GetGitDiffSummary,
+        GetGitCurrentBranch,
+        ListGitCommitHistory,
+        GetGitCommitMetadata,
+        CommitGitChanges
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();

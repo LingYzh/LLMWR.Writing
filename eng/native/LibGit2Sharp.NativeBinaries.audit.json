@@ -1,0 +1,21 @@
+{
+  "packageId": "LibGit2Sharp.NativeBinaries",
+  "packageVersion": "2.0.324",
+  "runtime": "win-x64",
+  "libgit2Version": "1.9.6",
+  "packageSha256": "8099eb0836f2236473b303b16d628fc3f7cf3ca494067a957b01e7178a70806e",
+  "source": {
+    "package": "pygit2",
+    "version": "1.20.0",
+    "archiveUrl": "https://files.pythonhosted.org/packages/3f/5a/09e66f51a5147929fe4a5653e9e9f3820e91998820fd15837ecfdd98e4fd/pygit2-1.20.0-cp311-cp311-win_amd64.whl",
+    "archiveSha256": "c4800ad2643e0cb540f802973866b16480d45da2c8237a56c0b9405460ea97e6",
+    "upstreamRepository": "https://github.com/libgit2/pygit2"
+  },
+  "nativeAssets": {
+    "git2-5853918.dll": "9de746ab87a1d0f733c6cf2b340ca7c356481754b208b6c43c97ce2ae6067ffe"
+  },
+  "licences": {
+    "libgit2": "GPLv2 with linking exception",
+    "sourcePackaging": "GPLv2 with linking exception"
+  }
+}

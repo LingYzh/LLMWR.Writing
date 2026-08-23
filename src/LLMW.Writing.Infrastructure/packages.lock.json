@@ -11,6 +11,21 @@
           "DocumentFormat.OpenXml.Framework": "3.5.1"
         }
       },
+      "LibGit2Sharp": {
+        "type": "Direct",
+        "requested": "[0.32.0, 0.32.0]",
+        "resolved": "0.32.0",
+        "contentHash": "BL3eMVRnkWWS9zbz6n0H+iDVJ9ZK7hDeiuASnHlsFvwZYTJtDuBFRRVIaH//s4VlF0baOGvCeenXbobE1JLLiQ==",
+        "dependencies": {
+          "LibGit2Sharp.NativeBinaries": "[2.0.324]"
+        }
+      },
+      "LibGit2Sharp.NativeBinaries": {
+        "type": "Direct",
+        "requested": "[2.0.324, 2.0.324]",
+        "resolved": "2.0.324",
+        "contentHash": "mRnagEx0HzHHxrzkqeqo4ycnwoaC5E+KUdHTN8QuWJiJc98b4iR2ocOkT02GH/xHKQwdo3Sk8jlGJJGAysn51Q=="
+      },
       "Microsoft.Data.Sqlite": {
         "type": "Direct",
         "requested": "[8.0.29, 8.0.29]",

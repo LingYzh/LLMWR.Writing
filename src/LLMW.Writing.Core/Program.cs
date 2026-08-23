@@ -1,6 +1,8 @@
 using LLMW.Writing.Application.Ipc;
+using LLMW.Writing.Application.Git;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
+using LLMW.Writing.Infrastructure.Git;
 
 namespace LLMW.Writing.Core;
 
@@ -25,6 +27,9 @@ internal static class Program
             throw new InvalidOperationException("Core requires separate launcher-provided UI and Agent Runtime bootstrap tokens.");
         }
 
+        var gitNative = LibGit2SharpNativeRuntime.Verify();
+        Console.WriteLine($"WP19 libgit2 runtime={gitNative.Version} sha256={gitNative.Sha256}");
+
         var eventRing = new IpcEventRing(Guid.NewGuid().ToString("D"));
         var bindings = new TrustedIpcBindingRegistry();
         var commands = new MutableIpcCommandHandler();
@@ -33,6 +38,7 @@ internal static class Program
         var runtimeChannelInstanceId = "runtime-channel-" + Guid.NewGuid().ToString("N");
         var runSessions = new ProjectRunSessionServiceHolder();
         var editors = new EditorRuntimeHolder();
+        var gitProjects = new GitProjectServiceHolder();
         commands.Inner = new CoreOpenProjectHandler(
             commands,
             bindings,
@@ -42,7 +48,8 @@ internal static class Program
             runtimeChannelInstanceId,
             nativeUi,
             runSessions,
-            editors);
+            editors,
+            gitProjects);
 
         var uiOptions = new IpcServerOptions
         {

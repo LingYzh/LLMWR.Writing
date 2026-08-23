@@ -43,6 +43,10 @@ jobs:
         with:
           node-version: '24'
 
+      - name: Verify WP19 controlled native Git runtime
+        shell: pwsh
+        run: ./eng/native/verify-libgit2sharp-nativebinaries.ps1
+
       - name: Run hosted release test gate
         shell: pwsh
         run: ./.github/scripts/run-hosted-gate.ps1 -Gate Core -Configuration Release

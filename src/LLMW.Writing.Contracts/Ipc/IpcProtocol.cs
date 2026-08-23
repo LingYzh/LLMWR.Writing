@@ -245,6 +245,16 @@ public static class IpcErrorCodes
     public const string DocxExternalRelationship = "DOCX_EXTERNAL_RELATIONSHIP";
     public const string DocxEncrypted = "DOCX_ENCRYPTED_UNSUPPORTED";
     public const string DocxAdapterUnavailable = "DOCX_ADAPTER_UNAVAILABLE";
+    public const string GitProjectBindingInvalid = "GIT_PROJECT_BINDING_INVALID";
+    public const string GitRepositoryNotFound = "GIT_REPOSITORY_NOT_FOUND";
+    public const string GitRepositoryOutsideProject = "GIT_REPOSITORY_OUTSIDE_PROJECT";
+    public const string GitRepositoryUnsupported = "GIT_REPOSITORY_UNSUPPORTED";
+    public const string GitPathRejected = "GIT_PATH_REJECTED";
+    public const string GitCommitReferenceInvalid = "GIT_COMMIT_REFERENCE_INVALID";
+    public const string GitCommitMessageInvalid = "GIT_COMMIT_MESSAGE_INVALID";
+    public const string GitUserIdentityUnavailable = "GIT_USER_IDENTITY_UNAVAILABLE";
+    public const string GitMutationDenied = "GIT_MUTATION_DENIED";
+    public const string GitBackendFailure = "GIT_BACKEND_FAILURE";
 }
 
 public static class IpcServerCapabilities

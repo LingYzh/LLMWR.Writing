@@ -1,17 +1,21 @@
 using LLMW.Writing.Application.Editor;
+using LLMW.Writing.Application.Git;
 using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
+using LLMW.Writing.Application.Watcher;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.FileSystem;
+using LLMW.Writing.Infrastructure.Git;
 using LLMW.Writing.Infrastructure.Docx;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
 using LLMW.Writing.Infrastructure.Specialists;
+using LLMW.Writing.Infrastructure.Watcher;
 
 namespace LLMW.Writing.Core;
 
@@ -27,6 +31,10 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
     private readonly TrustedNativePrincipalSource nativeUi;
     private readonly ProjectRunSessionServiceHolder runSessions;
     private readonly EditorRuntimeHolder editors;
+    private readonly GitProjectServiceHolder gitProjects;
+    // Project lifetime ownership. The watcher is deliberately not owned by an EditorSession.
+    private ProjectWatcherBatcher? projectWatcher;
+    private IDisposable? projectWatcherSubscription;
     private bool opened;
 
     public CoreOpenProjectHandler(
@@ -38,7 +46,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         string runtimeChannelInstanceId,
         TrustedNativePrincipalSource nativeUi,
         ProjectRunSessionServiceHolder runSessions,
-        EditorRuntimeHolder editors)
+        EditorRuntimeHolder editors,
+        GitProjectServiceHolder gitProjects)
     {
         this.commands = commands;
         this.bindings = bindings;
@@ -49,6 +58,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         this.nativeUi = nativeUi;
         this.runSessions = runSessions;
         this.editors = editors;
+        this.gitProjects = gitProjects;
     }
 
     public Task<IpcApplicationCommandResult?> HandleAsync(IpcApplicationCommandContext context)
@@ -81,6 +91,9 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
             var previousInner = commands.Inner;
             RunSessionService? published = null;
             EditorRuntime? publishedEditor = null;
+            GitProjectService? publishedGit = null;
+            ProjectWatcherBatcher? pendingWatcher = null;
+            IDisposable? pendingWatcherSubscription = null;
             var runtimeBindingInstalled = false;
             try
             {
@@ -145,10 +158,12 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new Wp14IpcCommandHandler(
                         new ProviderInvocationStateHandler(store, scheduler, authorization),
                         workspaceInstanceId),
-                    new Wp16IpcCommandHandler(editors, workspaceInstanceId));
+                    new Wp16IpcCommandHandler(editors, workspaceInstanceId),
+                    new Wp19IpcCommandHandler(gitProjects, workspaceInstanceId));
                 var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
                 var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
-                var draftStore = new DraftFileStore(pathResolver, new SelfWriteTracker());
+                var selfWrites = new SelfWriteTracker();
+                var draftStore = new DraftFileStore(pathResolver, selfWrites);
                 var localHistory = new LocalHistoryService(
                     blobStore,
                     new FileLocalHistoryMetadataStore(pathResolver));
@@ -161,9 +176,26 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     localHistory);
                 editors.PublishOnce(editor);
                 publishedEditor = editor;
+                var git = new GitProjectService(
+                    new LibGit2SharpGitService(),
+                    new GitProjectBinding(bind.ProjectId.ToString("D"), bind.CanonicalRoot));
+                gitProjects.PublishOnce(git);
+                publishedGit = git;
+                var watcherDispatcher = new ProjectWatcherBatchDispatcher();
+                pendingWatcherSubscription = watcherDispatcher.Subscribe(batch =>
+                {
+                    // Event-only bridge: the watcher never starts reconcile or an Authority mutation.
+                    eventRing.PublishNotice(
+                        "projectWatcherBatch",
+                        "events=" + batch.Events.Count + ";fullRescan=" + batch.RequiresFullRescan);
+                });
+                pendingWatcher = new ProjectWatcherBatcher(bind.ProjectId.ToString("D"), pathResolver, watcherDispatcher);
+                pendingWatcher.Start();
                 wp13.RecoverBackgroundTasks();
                 runSessions.PublishOnce(sessions);
                 published = sessions;
+                projectWatcher = pendingWatcher;
+                projectWatcherSubscription = pendingWatcherSubscription;
                 opened = true;
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
@@ -179,6 +211,14 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 {
                     editors.TryAbandon(publishedEditor);
                 }
+
+                if (publishedGit is not null)
+                {
+                    gitProjects.TryAbandon(publishedGit);
+                }
+
+                pendingWatcherSubscription?.Dispose();
+                pendingWatcher?.Dispose();
 
                 if (runtimeBindingInstalled)
                 {
