@@ -274,6 +274,10 @@ internal static partial class Program
     {
         var root = CreateWp19Directory("repository");
         using var repository = new Repository(Repository.Init(root));
+        // The adapter correctly requires a configured identity for a user-triggered commit.
+        // Keep this fixture independent of a developer or hosted-runner global Git config.
+        repository.Config.Set("user.name", "WP19 Test");
+        repository.Config.Set("user.email", "wp19@example.test");
         File.WriteAllText(Path.Combine(root, "README.md"), "initial");
         repository.Index.Add("README.md");
         repository.Index.Write();
