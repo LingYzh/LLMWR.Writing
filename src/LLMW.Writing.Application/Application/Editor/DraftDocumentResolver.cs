@@ -104,6 +104,10 @@ public static class DraftDocumentResolver
         {
             format = EditorFormatKind.Txt;
         }
+        else if (string.Equals(extension, ".docx", StringComparison.OrdinalIgnoreCase))
+        {
+            format = EditorFormatKind.Docx;
+        }
         else
         {
             return false;

@@ -68,6 +68,8 @@ public static class IpcSemanticTypes
     public const string OpenDraftEditorSession = "openDraftEditorSession";
     public const string GetDraftEditorSessionState = "getDraftEditorSessionState";
     public const string ReleaseDraftEditorSession = "releaseDraftEditorSession";
+    public const string BeginEditorContentDownload = "beginEditorContentDownload";
+    public const string EditorContentDownloadChunk = "editorContentDownloadChunk";
     public const string BeginEditorContentUpload = "beginEditorContentUpload";
     public const string EditorContentUploadChunk = "editorContentUploadChunk";
     public const string CommitEditorContentUpload = "commitEditorContentUpload";
@@ -138,6 +140,8 @@ public static class IpcSemanticTypes
         OpenDraftEditorSession,
         GetDraftEditorSessionState,
         ReleaseDraftEditorSession,
+        BeginEditorContentDownload,
+        EditorContentDownloadChunk,
         BeginEditorContentUpload,
         EditorContentUploadChunk,
         CommitEditorContentUpload,

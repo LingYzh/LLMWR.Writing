@@ -47,10 +47,14 @@ internal sealed class EditorSessionController : IEditorBridgeHost
 
         var opened = await core.OpenAsync(chapterId, draftFileName, requestWritable: true, cancellationToken)
             .ConfigureAwait(true);
-        var read = NativeDraftReader.Read(core.ProjectRoot, opened.RelativeDraftPath, opened.BaseDiskDigest);
-        if (!read.Succeeded)
+        string logicalText;
+        try
         {
-            _site.ShowNativeError(read.ErrorCode ?? IpcErrorCodes.EditorSessionInvalid, "Draft could not be opened.");
+            logicalText = await core.DownloadLogicalTextAsync(opened.EditorSessionId, opened.BaseDiskDigest, cancellationToken).ConfigureAwait(true);
+        }
+        catch (Exception)
+        {
+            _site.ShowNativeError(IpcErrorCodes.EditorSessionInvalid, "Draft could not be opened.");
             return;
         }
 
@@ -60,16 +64,12 @@ internal sealed class EditorSessionController : IEditorBridgeHost
             _shadow = new EditorCrashShadow(
                 opened.EditorSessionId,
                 opened.BaseDiskDigest,
-                read.Value!.EncodingSupported ? read.Value.LogicalText : "",
+                logicalText,
                 dirty: false);
             _fsm.Force(opened.Writable
-                ? (read.Value.EncodingSupported ? EditorSaveUiState.Clean : EditorSaveUiState.ReadOnlyLeased)
+                ? EditorSaveUiState.Clean
                 : EditorSaveUiState.ReadOnlyLeased);
             _pendingRecoveryKind = "none";
-            if (!read.Value.EncodingSupported)
-            {
-                _pendingRecoveryKind = "encoding";
-            }
         }
 
         EnsureTimer();
@@ -79,10 +79,6 @@ internal sealed class EditorSessionController : IEditorBridgeHost
         }
 
         PublishStatus();
-        if (!read.Value!.EncodingSupported)
-        {
-            _site.ShowNativeError(IpcErrorCodes.EditorEncodingUnsupported, "Draft encoding is not supported UTF-8.");
-        }
     }
 
     public void OnDocumentSessionReady(string documentSessionId)

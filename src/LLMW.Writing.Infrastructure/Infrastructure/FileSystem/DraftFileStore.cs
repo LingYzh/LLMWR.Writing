@@ -55,12 +55,12 @@ public sealed class DraftFileStore : IDraftFileStore
     public EditorResult<DraftFileSnapshot> AtomicReplace(
         string relativePath,
         string expectedDigest,
-        byte[] utf8NoBomLf,
+        byte[] contentBytes,
         IEditorSaveFaultInjector faults)
     {
-        ArgumentNullException.ThrowIfNull(utf8NoBomLf);
+        ArgumentNullException.ThrowIfNull(contentBytes);
         ArgumentNullException.ThrowIfNull(faults);
-        if (utf8NoBomLf.Length > EditorTransportLimits.MaximumDocumentUtf8Bytes)
+        if (contentBytes.Length > EditorTransportLimits.MaximumDocumentUtf8Bytes)
         {
             return EditorResult<DraftFileSnapshot>.Fail(IpcErrorCodes.EditorDocumentTooLarge);
         }
@@ -83,7 +83,7 @@ public sealed class DraftFileStore : IDraftFileStore
             return EditorResult<DraftFileSnapshot>.Fail(IpcErrorCodes.EditorStaleBase);
         }
 
-        var newDigest = ContentDigest.Sha256Hex(utf8NoBomLf);
+        var newDigest = ContentDigest.Sha256Hex(contentBytes);
         var directory = Path.GetDirectoryName(targetPath)
             ?? throw new IOException("Draft target directory could not be resolved.");
         Directory.CreateDirectory(directory);
@@ -102,7 +102,7 @@ public sealed class DraftFileStore : IDraftFileStore
                 BufferSize,
                 FileOptions.WriteThrough))
             {
-                stream.Write(utf8NoBomLf);
+                stream.Write(contentBytes);
                 stream.Flush(flushToDisk: true);
             }
 

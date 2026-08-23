@@ -5,7 +5,8 @@ namespace LLMW.Writing.Contracts.Ipc;
 public enum EditorFormatKind
 {
     Txt,
-    Md
+    Md,
+    Docx
 }
 
 public enum EditorLeaseOwnerKind
@@ -46,6 +47,19 @@ public sealed record GetDraftEditorSessionStateResponse(
 public sealed record ReleaseDraftEditorSessionRequest(string EditorSessionId);
 
 public sealed record ReleaseDraftEditorSessionResponse(bool Released);
+
+public sealed record BeginEditorContentDownloadRequest(string EditorSessionId, string ExpectedPersistedDigest);
+
+public sealed record BeginEditorContentDownloadResponse(
+    string DownloadId,
+    int DeclaredUtf8Length,
+    string DeclaredSha256,
+    int ChunkCount,
+    int MaxChunkBytes);
+
+public sealed record EditorContentDownloadChunkRequest(string DownloadId, int ChunkIndex);
+
+public sealed record EditorContentDownloadChunkResponse(int ChunkIndex, string DataBase64);
 
 public sealed record BeginEditorContentUploadRequest(
     string EditorSessionId,

@@ -89,6 +89,8 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
             IpcSemanticTypes.OpenDraftEditorSession => Open(runtime, context),
             IpcSemanticTypes.GetDraftEditorSessionState => GetState(runtime, context),
             IpcSemanticTypes.ReleaseDraftEditorSession => Release(runtime, context),
+            IpcSemanticTypes.BeginEditorContentDownload => BeginDownload(runtime, context),
+            IpcSemanticTypes.EditorContentDownloadChunk => DownloadChunk(runtime, context),
             IpcSemanticTypes.BeginEditorContentUpload => BeginUpload(runtime, context),
             IpcSemanticTypes.EditorContentUploadChunk => Chunk(runtime, context),
             IpcSemanticTypes.CommitEditorContentUpload => Commit(runtime, context),
@@ -136,6 +138,24 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
         var result = runtime.BeginUpload(context.Principal!, context.ConnectionId, request);
         return result.Succeeded
             ? Ok(context, result.Value!, IpcJsonContext.Default.BeginEditorContentUploadResponseEnvelope)
+            : Error(context, result.ErrorCode!, Safe(result.ErrorCode!));
+    }
+
+    private IpcApplicationCommandResult BeginDownload(EditorRuntime runtime, IpcApplicationCommandContext context)
+    {
+        var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.BeginEditorContentDownloadRequest);
+        var result = runtime.BeginDownload(context.Principal!, context.ConnectionId, request);
+        return result.Succeeded
+            ? Ok(context, result.Value!, IpcJsonContext.Default.BeginEditorContentDownloadResponseEnvelope)
+            : Error(context, result.ErrorCode!, Safe(result.ErrorCode!));
+    }
+
+    private IpcApplicationCommandResult DownloadChunk(EditorRuntime runtime, IpcApplicationCommandContext context)
+    {
+        var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.EditorContentDownloadChunkRequest);
+        var result = runtime.DownloadChunk(context.Principal!, context.ConnectionId, request);
+        return result.Succeeded
+            ? Ok(context, result.Value!, IpcJsonContext.Default.EditorContentDownloadChunkResponseEnvelope)
             : Error(context, result.ErrorCode!, Safe(result.ErrorCode!));
     }
 
@@ -206,6 +226,8 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
         IpcSemanticTypes.OpenDraftEditorSession or
         IpcSemanticTypes.GetDraftEditorSessionState or
         IpcSemanticTypes.ReleaseDraftEditorSession or
+        IpcSemanticTypes.BeginEditorContentDownload or
+        IpcSemanticTypes.EditorContentDownloadChunk or
         IpcSemanticTypes.BeginEditorContentUpload or
         IpcSemanticTypes.EditorContentUploadChunk or
         IpcSemanticTypes.CommitEditorContentUpload or

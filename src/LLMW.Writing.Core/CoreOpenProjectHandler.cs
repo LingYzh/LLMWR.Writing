@@ -7,6 +7,7 @@ using LLMW.Writing.Application.Security.Sandbox;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.FileSystem;
+using LLMW.Writing.Infrastructure.Docx;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.Sandbox;
 using LLMW.Writing.Infrastructure.Specialists;
@@ -151,7 +152,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     bind.ProjectId.ToString("D"),
                     draftStore,
                     blobStore,
-                    EditorSaveFaultEnvironment.FromEnvironment());
+                    EditorSaveFaultEnvironment.FromEnvironment(),
+                    new OpenXmlDocxDocumentAdapter());
                 editors.PublishOnce(editor);
                 publishedEditor = editor;
                 wp13.RecoverBackgroundTasks();
