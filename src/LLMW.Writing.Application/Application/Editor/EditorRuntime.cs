@@ -8,26 +8,32 @@ namespace LLMW.Writing.Application.Editor;
 
 public sealed class EditorRuntime
 {
+    private sealed record PendingDownload(string EditorSessionId, string ConnectionId, byte[] Bytes);
+
     private readonly string projectId;
     private readonly IDraftFileStore files;
     private readonly EditorLeaseCoordinator leases = new();
     private readonly EditorContentUploadService uploads;
     private readonly DraftSaveService saves;
+    private readonly IDocxDocumentAdapter docx;
     private readonly Dictionary<string, EditorSession> sessions = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, PendingDownload> downloads = new(StringComparer.Ordinal);
     private readonly object gate = new();
 
     public EditorRuntime(
         string projectId,
         IDraftFileStore files,
         IImmutableBlobStore blobs,
-        IEditorSaveFaultInjector? faults = null)
+        IEditorSaveFaultInjector? faults = null,
+        IDocxDocumentAdapter? docx = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(projectId);
         this.projectId = projectId;
         this.files = files ?? throw new ArgumentNullException(nameof(files));
+        this.docx = docx ?? UnavailableDocxDocumentAdapter.Instance;
         var injector = faults ?? NoEditorSaveFaultInjector.Instance;
         uploads = new EditorContentUploadService(blobs, injector);
-        saves = new DraftSaveService(files, blobs, leases, injector);
+        saves = new DraftSaveService(files, blobs, leases, this.docx, injector);
     }
 
     public string ProjectId => projectId;
@@ -59,7 +65,14 @@ public sealed class EditorRuntime
             return EditorResult<OpenDraftEditorSessionResponse>.Fail(snapshot.ErrorCode!);
         }
 
-        var decode = TextDocumentCodec.TryDecode(snapshot.Value!.Bytes);
+        var decode = document.Value!.FormatKind == EditorFormatKind.Docx
+            ? ReadDocx(snapshot.Value!.Bytes)
+            : TextDocumentCodec.TryDecode(snapshot.Value!.Bytes);
+        if (document.Value.FormatKind == EditorFormatKind.Docx && !decode.Succeeded)
+        {
+            return EditorResult<OpenDraftEditorSessionResponse>.Fail(decode.ErrorCode!);
+        }
+
         var writable = false;
         EditorLeaseOwnerKind? owner = null;
         var sessionId = IpcMessageIds.Create().ToString("D");
@@ -156,9 +169,83 @@ public sealed class EditorRuntime
         lock (gate)
         {
             sessions.Remove(editorSessionId);
+            foreach (var downloadId in downloads.Where(pair => StringComparer.Ordinal.Equals(pair.Value.EditorSessionId, editorSessionId)).Select(pair => pair.Key).ToArray())
+            {
+                downloads.Remove(downloadId);
+            }
         }
 
         return EditorResult<ReleaseDraftEditorSessionResponse>.Ok(new ReleaseDraftEditorSessionResponse(true));
+    }
+
+    public EditorResult<BeginEditorContentDownloadResponse> BeginDownload(
+        CallerPrincipal principal,
+        string connectionId,
+        BeginEditorContentDownloadRequest request)
+    {
+        var session = RequireSession(principal, connectionId, request.EditorSessionId);
+        if (!session.Succeeded || !ContentDigest.IsSha256Hex(request.ExpectedPersistedDigest)
+            || !StringComparer.Ordinal.Equals(request.ExpectedPersistedDigest, session.Value?.LastPersistedDigest))
+        {
+            return EditorResult<BeginEditorContentDownloadResponse>.Fail(session.Succeeded ? IpcErrorCodes.EditorStaleBase : session.ErrorCode!);
+        }
+
+        var snapshot = files.Read(session.Value!.Document.RelativePath);
+        if (!snapshot.Succeeded || !StringComparer.Ordinal.Equals(snapshot.Value!.Digest, request.ExpectedPersistedDigest))
+        {
+            return EditorResult<BeginEditorContentDownloadResponse>.Fail(snapshot.ErrorCode ?? IpcErrorCodes.EditorStaleBase);
+        }
+
+        var decoded = session.Value.Document.FormatKind == EditorFormatKind.Docx
+            ? ReadDocx(snapshot.Value.Bytes)
+            : TextDocumentCodec.TryDecode(snapshot.Value.Bytes);
+        if (!decoded.Succeeded)
+        {
+            return EditorResult<BeginEditorContentDownloadResponse>.Fail(decoded.ErrorCode!);
+        }
+
+        var bytes = TextDocumentCodec.EncodeUtf8NoBomLf(decoded.Value!.LogicalText);
+        if (bytes.Length > EditorTransportLimits.MaximumDocumentUtf8Bytes)
+        {
+            return EditorResult<BeginEditorContentDownloadResponse>.Fail(IpcErrorCodes.EditorDocumentTooLarge);
+        }
+
+        var downloadId = IpcMessageIds.Create().ToString("D");
+        lock (gate)
+        {
+            downloads[downloadId] = new PendingDownload(session.Value.EditorSessionId, connectionId, bytes);
+        }
+
+        var count = bytes.Length == 0 ? 0 : (bytes.Length + EditorTransportLimits.MaximumChunkUtf8Bytes - 1) / EditorTransportLimits.MaximumChunkUtf8Bytes;
+        return EditorResult<BeginEditorContentDownloadResponse>.Ok(new BeginEditorContentDownloadResponse(
+            downloadId, bytes.Length, ContentDigest.Sha256Hex(bytes), count, EditorTransportLimits.MaximumChunkUtf8Bytes));
+    }
+
+    public EditorResult<EditorContentDownloadChunkResponse> DownloadChunk(
+        CallerPrincipal principal,
+        string connectionId,
+        EditorContentDownloadChunkRequest request)
+    {
+        if (!IsUser(principal))
+        {
+            return EditorResult<EditorContentDownloadChunkResponse>.Fail(IpcErrorCodes.EditorSessionInvalid);
+        }
+
+        PendingDownload? download;
+        lock (gate)
+        {
+            downloads.TryGetValue(request.DownloadId, out download);
+        }
+
+        var count = download is null ? 0 : download.Bytes.Length == 0 ? 0 : (download.Bytes.Length + EditorTransportLimits.MaximumChunkUtf8Bytes - 1) / EditorTransportLimits.MaximumChunkUtf8Bytes;
+        if (download is null || !StringComparer.Ordinal.Equals(download.ConnectionId, connectionId) || request.ChunkIndex < 0 || request.ChunkIndex >= count)
+        {
+            return EditorResult<EditorContentDownloadChunkResponse>.Fail(IpcErrorCodes.EditorSessionInvalid);
+        }
+
+        var offset = request.ChunkIndex * EditorTransportLimits.MaximumChunkUtf8Bytes;
+        var length = Math.Min(EditorTransportLimits.MaximumChunkUtf8Bytes, download.Bytes.Length - offset);
+        return EditorResult<EditorContentDownloadChunkResponse>.Ok(new EditorContentDownloadChunkResponse(request.ChunkIndex, Convert.ToBase64String(download.Bytes, offset, length)));
     }
 
     public void ReleaseByConnection(string connectionId)
@@ -182,6 +269,10 @@ public sealed class EditorRuntime
                 }
 
                 sessions.Remove(id);
+                foreach (var downloadId in downloads.Where(pair => StringComparer.Ordinal.Equals(pair.Value.EditorSessionId, id)).Select(pair => pair.Key).ToArray())
+                {
+                    downloads.Remove(downloadId);
+                }
             }
 
             leases.Release(session.LeaseKey, EditorLeaseOwnerKind.UserEditor, connectionId, session.EditorSessionId);
@@ -399,6 +490,28 @@ public sealed class EditorRuntime
 
     private static bool IsUser(CallerPrincipal principal) =>
         principal.Kind == PrincipalKind.UserInteractive;
+
+    private EditorResult<TextDecodeResult> ReadDocx(byte[] bytes)
+    {
+        var read = docx.Read(bytes);
+        if (!read.Succeeded)
+        {
+            return EditorResult<TextDecodeResult>.Fail(ToError(read.Failure!.Value));
+        }
+
+        return EditorResult<TextDecodeResult>.Ok(new TextDecodeResult(read.Value!.LogicalText, false, false));
+    }
+
+    private static string ToError(DocxDocumentFailure failure) => failure switch
+    {
+        DocxDocumentFailure.MalformedXml => IpcErrorCodes.DocxMalformedXml,
+        DocxDocumentFailure.ExternalRelationship => IpcErrorCodes.DocxExternalRelationship,
+        DocxDocumentFailure.Encrypted => IpcErrorCodes.DocxEncrypted,
+        DocxDocumentFailure.AdapterUnavailable => IpcErrorCodes.DocxAdapterUnavailable,
+        DocxDocumentFailure.Oversized => IpcErrorCodes.EditorDocumentTooLarge,
+        DocxDocumentFailure.UnsupportedFeature => IpcErrorCodes.DocxUnsupportedFeature,
+        _ => IpcErrorCodes.DocxMalformedPackage
+    };
 
     private static OpenDraftEditorSessionResponse ToOpenResponse(EditorSession session, long length) =>
         new(

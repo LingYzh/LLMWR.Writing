@@ -15,6 +15,7 @@ public sealed class DraftSaveService
     private readonly IDraftFileStore files;
     private readonly IImmutableBlobStore blobs;
     private readonly EditorLeaseCoordinator leases;
+    private readonly IDocxDocumentAdapter docx;
     private readonly IEditorSaveFaultInjector faults;
     private readonly Dictionary<string, CompletedSave> completed = new(StringComparer.Ordinal);
     private readonly object gate = new();
@@ -23,11 +24,13 @@ public sealed class DraftSaveService
         IDraftFileStore files,
         IImmutableBlobStore blobs,
         EditorLeaseCoordinator leases,
+        IDocxDocumentAdapter? docx = null,
         IEditorSaveFaultInjector? faults = null)
     {
         this.files = files ?? throw new ArgumentNullException(nameof(files));
         this.blobs = blobs ?? throw new ArgumentNullException(nameof(blobs));
         this.leases = leases ?? throw new ArgumentNullException(nameof(leases));
+        this.docx = docx ?? UnavailableDocxDocumentAdapter.Instance;
         this.faults = faults ?? NoEditorSaveFaultInjector.Instance;
     }
 
@@ -113,8 +116,21 @@ public sealed class DraftSaveService
             return EditorResult<SaveDraftEditorSessionResponse>.Fail(decode.ErrorCode!);
         }
 
-        var normalized = TextDocumentCodec.EncodeUtf8NoBomLf(decode.Value!.LogicalText);
-        var normalizedDigest = ContentDigest.Sha256Hex(normalized);
+        byte[] serialized;
+        if (session.Document.FormatKind == EditorFormatKind.Docx)
+        {
+            var created = docx.Create(DocxEditorDocument.FromLogicalText(decode.Value!.LogicalText));
+            if (!created.Succeeded)
+            {
+                return EditorResult<SaveDraftEditorSessionResponse>.Fail(ToError(created.Failure!.Value));
+            }
+
+            serialized = created.Value!;
+        }
+        else
+        {
+            serialized = TextDocumentCodec.EncodeUtf8NoBomLf(decode.Value!.LogicalText);
+        }
 
         return leases.WithDocumentLock(session.LeaseKey, () =>
         {
@@ -127,7 +143,7 @@ public sealed class DraftSaveService
             var written = files.AtomicReplace(
                 session.Document.RelativePath,
                 expectedPersistedDigest,
-                normalized,
+                serialized,
                 faults);
             if (!written.Succeeded)
             {
@@ -144,11 +160,23 @@ public sealed class DraftSaveService
                 completed[identityKey] = new CompletedSave(saveOperationId, contentDigest, expectedPersistedDigest, response);
             }
 
-            _ = normalizedDigest;
             faults.ThrowIf(EditorSaveFaultPoint.BeforeIpcResponse);
             return EditorResult<SaveDraftEditorSessionResponse>.Ok(response);
         });
     }
+
+    private static string ToError(DocxDocumentFailure failure) => failure switch
+    {
+        DocxDocumentFailure.MalformedXml => IpcErrorCodes.DocxMalformedXml,
+        DocxDocumentFailure.ExternalRelationship => IpcErrorCodes.DocxExternalRelationship,
+        DocxDocumentFailure.Encrypted => IpcErrorCodes.DocxEncrypted,
+        DocxDocumentFailure.AdapterUnavailable => IpcErrorCodes.DocxAdapterUnavailable,
+        _ => failure == DocxDocumentFailure.Oversized
+            ? IpcErrorCodes.EditorDocumentTooLarge
+            : failure == DocxDocumentFailure.UnsupportedFeature
+                ? IpcErrorCodes.DocxUnsupportedFeature
+                : IpcErrorCodes.DocxMalformedPackage
+    };
 
     internal bool TryGetCompleted(
         EditorSession session,

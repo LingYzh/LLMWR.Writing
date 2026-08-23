@@ -235,6 +235,12 @@ public static class IpcErrorCodes
     public const string EditorRecoveryAvailable = "EDITOR_RECOVERY_AVAILABLE";
     public const string EditorRecoveryBaseChanged = "EDITOR_RECOVERY_BASE_CHANGED";
     public const string EditorSaveOutcomeUnknown = "EDITOR_SAVE_OUTCOME_UNKNOWN";
+    public const string DocxMalformedPackage = "DOCX_MALFORMED_PACKAGE";
+    public const string DocxMalformedXml = "DOCX_MALFORMED_XML";
+    public const string DocxUnsupportedFeature = "DOCX_UNSUPPORTED_FEATURE";
+    public const string DocxExternalRelationship = "DOCX_EXTERNAL_RELATIONSHIP";
+    public const string DocxEncrypted = "DOCX_ENCRYPTED_UNSUPPORTED";
+    public const string DocxAdapterUnavailable = "DOCX_ADAPTER_UNAVAILABLE";
 }
 
 public static class IpcServerCapabilities

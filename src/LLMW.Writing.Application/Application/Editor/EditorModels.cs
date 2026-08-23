@@ -86,6 +86,85 @@ public sealed record ResolvedDraftDocument(
     EditorFormatKind FormatKind,
     string LogicalTitle);
 
+public enum DocxDocumentFailure
+{
+    MalformedPackage,
+    MalformedXml,
+    Oversized,
+    UnsupportedFeature,
+    ExternalRelationship,
+    Encrypted,
+    AdapterUnavailable
+}
+
+public sealed record DocxParagraph(string Anchor, string Text);
+
+public sealed record DocxEditorDocument(IReadOnlyList<DocxParagraph> Paragraphs)
+{
+    public string LogicalText => string.Join("\n", Paragraphs.Select(paragraph => paragraph.Text));
+
+    public static DocxEditorDocument FromLogicalText(string logicalText)
+    {
+        ArgumentNullException.ThrowIfNull(logicalText);
+        var paragraphs = logicalText
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\r", "\n", StringComparison.Ordinal)
+            .Split('\n')
+            .Select((text, index) => new DocxParagraph($"p-{index:D8}", text))
+            .ToArray();
+        return new DocxEditorDocument(paragraphs);
+    }
+}
+
+public readonly struct DocxAdapterResult<T>
+{
+    private DocxAdapterResult(T? value, DocxDocumentFailure? failure)
+    {
+        Value = value;
+        Failure = failure;
+    }
+
+    public T? Value { get; }
+
+    public DocxDocumentFailure? Failure { get; }
+
+    public bool Succeeded => Failure is null && Value is not null;
+
+#pragma warning disable CA1000
+    public static DocxAdapterResult<T> Ok(T value) => new(value, null);
+
+    public static DocxAdapterResult<T> Fail(DocxDocumentFailure failure) => new(default, failure);
+#pragma warning restore CA1000
+}
+
+public interface IDocxDocumentAdapter
+{
+    DocxAdapterResult<DocxEditorDocument> Read(ReadOnlyMemory<byte> packageBytes);
+
+    DocxAdapterResult<byte[]> Create(DocxEditorDocument document);
+}
+
+public sealed class UnavailableDocxDocumentAdapter : IDocxDocumentAdapter
+{
+    public static UnavailableDocxDocumentAdapter Instance { get; } = new();
+
+    private UnavailableDocxDocumentAdapter()
+    {
+    }
+
+    public DocxAdapterResult<DocxEditorDocument> Read(ReadOnlyMemory<byte> packageBytes)
+    {
+        _ = packageBytes;
+        return DocxAdapterResult<DocxEditorDocument>.Fail(DocxDocumentFailure.AdapterUnavailable);
+    }
+
+    public DocxAdapterResult<byte[]> Create(DocxEditorDocument document)
+    {
+        _ = document;
+        return DocxAdapterResult<byte[]>.Fail(DocxDocumentFailure.AdapterUnavailable);
+    }
+}
+
 public sealed record DraftFileSnapshot(
     string RelativePath,
     string LeaseKey,
@@ -106,7 +185,7 @@ public interface IDraftFileStore
     EditorResult<DraftFileSnapshot> AtomicReplace(
         string relativePath,
         string expectedDigest,
-        byte[] utf8NoBomLf,
+        byte[] contentBytes,
         IEditorSaveFaultInjector faults);
 }
 

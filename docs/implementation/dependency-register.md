@@ -9,6 +9,7 @@ audit during the owning work package.
 | `Microsoft.Data.Sqlite` | 8.0.29 | Frozen-design ADO.NET provider for the project SQLite database, migration runner, and hand-written SQL persistence adapters. | MIT | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `SQLitePCLRaw.bundle_e_sqlite3` | 2.1.12 | Explicit patched native SQLite bundle pin; prevents resolution to the provider's older 2.1.6 minimum. | Apache-2.0 | LLMW.Writing maintainers | Infrastructure SQLite adapter only |
 | `Microsoft.WindowsAppSDK` | 2.4.0 | Current supported stable Windows App SDK / WinUI 3 host, including WebView2 APIs for the unpackaged WP15 UI process. | MIT | LLMW.Writing maintainers | `LLMW.Writing.UI` executable host only |
+| `DocumentFormat.OpenXml` | 3.5.1 | DOCX parser/serializer behind the isolated WP17 document adapter. | MIT | LLMW.Writing maintainers | `LLMW.Writing.Infrastructure` DOCX adapter only |
 
 ## Lock files
 
@@ -16,6 +17,7 @@ audit during the owning work package.
 |---|---|---|
 | `LLMW.Writing.Infrastructure` | `src/LLMW.Writing.Infrastructure/packages.lock.json` | SQLite provider graph (`Microsoft.Data.Sqlite` and the pinned native bundle) |
 | `LLMW.Writing.UI` | `src/LLMW.Writing.UI/packages.lock.json` | Windows App SDK / WinUI 3 / WebView2 graph |
+| `LLMW.Writing.Infrastructure` | `src/LLMW.Writing.Infrastructure/packages.lock.json` | SQLite and DOCX adapter dependency graphs |
 
 Do not infer the UI transitive graph from the Infrastructure lock file. Do not edit either lock file by hand; regenerate with `dotnet restore` on the owning project.
 

@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Ipc;
+using LLMW.Writing.Application.Editor;
 using LLMW.Writing.Contracts.Editor;
 using LLMW.Writing.Contracts.Ipc;
 
@@ -19,6 +20,8 @@ internal interface IEditorCoreClient
     Task<GetDraftEditorSessionStateResponse> GetStateAsync(string editorSessionId, CancellationToken cancellationToken);
 
     Task ReleaseAsync(string editorSessionId, CancellationToken cancellationToken);
+
+    Task<string> DownloadLogicalTextAsync(string editorSessionId, string expectedPersistedDigest, CancellationToken cancellationToken);
 
     Task<IpcBlobRef> UploadAsync(
         string editorSessionId,
@@ -93,6 +96,51 @@ internal sealed class IpcEditorCoreClient : IEditorCoreClient
                 cancellationToken,
                 _projectId)
             .ConfigureAwait(false);
+    }
+
+    public async Task<string> DownloadLogicalTextAsync(string editorSessionId, string expectedPersistedDigest, CancellationToken cancellationToken)
+    {
+        var begin = await _session.RequestAsync(
+                IpcSemanticTypes.BeginEditorContentDownload,
+                new BeginEditorContentDownloadRequest(editorSessionId, expectedPersistedDigest),
+                IpcJsonContext.Default.BeginEditorContentDownloadRequestEnvelope,
+                IpcJsonContext.Default.BeginEditorContentDownloadResponseEnvelope,
+                cancellationToken,
+                _projectId)
+            .ConfigureAwait(false);
+        var bytes = new byte[begin.Payload.DeclaredUtf8Length];
+        for (var index = 0; index < begin.Payload.ChunkCount; index++)
+        {
+            var chunk = await _session.RequestAsync(
+                    IpcSemanticTypes.EditorContentDownloadChunk,
+                    new EditorContentDownloadChunkRequest(begin.Payload.DownloadId, index),
+                    IpcJsonContext.Default.EditorContentDownloadChunkRequestEnvelope,
+                    IpcJsonContext.Default.EditorContentDownloadChunkResponseEnvelope,
+                    cancellationToken,
+                    _projectId)
+                .ConfigureAwait(false);
+            var decoded = Convert.FromBase64String(chunk.Payload.DataBase64);
+            var offset = index * begin.Payload.MaxChunkBytes;
+            if (chunk.Payload.ChunkIndex != index || decoded.Length > begin.Payload.MaxChunkBytes || offset + decoded.Length > bytes.Length)
+            {
+                throw new InvalidOperationException("Core returned an invalid document-content chunk.");
+            }
+
+            decoded.CopyTo(bytes, offset);
+        }
+
+        if (!StringComparer.Ordinal.Equals(ContentDigest.Sha256Hex(bytes), begin.Payload.DeclaredSha256))
+        {
+            throw new InvalidOperationException("Core document-content digest verification failed.");
+        }
+
+        var text = TextDocumentCodec.TryDecode(bytes);
+        if (!text.Succeeded)
+        {
+            throw new InvalidOperationException(text.ErrorCode);
+        }
+
+        return text.Value!.LogicalText;
     }
 
     public async Task<IpcBlobRef> UploadAsync(
