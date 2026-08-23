@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <PackageId>LibGit2Sharp.NativeBinaries</PackageId>
+    <!-- 2.0.324 is kept because LibGit2Sharp 0.32.0 pins this exact package ID/version. -->
+    <Version>2.0.324</Version>
+    <Authors>LLMW.Writing Infrastructure maintainers</Authors>
+    <Description>Controlled Windows x64 libgit2 1.9.6 runtime for LibGit2Sharp 0.32.0.</Description>
+    <PackageLicenseExpression>GPL-2.0-only</PackageLicenseExpression>
+    <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/libgit2/libgit2</RepositoryUrl>
+    <RepositoryCommit>v1.9.6</RepositoryCommit>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+    <NoBuild>true</NoBuild>
+    <NoWarn>$(NoWarn);NU5128</NoWarn>
+    <NativeAssetDirectory Condition="'$(NativeAssetDirectory)' == ''">$(MSBuildThisFileDirectory)..\staging\windows</NativeAssetDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="assets\LibGit2Sharp.NativeBinaries.props" Pack="true" PackagePath="build\LibGit2Sharp.NativeBinaries.props" />
+    <None Include="assets\LibGit2Sharp.NativeBinaries.props" Pack="true" PackagePath="buildMultiTargeting\LibGit2Sharp.NativeBinaries.props" />
+    <None Include="assets\native-runtime-notice.txt" Pack="true" PackagePath="libgit2\native-runtime-notice.txt" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="$(NativeAssetDirectory)\git2.dll" Pack="true" PackagePath="runtimes\win-x64\native\git2-5853918.dll" />
+  </ItemGroup>
+</Project>

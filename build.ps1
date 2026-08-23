@@ -14,6 +14,10 @@ $repositoryRoot = $PSScriptRoot
 $solutionPath = Join-Path $repositoryRoot 'LLMW.Writing.sln'
 $webEditorManifest = Join-Path $repositoryRoot 'src\web-editor\package.json'
 $nuGetConfigPath = Join-Path $repositoryRoot 'NuGet.Config'
+# The internal LibGit2Sharp.NativeBinaries package deliberately shadows the upstream
+# compatibility version. A repository-local cache makes restore provenance deterministic
+# even when a developer previously cached the upstream package under the same version.
+$env:NUGET_PACKAGES = Join-Path $repositoryRoot '.artifacts\nuget-packages-wp19-native-8099'
 
 function Invoke-CheckedCommand {
     param(

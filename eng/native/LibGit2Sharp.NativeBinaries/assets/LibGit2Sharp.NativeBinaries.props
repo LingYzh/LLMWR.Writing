@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <!-- LibGit2Sharp 0.32.0 binds to this fixed native library basename. -->
+    <libgit2_propsfile>$(MSBuildThisFileFullPath)</libgit2_propsfile>
+    <libgit2_hash>llmw-wp19-libgit2-1.9.6</libgit2_hash>
+    <libgit2_filename>git2-5853918</libgit2_filename>
+  </PropertyGroup>
+</Project>

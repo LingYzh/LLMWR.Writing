@@ -9,6 +9,17 @@
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" />
     <PackageReference Include="DocumentFormat.OpenXml" />
+    <PackageReference Include="LibGit2Sharp" />
+    <PackageReference Include="LibGit2Sharp.NativeBinaries" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The package is referenced only here. These are propagated as project content to the
+         Core composition root and test executables; no renderer/UI project references native Git. -->
+    <Content Include="$(NuGetPackageRoot)\libgit2sharp.nativebinaries\2.0.324\runtimes\win-x64\native\*.dll"
+             Link="%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
