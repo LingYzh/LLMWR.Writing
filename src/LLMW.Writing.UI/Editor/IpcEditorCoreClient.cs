@@ -34,6 +34,13 @@ internal interface IEditorCoreClient
         string saveOperationId,
         string expectedPersistedDigest,
         IpcBlobRef content,
+        HistoryCheckpointTriggerKind checkpointTrigger,
+        CancellationToken cancellationToken);
+
+    Task<RestoreHistoryEntryResponse> RestoreHistoryAsync(
+        string historyId,
+        string editorSessionId,
+        string expectedPersistedDigest,
         CancellationToken cancellationToken);
 }
 
@@ -198,13 +205,31 @@ internal sealed class IpcEditorCoreClient : IEditorCoreClient
         string saveOperationId,
         string expectedPersistedDigest,
         IpcBlobRef content,
+        HistoryCheckpointTriggerKind checkpointTrigger,
         CancellationToken cancellationToken)
     {
         var response = await _session.RequestAsync(
                 IpcSemanticTypes.SaveDraftEditorSession,
-                new SaveDraftEditorSessionRequest(editorSessionId, saveOperationId, expectedPersistedDigest, content),
+                new SaveDraftEditorSessionRequest(editorSessionId, saveOperationId, expectedPersistedDigest, content, checkpointTrigger),
                 IpcJsonContext.Default.SaveDraftEditorSessionRequestEnvelope,
                 IpcJsonContext.Default.SaveDraftEditorSessionResponseEnvelope,
+                cancellationToken,
+                _projectId)
+            .ConfigureAwait(false);
+        return response.Payload;
+    }
+
+    public async Task<RestoreHistoryEntryResponse> RestoreHistoryAsync(
+        string historyId,
+        string editorSessionId,
+        string expectedPersistedDigest,
+        CancellationToken cancellationToken)
+    {
+        var response = await _session.RequestAsync(
+                IpcSemanticTypes.RestoreHistoryEntry,
+                new RestoreHistoryEntryRequest(historyId, editorSessionId, expectedPersistedDigest),
+                IpcJsonContext.Default.RestoreHistoryEntryRequestEnvelope,
+                IpcJsonContext.Default.RestoreHistoryEntryResponseEnvelope,
                 cancellationToken,
                 _projectId)
             .ConfigureAwait(false);

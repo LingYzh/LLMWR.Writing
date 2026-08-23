@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Editor;
+using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Application.Runtime;
@@ -148,12 +149,16 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
                 var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
                 var draftStore = new DraftFileStore(pathResolver, new SelfWriteTracker());
+                var localHistory = new LocalHistoryService(
+                    blobStore,
+                    new FileLocalHistoryMetadataStore(pathResolver));
                 var editor = new EditorRuntime(
                     bind.ProjectId.ToString("D"),
                     draftStore,
                     blobStore,
                     EditorSaveFaultEnvironment.FromEnvironment(),
-                    new OpenXmlDocxDocumentAdapter());
+                    new OpenXmlDocxDocumentAdapter(),
+                    localHistory);
                 editors.PublishOnce(editor);
                 publishedEditor = editor;
                 wp13.RecoverBackgroundTasks();

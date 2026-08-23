@@ -95,6 +95,7 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
             IpcSemanticTypes.EditorContentUploadChunk => Chunk(runtime, context),
             IpcSemanticTypes.CommitEditorContentUpload => Commit(runtime, context),
             IpcSemanticTypes.SaveDraftEditorSession => Save(runtime, context),
+            IpcSemanticTypes.RestoreHistoryEntry => RestoreHistory(runtime, context),
             _ => Error(context, IpcErrorCodes.CommandUnavailable, "Unknown editor command.")
         };
     }
@@ -193,6 +194,20 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
         }
     }
 
+    private IpcApplicationCommandResult RestoreHistory(EditorRuntime runtime, IpcApplicationCommandContext context)
+    {
+        var request = IpcJson.DeserializePayload(context.Payload, IpcJsonContext.Default.RestoreHistoryEntryRequest);
+        var result = runtime.RestoreHistory(
+            context.Principal!,
+            context.ConnectionId,
+            context.EnvelopeProjectId?.ToString("D"),
+            request,
+            context.CancellationToken);
+        return result.Succeeded
+            ? Ok(context, result.Value!, IpcJsonContext.Default.RestoreHistoryEntryResponseEnvelope)
+            : Error(context, result.ErrorCode!, Safe(result.ErrorCode!));
+    }
+
     private IpcApplicationCommandResult Ok<T>(
         IpcApplicationCommandContext context,
         T payload,
@@ -231,7 +246,8 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
         IpcSemanticTypes.BeginEditorContentUpload or
         IpcSemanticTypes.EditorContentUploadChunk or
         IpcSemanticTypes.CommitEditorContentUpload or
-        IpcSemanticTypes.SaveDraftEditorSession;
+        IpcSemanticTypes.SaveDraftEditorSession or
+        IpcSemanticTypes.RestoreHistoryEntry;
 
     private static string Safe(string code) => code switch
     {
@@ -245,6 +261,10 @@ public sealed class Wp16IpcCommandHandler : IIpcApplicationCommandHandler
         IpcErrorCodes.EditorSaveIdentityConflict => "The save operation identity does not match prior content.",
         IpcErrorCodes.EditorSessionInvalid => "The editor session is not valid.",
         IpcErrorCodes.EditorUploadInvalid => "The editor upload is invalid.",
+        IpcErrorCodes.HistoryRestoreConflict => "The Draft changed since the selected history base.",
+        IpcErrorCodes.HistoryEntryNotFound => "The selected local-history entry does not exist.",
+        IpcErrorCodes.HistoryEntryInvalid => "The selected local-history entry is not valid for this Draft.",
+        IpcErrorCodes.HistoryStorageFailure => "The local-history entry could not be verified.",
         _ => "The editor command was denied."
     };
 }

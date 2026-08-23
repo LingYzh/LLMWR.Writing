@@ -14,6 +14,8 @@
             <TextBox x:Name="DraftFileBox" Width="140" PlaceholderText="chapter.md" />
             <Button x:Name="OpenDraftButton" Content="Open draft" Click="OnOpenDraftClick" />
             <Button x:Name="SaveButton" Content="Save" Click="OnSaveClick" />
+            <TextBox x:Name="HistoryIdBox" Width="220" PlaceholderText="local history id" />
+            <Button x:Name="RestoreHistoryButton" Content="Restore history" Click="OnRestoreHistoryClick" />
             <Button x:Name="RestoreButton" Content="Restore" Click="OnRestoreClick" />
             <Button x:Name="DiscardButton" Content="Discard" Click="OnDiscardClick" />
         </StackPanel>

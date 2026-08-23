@@ -72,9 +72,16 @@ public sealed record SearchNarrativeHit(
 
 public sealed record SearchNarrativeResponse(SearchNarrativeHit[] Hits);
 
-public sealed record RestoreHistoryEntryRequest(string HistoryId);
+public sealed record RestoreHistoryEntryRequest(
+    string HistoryId,
+    string EditorSessionId,
+    string ExpectedPersistedDigest);
 
-public sealed record RestoreHistoryEntryResponse(string HistoryId, bool Restored);
+public sealed record RestoreHistoryEntryResponse(
+    string HistoryId,
+    string PersistedDigest,
+    long PersistedRevision,
+    bool Restored);
 
 public sealed record ActivateExtensionRequest(string ExtensionId);
 

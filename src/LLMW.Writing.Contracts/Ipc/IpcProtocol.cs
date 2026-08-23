@@ -235,6 +235,10 @@ public static class IpcErrorCodes
     public const string EditorRecoveryAvailable = "EDITOR_RECOVERY_AVAILABLE";
     public const string EditorRecoveryBaseChanged = "EDITOR_RECOVERY_BASE_CHANGED";
     public const string EditorSaveOutcomeUnknown = "EDITOR_SAVE_OUTCOME_UNKNOWN";
+    public const string HistoryEntryNotFound = "HISTORY_ENTRY_NOT_FOUND";
+    public const string HistoryEntryInvalid = "HISTORY_ENTRY_INVALID";
+    public const string HistoryRestoreConflict = "HISTORY_RESTORE_CONFLICT";
+    public const string HistoryStorageFailure = "HISTORY_STORAGE_FAILURE";
     public const string DocxMalformedPackage = "DOCX_MALFORMED_PACKAGE";
     public const string DocxMalformedXml = "DOCX_MALFORMED_XML";
     public const string DocxUnsupportedFeature = "DOCX_UNSUPPORTED_FEATURE";

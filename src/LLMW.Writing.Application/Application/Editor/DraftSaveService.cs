@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Authority;
+using LLMW.Writing.Application.History;
 using LLMW.Writing.Contracts.Editor;
 using LLMW.Writing.Contracts.Ipc;
 
@@ -17,6 +18,7 @@ public sealed class DraftSaveService
     private readonly EditorLeaseCoordinator leases;
     private readonly IDocxDocumentAdapter docx;
     private readonly IEditorSaveFaultInjector faults;
+    private readonly LocalHistoryService? history;
     private readonly Dictionary<string, CompletedSave> completed = new(StringComparer.Ordinal);
     private readonly object gate = new();
 
@@ -25,13 +27,15 @@ public sealed class DraftSaveService
         IImmutableBlobStore blobs,
         EditorLeaseCoordinator leases,
         IDocxDocumentAdapter? docx = null,
-        IEditorSaveFaultInjector? faults = null)
+        IEditorSaveFaultInjector? faults = null,
+        LocalHistoryService? history = null)
     {
         this.files = files ?? throw new ArgumentNullException(nameof(files));
         this.blobs = blobs ?? throw new ArgumentNullException(nameof(blobs));
         this.leases = leases ?? throw new ArgumentNullException(nameof(leases));
         this.docx = docx ?? UnavailableDocxDocumentAdapter.Instance;
         this.faults = faults ?? NoEditorSaveFaultInjector.Instance;
+        this.history = history;
     }
 
     public EditorResult<SaveDraftEditorSessionResponse> Save(
@@ -40,11 +44,17 @@ public sealed class DraftSaveService
         string saveOperationId,
         string expectedPersistedDigest,
         IpcBlobRef content,
+        HistoryCheckpointTriggerKind checkpointTrigger,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(session);
         ArgumentNullException.ThrowIfNull(content);
         if (string.IsNullOrWhiteSpace(saveOperationId) || !ContentDigest.IsSha256Hex(expectedPersistedDigest))
+        {
+            return EditorResult<SaveDraftEditorSessionResponse>.Fail(IpcErrorCodes.EditorUploadInvalid);
+        }
+
+        if (!Enum.IsDefined(checkpointTrigger))
         {
             return EditorResult<SaveDraftEditorSessionResponse>.Fail(IpcErrorCodes.EditorUploadInvalid);
         }
@@ -155,6 +165,7 @@ public sealed class DraftSaveService
                 written.Value!.Digest,
                 session.LastPersistedRevision + 1,
                 false);
+            CaptureHistory(session, expectedPersistedDigest, written.Value.Bytes, checkpointTrigger, cancellationToken);
             lock (gate)
             {
                 completed[identityKey] = new CompletedSave(saveOperationId, contentDigest, expectedPersistedDigest, response);
@@ -163,6 +174,31 @@ public sealed class DraftSaveService
             faults.ThrowIf(EditorSaveFaultPoint.BeforeIpcResponse);
             return EditorResult<SaveDraftEditorSessionResponse>.Ok(response);
         });
+    }
+
+    private void CaptureHistory(
+        EditorSession session,
+        string baseDigest,
+        byte[] content,
+        HistoryCheckpointTriggerKind trigger,
+        CancellationToken cancellationToken)
+    {
+        if (history is null)
+        {
+            return;
+        }
+
+        // Draft durability already succeeded. Local-history metadata is recovery support and
+        // must never turn that completed Draft save into an ambiguous overwrite outcome.
+        _ = history.Capture(
+            new LocalHistoryCheckpoint(
+                session.ProjectId,
+                HistoryDocumentIdentity.From(session.Document),
+                session.EditorSessionId,
+                baseDigest,
+                content,
+                trigger),
+            cancellationToken);
     }
 
     private static string ToError(DocxDocumentFailure failure) => failure switch
