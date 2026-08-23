@@ -242,6 +242,36 @@ public sealed class EditorContentUploadService
         }
     }
 
+    internal bool IsCommittedForSave(
+        string editorSessionId,
+        string connectionId,
+        string saveOperationId,
+        IpcBlobRef content)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(editorSessionId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(connectionId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(saveOperationId);
+        ArgumentNullException.ThrowIfNull(content);
+        if (!ContentDigest.IsSha256Hex(content.Digest)
+            || content.Size < 0
+            || !StringComparer.Ordinal.Equals(content.Locator, "blob:" + ContentDigest.Normalize(content.Digest)))
+        {
+            return false;
+        }
+
+        var digest = ContentDigest.Normalize(content.Digest);
+        lock (gate)
+        {
+            return uploads.Values.Any(pending =>
+                pending.Committed
+                && StringComparer.Ordinal.Equals(pending.EditorSessionId, editorSessionId)
+                && StringComparer.Ordinal.Equals(pending.ConnectionId, connectionId)
+                && StringComparer.Ordinal.Equals(pending.SaveOperationId, saveOperationId)
+                && StringComparer.Ordinal.Equals(pending.DeclaredSha256, digest)
+                && pending.DeclaredUtf8Length == content.Size);
+        }
+    }
+
     private static int ExpectedChunkCount(int declaredUtf8Length)
     {
         if (declaredUtf8Length == 0)

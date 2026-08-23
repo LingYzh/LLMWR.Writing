@@ -269,13 +269,37 @@ public sealed class EditorRuntime
             return EditorResult<SaveDraftEditorSessionResponse>.Fail(session.ErrorCode!);
         }
 
-        var saved = saves.Save(
-            session.Value!,
-            connectionId,
-            request.SaveOperationId,
-            request.ExpectedPersistedDigest,
-            request.Content,
-            cancellationToken);
+        if (!uploads.IsCommittedForSave(
+                session.Value!.EditorSessionId,
+                connectionId,
+                request.SaveOperationId,
+                request.Content))
+        {
+            return EditorResult<SaveDraftEditorSessionResponse>.Fail(IpcErrorCodes.EditorUploadInvalid);
+        }
+
+        EditorResult<SaveDraftEditorSessionResponse> saved;
+        try
+        {
+            saved = saves.Save(
+                session.Value,
+                connectionId,
+                request.SaveOperationId,
+                request.ExpectedPersistedDigest,
+                request.Content,
+                cancellationToken);
+        }
+        catch (EditorSaveFaultInjectedException exception) when (exception.Point == EditorSaveFaultPoint.BeforeIpcResponse)
+        {
+            if (saves.TryGetCompleted(session.Value, request.SaveOperationId, out var completed))
+            {
+                session.Value.LastPersistedDigest = completed.PersistedDigest;
+                session.Value.LastPersistedRevision = completed.PersistedRevision;
+            }
+
+            throw;
+        }
+
         if (!saved.Succeeded)
         {
             return saved;

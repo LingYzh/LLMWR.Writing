@@ -26,6 +26,7 @@ internal static class Wp16ApplicationTests
         count += SavePreconditions();
         count += UploadAdversarial();
         count += SaveIdempotencyAndFaults();
+        count += SaveBindingAndUnknownOutcome();
         Console.WriteLine("WP16 application tests passed (" + count + ").");
         return count;
     }
@@ -126,7 +127,7 @@ internal static class Wp16ApplicationTests
         var runtime = new EditorRuntime(ProjectId, files, blobs);
         var opened = Must(runtime.Open(User, "conn-a", ProjectId, ChapterId, "chapter.md", true));
         var payload = TextDocumentCodec.EncodeUtf8NoBomLf("hello editor");
-        var blob = Stage(blobs, payload);
+        var blob = Upload(runtime, opened.EditorSessionId, "op-1", payload);
         var saved = Must(runtime.Save(
             User,
             "conn-a",
@@ -137,7 +138,11 @@ internal static class Wp16ApplicationTests
         var stale = runtime.Save(
             User,
             "conn-a",
-            new SaveDraftEditorSessionRequest(opened.EditorSessionId, "op-2", opened.LastPersistedDigest, blob),
+            new SaveDraftEditorSessionRequest(
+                opened.EditorSessionId,
+                "op-2",
+                opened.LastPersistedDigest,
+                Upload(runtime, opened.EditorSessionId, "op-2", payload)),
             CancellationToken.None);
         AssertEqual(IpcErrorCodes.EditorStaleBase, stale.ErrorCode, "stale base denied.");
         var wrongBlob = runtime.Save(
@@ -153,7 +158,11 @@ internal static class Wp16ApplicationTests
         var identity = runtime.Save(
             User,
             "conn-a",
-            new SaveDraftEditorSessionRequest(opened.EditorSessionId, "op-1", saved.PersistedDigest, Stage(blobs, "other"u8.ToArray())),
+            new SaveDraftEditorSessionRequest(
+                opened.EditorSessionId,
+                "op-1",
+                saved.PersistedDigest,
+                Upload(runtime, opened.EditorSessionId, "op-1", "other"u8.ToArray())),
             CancellationToken.None);
         AssertEqual(IpcErrorCodes.EditorSaveIdentityConflict, identity.ErrorCode, "same op different content.");
         var replay = Must(runtime.Save(
@@ -228,7 +237,11 @@ internal static class Wp16ApplicationTests
             runtime.Save(
                 User,
                 "conn-a",
-                new SaveDraftEditorSessionRequest(opened.EditorSessionId, "op-fault", opened.LastPersistedDigest, Stage(blobs, payload)),
+                new SaveDraftEditorSessionRequest(
+                    opened.EditorSessionId,
+                    "op-fault",
+                    opened.LastPersistedDigest,
+                    Upload(runtime, opened.EditorSessionId, "op-fault", payload)),
                 CancellationToken.None);
             throw new InvalidOperationException("pre-publish fault must throw.");
         }
@@ -241,11 +254,90 @@ internal static class Wp16ApplicationTests
         var saved = Must(runtime.Save(
             User,
             "conn-a",
-            new SaveDraftEditorSessionRequest(opened.EditorSessionId, "op-ok", opened.LastPersistedDigest, Stage(blobs, payload)),
+            new SaveDraftEditorSessionRequest(
+                opened.EditorSessionId,
+                "op-ok",
+                opened.LastPersistedDigest,
+                Upload(runtime, opened.EditorSessionId, "op-ok", payload)),
             CancellationToken.None));
         AssertEqual(ContentDigest.Sha256Hex(payload), files.Read("Draft/" + ChapterId + "/chapter.md").Value!.Digest, "post-publish new Draft.");
         _ = saved;
         return 3;
+    }
+
+    private static int SaveBindingAndUnknownOutcome()
+    {
+        var files = Seed();
+        var blobs = new MemoryEditorBlobStore();
+        var runtime = new EditorRuntime(ProjectId, files, blobs);
+        var first = Must(runtime.Open(User, "conn-a", ProjectId, ChapterId, "chapter.md", true));
+        var second = Must(runtime.Open(User, "conn-a", ProjectId, OtherChapter, "notes.txt", true));
+        var foreignPayload = "foreign-session"u8.ToArray();
+        var foreign = Upload(runtime, second.EditorSessionId, "op-foreign", foreignPayload);
+
+        var crossSession = runtime.Save(
+            User,
+            "conn-a",
+            new SaveDraftEditorSessionRequest(
+                first.EditorSessionId,
+                "op-target",
+                first.LastPersistedDigest,
+                foreign),
+            CancellationToken.None);
+        AssertEqual(IpcErrorCodes.EditorUploadInvalid, crossSession.ErrorCode, "BlobRef must stay bound to its editor session and save operation.");
+        AssertEqual("alpha", Encoding.UTF8.GetString(files.Read("Draft/" + ChapterId + "/chapter.md").Value!.Bytes), "Foreign BlobRef must not alter another Draft.");
+
+        var local = Upload(runtime, first.EditorSessionId, "op-upload", "local"u8.ToArray());
+        var wrongOperation = runtime.Save(
+            User,
+            "conn-a",
+            new SaveDraftEditorSessionRequest(
+                first.EditorSessionId,
+                "op-save",
+                first.LastPersistedDigest,
+                local),
+            CancellationToken.None);
+        AssertEqual(IpcErrorCodes.EditorUploadInvalid, wrongOperation.ErrorCode, "BlobRef must stay bound to its SaveOperationId.");
+
+        var faultFiles = Seed();
+        var faultBlobs = new MemoryEditorBlobStore();
+        var faults = new MutableEditorSaveFaultInjector { Fault = EditorSaveFaultPoint.BeforeIpcResponse };
+        var faultRuntime = new EditorRuntime(ProjectId, faultFiles, faultBlobs, faults);
+        var faultSession = Must(faultRuntime.Open(User, "conn-a", ProjectId, ChapterId, "chapter.md", true));
+        var published = "published-before-response"u8.ToArray();
+        try
+        {
+            faultRuntime.Save(
+                User,
+                "conn-a",
+                new SaveDraftEditorSessionRequest(
+                    faultSession.EditorSessionId,
+                    "op-unknown",
+                    faultSession.LastPersistedDigest,
+                    Upload(faultRuntime, faultSession.EditorSessionId, "op-unknown", published)),
+                CancellationToken.None);
+            throw new InvalidOperationException("post-publish response fault must throw.");
+        }
+        catch (EditorSaveFaultInjectedException exception) when (exception.Point == EditorSaveFaultPoint.BeforeIpcResponse)
+        {
+        }
+
+        var afterUnknown = Must(faultRuntime.GetState(User, "conn-a", faultSession.EditorSessionId));
+        AssertEqual(ContentDigest.Sha256Hex(published), afterUnknown.LastPersistedDigest, "Core query must observe the published bytes after an unknown response outcome.");
+        AssertEqual(2L, afterUnknown.LastPersistedRevision, "Core session revision must advance after a known publish even when the response is lost.");
+        faults.Fault = EditorSaveFaultPoint.None;
+        var nextPayload = "next"u8.ToArray();
+        var next = Must(faultRuntime.Save(
+            User,
+            "conn-a",
+            new SaveDraftEditorSessionRequest(
+                faultSession.EditorSessionId,
+                "op-next",
+                afterUnknown.LastPersistedDigest,
+                Upload(faultRuntime, faultSession.EditorSessionId, "op-next", nextPayload)),
+            CancellationToken.None));
+        AssertEqual(3L, next.PersistedRevision, "The next save must not reuse the lost-response revision.");
+        return 6;
     }
 
     private static MemoryDraftFileStore Seed()
@@ -256,11 +348,35 @@ internal static class Wp16ApplicationTests
         return files;
     }
 
-    private static IpcBlobRef Stage(MemoryEditorBlobStore blobs, byte[] payload)
+    private static IpcBlobRef Upload(EditorRuntime runtime, string editorSessionId, string saveOperationId, byte[] payload)
     {
-        using var stream = new MemoryStream(payload, writable: false);
-        var staged = blobs.Stage(stream);
-        return new IpcBlobRef(staged.Digest, staged.Length, "blob:" + staged.Digest);
+        var digest = ContentDigest.Sha256Hex(payload);
+        var begin = Must(runtime.BeginUpload(
+            User,
+            "conn-a",
+            new BeginEditorContentUploadRequest(editorSessionId, saveOperationId, payload.Length, digest)));
+        var count = payload.Length == 0
+            ? 0
+            : (payload.Length + begin.MaxChunkBytes - 1) / begin.MaxChunkBytes;
+        for (var index = 0; index < count; index++)
+        {
+            var offset = index * begin.MaxChunkBytes;
+            var length = Math.Min(begin.MaxChunkBytes, payload.Length - offset);
+            Must(runtime.UploadChunk(
+                User,
+                "conn-a",
+                new EditorContentUploadChunkRequest(
+                    begin.UploadId,
+                    index,
+                    count,
+                    Convert.ToBase64String(payload, offset, length))));
+        }
+
+        return Must(runtime.CommitUpload(
+            User,
+            "conn-a",
+            new CommitEditorContentUploadRequest(begin.UploadId),
+            CancellationToken.None)).BlobRef;
     }
 
     private static T Must<T>(EditorResult<T> result)

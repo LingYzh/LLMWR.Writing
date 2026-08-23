@@ -149,4 +149,24 @@ public sealed class DraftSaveService
             return EditorResult<SaveDraftEditorSessionResponse>.Ok(response);
         });
     }
+
+    internal bool TryGetCompleted(
+        EditorSession session,
+        string saveOperationId,
+        out SaveDraftEditorSessionResponse response)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentException.ThrowIfNullOrWhiteSpace(saveOperationId);
+        lock (gate)
+        {
+            if (completed.TryGetValue(session.EditorSessionId + ":" + saveOperationId, out var previous))
+            {
+                response = previous.Response;
+                return true;
+            }
+        }
+
+        response = default!;
+        return false;
+    }
 }
