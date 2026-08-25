@@ -31,6 +31,7 @@ internal static class Program
             Wp14ContractTests.Run();
             Wp16ContractTests.Run();
             Wp19GitContractTests.Run();
+            Wp20ProjectPackageContractTests.Run();
             Console.WriteLine("Contracts tests passed.");
             return 0;
         }

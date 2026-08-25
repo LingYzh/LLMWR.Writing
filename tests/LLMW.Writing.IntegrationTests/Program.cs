@@ -31,6 +31,7 @@ internal static partial class Program
             RunWp14Tests();
             await RunWp16TestsAsync();
             await RunWp17TestsAsync();
+            RunWp20Tests();
             await ReconnectsAfterCoreRestartAsync();
             Console.WriteLine("Integration tests passed.");
             return 0;
