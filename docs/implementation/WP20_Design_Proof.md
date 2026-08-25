@@ -1,8 +1,8 @@
 # WP20 Design Proof — Backup, Archive, and Final Package
 
-**Status:** WP20 EXECUTION PROOF  
-**Accepted base:** `1fab451a0d9c263f09c48221a30de785e12e7161` (`merge(wp19): integrate Git adapter watcher`)  
-**Branch:** `wp20-project-git-service`  
+**Status:** WP20 EXECUTION PROOF
+**Accepted base:** `1fab451a0d9c263f09c48221a30de785e12e7161` (`merge(wp19): integrate Git adapter watcher`)
+**Branch:** `wp20-project-git-service`
 **Does not own:** Final Acceptance FSM, Authority mutation semantics, schema v2, restore/import UX, migration orchestration, UI file-picker integration, WP21 activation/security, WP22 recovery/reconstruction.
 
 Precedence: Product FROZEN > Architecture FROZEN > Implementation Design > Test/Fault Plan > this proof > local detail.
