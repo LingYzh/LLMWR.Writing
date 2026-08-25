@@ -264,6 +264,14 @@ public static class IpcErrorCodes
     public const string PackageNotFound = "PACKAGE_NOT_FOUND";
     public const string PackageNotFinal = "PACKAGE_NOT_FINAL";
     public const string PackageVerificationFailed = "PACKAGE_VERIFICATION_FAILED";
+    public const string ExtensionProjectBindingInvalid = "EXTENSION_PROJECT_BINDING_INVALID";
+    public const string ExtensionMutationDenied = "EXTENSION_MUTATION_DENIED";
+    public const string ExtensionTrustRequired = "EXTENSION_TRUST_REQUIRED";
+    public const string ExtensionNotFound = "EXTENSION_NOT_FOUND";
+    public const string ExtensionInvalid = "EXTENSION_INVALID";
+    public const string ExtensionDependencyInactive = "EXTENSION_DEPENDENCY_INACTIVE";
+    public const string ExtensionOperationIdentityConflict = "EXTENSION_OPERATION_IDENTITY_CONFLICT";
+    public const string ExtensionStorageFailure = "EXTENSION_STORAGE_FAILURE";
 }
 
 public static class IpcServerCapabilities

@@ -27,6 +27,10 @@ public static class IpcSemanticTypes
     public const string SearchNarrative = "searchNarrative";
     public const string RestoreHistoryEntry = "restoreHistoryEntry";
     public const string ActivateExtension = "activateExtension";
+    public const string DeactivateExtension = "deactivateExtension";
+    public const string TrustProjectExtensions = "trustProjectExtensions";
+    public const string RevokeProjectExtensionsTrust = "revokeProjectExtensionsTrust";
+    public const string ListExtensions = "listExtensions";
     public const string LoadSchedulerSnapshot = "loadSchedulerSnapshot";
     public const string CreateWorkflowRun = "createWorkflowRun";
     public const string CreateRun = "createRun";
@@ -109,6 +113,10 @@ public static class IpcSemanticTypes
         SearchNarrative,
         RestoreHistoryEntry,
         ActivateExtension,
+        DeactivateExtension,
+        TrustProjectExtensions,
+        RevokeProjectExtensionsTrust,
+        ListExtensions,
         LoadSchedulerSnapshot,
         CreateWorkflowRun,
         CreateRun,

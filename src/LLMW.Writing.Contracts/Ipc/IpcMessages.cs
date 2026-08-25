@@ -83,6 +83,37 @@ public sealed record RestoreHistoryEntryResponse(
     long PersistedRevision,
     bool Restored);
 
-public sealed record ActivateExtensionRequest(string ExtensionId);
+/// <summary>
+/// Path-free extension activation command. OperationId is a UUIDv7-shaped idempotency identity;
+/// the renderer cannot nominate a script, executable, filesystem target, or credential.
+/// </summary>
+public sealed record ActivateExtensionRequest(string ExtensionId, string OperationId);
 
-public sealed record ActivateExtensionResponse(string ExtensionId, bool Activated);
+public sealed record ActivateExtensionResponse(string ExtensionId, bool Activated, bool ProjectTrusted);
+
+public sealed record DeactivateExtensionRequest(string ExtensionId, string OperationId);
+
+public sealed record DeactivateExtensionResponse(string ExtensionId, bool Activated, bool ProjectTrusted);
+
+public sealed record TrustProjectExtensionsRequest(string OperationId);
+
+public sealed record TrustProjectExtensionsResponse(bool ProjectTrusted);
+
+public sealed record RevokeProjectExtensionsTrustRequest(string OperationId);
+
+public sealed record RevokeProjectExtensionsTrustResponse(bool ProjectTrusted);
+
+public sealed record ListExtensionsRequest();
+
+public sealed record ExtensionStatusResponse(
+    string ExtensionId,
+    string Kind,
+    string Scope,
+    string Version,
+    bool Activated,
+    bool Invalidated);
+
+public sealed record ListExtensionsResponse(
+    bool ProjectTrusted,
+    ExtensionStatusResponse[] Extensions,
+    string[] Diagnostics);

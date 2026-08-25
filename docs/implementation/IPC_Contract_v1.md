@@ -76,6 +76,21 @@ v1 `serverCapabilities`: `heartbeat`, `multiplex`, `snapshot`, `cancel`, `events
 
 `XxxRequest/XxxResponse/XxxEvent`; one-to-one with public Core command/query. Initial set includes OpenProject, GetProjectState, SubmitCandidate, CancelSubmission, AcceptAuthority, ApplyNarrativeChangeSet, RegisterProjectFile, ReconcileRegistryEntry, SearchNarrative, RestoreHistoryEntry, ActivateExtension, CreateRunSession, RevokeRunSession.
 
+### WP21 extension activation commands
+
+`listExtensions`, `trustProjectExtensions`, `revokeProjectExtensionsTrust`,
+`activateExtension`, and `deactivateExtension` are authenticated native-UI commands only. All
+mutations require a matching open Project envelope binding and UUID operation identity. The trust
+commands have no extension identity; activation/deactivation carry only a stable extension ID and
+operation ID. None carries a project filesystem path, script/command, MCP endpoint/transport,
+credential, token, or secret. They are business mutations and therefore are **not** automatic
+replay candidates after reconnect.
+
+Project Trust and activation are distinct: activation fails until an explicit trusted UI command
+has established trust, and revoking trust deactivates every active extension. Discovery/listing is
+metadata-only and never launches project content. Content digest changes invalidate activation
+before any eventual executable/MCP use.
+
 WP11 transport additions: GetStateSnapshot, SubscribeEvents, Cancel, GapEvent, CoreNoticeEvent.
 
 WP12 Runtime scheduler additions: LoadSchedulerSnapshot, CreateWorkflowRun, CreateRun, CreateTask, DispatchReadyTask, CancelRuntimeScope, RetryTask, PersistCheckpoint, ClassifyResume, LaunchRunWorker, ReleaseRunWorker, ReconcileRunWorkers, SpawnChildRun.
