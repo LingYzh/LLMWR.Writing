@@ -1,4 +1,5 @@
 using System.Text.Json;
+using LLMW.Writing.Application.Extensions;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
@@ -23,6 +24,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
     private readonly IRuntimeGrillSafetyEvaluator grillSafety;
     private readonly IToolCallCancellationPort toolCancellation;
     private readonly IRuntimeLinearizationBarrier linearization;
+    private readonly IAgentExtensionFreshnessSource extensionFreshness;
 
     public Wp13RuntimeService(
         IRuntimePersistence store,
@@ -36,7 +38,8 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         IPendingApprovalSafetyEvaluator? pendingSafety = null,
         IRuntimeGrillSafetyEvaluator? grillSafety = null,
         IToolCallCancellationPort? toolCancellation = null,
-        IRuntimeLinearizationBarrier? linearization = null)
+        IRuntimeLinearizationBarrier? linearization = null,
+        IAgentExtensionFreshnessSource? extensionFreshness = null)
     {
         this.store = store ?? throw new ArgumentNullException(nameof(store));
         this.scheduler = scheduler ?? throw new ArgumentNullException(nameof(scheduler));
@@ -62,6 +65,7 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         this.grillSafety = grillSafety ?? FailClosedRuntimeGrillSafetyEvaluator.Instance;
         this.toolCancellation = toolCancellation ?? UnavailableToolCallCancellationPort.Instance;
         this.linearization = linearization ?? NoRuntimeLinearizationBarrier.Instance;
+        this.extensionFreshness = extensionFreshness ?? NoAgentExtensionFreshnessSource.Instance;
     }
 
     public EffectiveOversightPolicy Resolve(string? projectId, string? storylineId, string? taskId)
@@ -1804,8 +1808,10 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
             new Dictionary<string, string>(StringComparer.Ordinal),
             run?.PromptConfigId,
             run?.EffectivePromptDigest,
-            null,
-            new Dictionary<string, string>(StringComparer.Ordinal),
+            current.GetValueOrDefault("agentsDigest"),
+            current
+                .Where(pair => pair.Key.StartsWith("skill:", StringComparison.Ordinal))
+                .ToDictionary(pair => pair.Key["skill:".Length..], pair => pair.Value, StringComparer.Ordinal),
             run?.ProviderId,
             run?.ModelId,
             required,
@@ -1840,6 +1846,17 @@ public sealed class Wp13RuntimeService : IEffectiveOversightSource, IDelegatedDe
         if (!string.IsNullOrWhiteSpace(run?.ModelId))
         {
             values["modelId"] = run.ModelId;
+        }
+
+        var extensionInputs = extensionFreshness.GetCurrent();
+        if (!string.IsNullOrWhiteSpace(extensionInputs.AgentsDigest))
+        {
+            values["agentsDigest"] = extensionInputs.AgentsDigest;
+        }
+
+        foreach (var skill in extensionInputs.SkillDigests.OrderBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            values["skill:" + skill.Key] = skill.Value;
         }
 
         if (string.IsNullOrWhiteSpace(taskId))

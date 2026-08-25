@@ -589,6 +589,7 @@ public static class ResumeClassifier
         if (CheckpointBaselineDiffers(retained, "authorityRevision", inputs.AuthorityRevision) ||
             CheckpointBaselineDiffers(retained, "promptConfigId", inputs.PromptConfigId) ||
             CheckpointBaselineDiffers(retained, "effectivePromptDigest", inputs.EffectivePromptDigest) ||
+            CheckpointBaselineDiffers(retained, "agentsDigest", inputs.AgentsDigest) ||
             CheckpointBaselineDiffers(retained, "providerId", inputs.ProviderId) ||
             CheckpointBaselineDiffers(retained, "modelId", inputs.ModelId))
         {
@@ -609,6 +610,31 @@ public static class ResumeClassifier
             var key = "artifact:" + pair.Key;
             if (!retained.TryGetValue(key, out var previous) ||
                 !StringComparer.Ordinal.Equals(previous, pair.Value))
+            {
+                return true;
+            }
+        }
+
+        foreach (var pair in inputs.SkillDigests)
+        {
+            var key = "skill:" + pair.Key;
+            if (!retained.TryGetValue(key, out var previous) ||
+                !StringComparer.Ordinal.Equals(previous, pair.Value))
+            {
+                return true;
+            }
+        }
+
+        foreach (var pair in retained)
+        {
+            if (!pair.Key.StartsWith("skill:", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var id = pair.Key["skill:".Length..];
+            if (!inputs.SkillDigests.TryGetValue(id, out var current) ||
+                !StringComparer.Ordinal.Equals(current, pair.Value))
             {
                 return true;
             }

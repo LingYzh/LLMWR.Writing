@@ -250,14 +250,14 @@ internal static class Wp11ContractTests
             "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"restoreHistoryEntry\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"historyId\":\"018f3e78-1234-7abc-8def-0123456789a1\",\"persistedDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"persistedRevision\":2,\"restored\":true}}");
 
         AssertGolden(
-            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.ActivateExtension, new ActivateExtensionRequest("ext-1")),
+            Program.Envelope(IpcMessageType.Request, IpcSemanticTypes.ActivateExtension, new ActivateExtensionRequest("ext-1", "018f3e78-1234-7abc-8def-0123456789ae")),
             IpcJsonContext.Default.ActivateExtensionRequestEnvelope,
-            "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"activateExtension\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"extensionId\":\"ext-1\"}}");
+            "{\"protocolVersion\":1,\"messageType\":\"request\",\"semanticType\":\"activateExtension\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"extensionId\":\"ext-1\",\"operationId\":\"018f3e78-1234-7abc-8def-0123456789ae\"}}");
 
         AssertGolden(
-            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.ActivateExtension, new ActivateExtensionResponse("ext-1", false)),
+            Program.Envelope(IpcMessageType.Response, IpcSemanticTypes.ActivateExtension, new ActivateExtensionResponse("ext-1", false, false)),
             IpcJsonContext.Default.ActivateExtensionResponseEnvelope,
-            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"activateExtension\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"extensionId\":\"ext-1\",\"activated\":false}}");
+            "{\"protocolVersion\":1,\"messageType\":\"response\",\"semanticType\":\"activateExtension\",\"requestId\":\"018f3e78-1234-7abc-8def-0123456789ab\",\"correlationId\":\"018f3e78-1234-7abc-8def-0123456789ac\",\"projectId\":\"018f3e78-1234-7abc-8def-0123456789ad\",\"workspaceInstanceId\":\"workspace-01\",\"timestampMs\":1735689600000,\"payload\":{\"extensionId\":\"ext-1\",\"activated\":false,\"projectTrusted\":false}}");
     }
 
     private static void OptionalExpiresAtMsIsOmittedAndUnknownFieldsAreIgnored()

@@ -303,6 +303,23 @@ internal static partial class Program
             "ModelId change vs checkpoint baseline must REPLAN.");
         AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, checkpoint, matching with { EffectivePromptDigest = "E2" }).Kind,
             "EffectivePromptDigest change vs checkpoint baseline must REPLAN.");
+        var extensionCheckpoint = checkpoint with
+        {
+            InputDigestSetJson = """{"agentsDigest":"agents-v1","skill:writer":"skill-v1"}"""
+        };
+        var extensionInputs = matching with
+        {
+            AgentsDigest = "agents-v1",
+            SkillDigests = new Dictionary<string, string> { ["writer"] = "skill-v1" }
+        };
+        AssertEqual(ResumeDecisionKind.Continue, ResumeClassifier.Classify(run, extensionCheckpoint, extensionInputs).Kind,
+            "Matching AGENTS/Skill digests must CONTINUE.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, extensionCheckpoint, extensionInputs with { AgentsDigest = "agents-v2" }).Kind,
+            "Changed AGENTS content must stale an active Run.");
+        AssertEqual(ResumeDecisionKind.Replan, ResumeClassifier.Classify(run, extensionCheckpoint, extensionInputs with
+        {
+            SkillDigests = new Dictionary<string, string> { ["writer"] = "skill-v2" }
+        }).Kind, "Changed activated Skill content must stale an active Run.");
         var later = checkpoint with { CheckpointId = "cp-2", CreatedAtMs = 20, InputDigestSetJson = "{}" };
         AssertEqual(ResumeDecisionKind.Continue, ResumeClassifier.Classify(run, checkpoint, matching).Kind,
             "An unrelated later checkpoint must not replace CP1 as the comparison baseline.");

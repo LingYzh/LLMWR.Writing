@@ -1,4 +1,5 @@
 using LLMW.Writing.Application.Editor;
+using LLMW.Writing.Application.Extensions;
 using LLMW.Writing.Application.Git;
 using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Ipc;
@@ -13,6 +14,7 @@ using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Git;
 using LLMW.Writing.Infrastructure.Docx;
+using LLMW.Writing.Infrastructure.Extensions;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.ProjectPackages;
 using LLMW.Writing.Infrastructure.Sandbox;
@@ -35,6 +37,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
     private readonly EditorRuntimeHolder editors;
     private readonly GitProjectServiceHolder gitProjects;
     private readonly ProjectPackageServiceHolder packages;
+    private readonly ExtensionActivationServiceHolder extensions;
     // Project lifetime ownership. The watcher is deliberately not owned by an EditorSession.
     private ProjectWatcherBatcher? projectWatcher;
     private IDisposable? projectWatcherSubscription;
@@ -53,7 +56,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
         ProjectRunSessionServiceHolder runSessions,
         EditorRuntimeHolder editors,
         GitProjectServiceHolder gitProjects,
-        ProjectPackageServiceHolder packages)
+        ProjectPackageServiceHolder packages,
+        ExtensionActivationServiceHolder extensions)
     {
         this.commands = commands;
         this.bindings = bindings;
@@ -66,6 +70,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
         this.editors = editors;
         this.gitProjects = gitProjects;
         this.packages = packages;
+        this.extensions = extensions;
     }
 
     public Task<IpcApplicationCommandResult?> HandleAsync(IpcApplicationCommandContext context)
@@ -100,6 +105,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
             EditorRuntime? publishedEditor = null;
             GitProjectService? publishedGit = null;
             ProjectPackageService? publishedPackages = null;
+            ExtensionActivationService? publishedExtensions = null;
             ProjectWatcherBatcher? pendingWatcher = null;
             IDisposable? pendingWatcherSubscription = null;
             var runtimeBindingInstalled = false;
@@ -109,6 +115,24 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                 var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
                 var store = new SqliteRuntimeStore(bind.DatabasePath);
                 var sessions = new RunSessionService(sessionStore);
+                var extensionCatalog = new FileExtensionCatalog(new ExtensionCatalogRoots(
+                    Path.Combine(AppContext.BaseDirectory, "extensions"),
+                    Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "LLMW.Writing",
+                        "extensions"),
+                    Path.Combine(bind.CanonicalRoot, "Extensions"),
+                    bind.CanonicalRoot));
+                var extensionService = new ExtensionActivationService(
+                    extensionCatalog,
+                    new FileExtensionSecurityStateStore(
+                        Path.Combine(
+                            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                            "LLMW.Writing",
+                            "extension-security"),
+                        bind.ProjectId.ToString("D"),
+                        bind.CanonicalRoot),
+                    bind.ProjectId.ToString("D"));
                 var oversightBinder = new LateBoundOversightSource();
                 var authorization = new CoreAuthorizationService(oversightSource: oversightBinder);
                 var sandboxHost = CreateSandboxHost(bind.CanonicalRoot, scope);
@@ -148,7 +172,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                     new MemoryApplicationOversightDefaults(),
                     new FileUserSpecialistProfileStore(userLibraryRoot),
                     SyntheticBuiltInSpecialistCatalog.Instance,
-                    UnavailableSemanticCompletionEvaluator.Instance);
+                    UnavailableSemanticCompletionEvaluator.Instance,
+                    extensionFreshness: extensionService);
                 oversightBinder.Inner = wp13;
                 scheduler.OversightActivationListener = wp13;
 
@@ -168,7 +193,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                         workspaceInstanceId),
                     new Wp16IpcCommandHandler(editors, workspaceInstanceId),
                     new Wp19IpcCommandHandler(gitProjects, workspaceInstanceId),
-                    new Wp20IpcCommandHandler(packages, workspaceInstanceId));
+                    new Wp20IpcCommandHandler(packages, workspaceInstanceId),
+                    new Wp21IpcCommandHandler(extensions, workspaceInstanceId));
                 var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
                 var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
                 var selfWrites = new SelfWriteTracker();
@@ -204,6 +230,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                     bind.ProjectId.ToString("D"));
                 packages.PublishOnce(packageService);
                 publishedPackages = packageService;
+                extensions.PublishOnce(extensionService);
+                publishedExtensions = extensionService;
                 openedPackages = packageService;
                 dailyBackupTimer = new Timer(
                     static state => ((CoreOpenProjectHandler)state!).CreateAutomaticBackup(),
@@ -249,6 +277,11 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                 if (publishedPackages is not null)
                 {
                     packages.TryAbandon(publishedPackages);
+                }
+
+                if (publishedExtensions is not null)
+                {
+                    extensions.TryAbandon(publishedExtensions);
                 }
 
                 dailyBackupTimer?.Dispose();

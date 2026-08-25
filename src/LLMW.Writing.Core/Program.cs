@@ -1,5 +1,6 @@
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Git;
+using LLMW.Writing.Application.Extensions;
 using LLMW.Writing.Application.ProjectPackages;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Contracts.Ipc;
@@ -41,6 +42,7 @@ internal static class Program
         var editors = new EditorRuntimeHolder();
         var gitProjects = new GitProjectServiceHolder();
         var packages = new ProjectPackageServiceHolder();
+        var extensions = new ExtensionActivationServiceHolder();
         using var openProject = new CoreOpenProjectHandler(
             commands,
             bindings,
@@ -52,7 +54,8 @@ internal static class Program
             runSessions,
             editors,
             gitProjects,
-            packages);
+            packages,
+            extensions);
         commands.Inner = openProject;
 
         var uiOptions = new IpcServerOptions
