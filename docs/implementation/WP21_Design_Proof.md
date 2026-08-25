@@ -2,7 +2,7 @@
 
 **Status:** WP21 EXECUTION PROOF
 **Accepted base:** `1e19a8f` (`Merge pull request #8 from LingYzh/wp20-project-git-service`)
-**Branch:** `codex/wp21-activation-security`
+**Branch:** `wp21-activation-security`
 
 Precedence: Product FROZEN > Architecture FROZEN > Implementation Design > ADR > local implementation detail.
 
