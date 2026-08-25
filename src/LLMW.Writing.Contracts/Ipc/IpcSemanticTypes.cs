@@ -80,6 +80,10 @@ public static class IpcSemanticTypes
     public const string ListGitCommitHistory = "listGitCommitHistory";
     public const string GetGitCommitMetadata = "getGitCommitMetadata";
     public const string CommitGitChanges = "commitGitChanges";
+    public const string CreateProjectBackup = "createProjectBackup";
+    public const string CreateProjectArchive = "createProjectArchive";
+    public const string CreateFinalPackage = "createFinalPackage";
+    public const string VerifyFinalPackage = "verifyFinalPackage";
 
     private static readonly HashSet<string> Known = new(StringComparer.Ordinal)
     {
@@ -157,7 +161,11 @@ public static class IpcSemanticTypes
         GetGitCurrentBranch,
         ListGitCommitHistory,
         GetGitCommitMetadata,
-        CommitGitChanges
+        CommitGitChanges,
+        CreateProjectBackup,
+        CreateProjectArchive,
+        CreateFinalPackage,
+        VerifyFinalPackage
     };
 
     public static IReadOnlyCollection<string> All { get; } = Known.ToArray();

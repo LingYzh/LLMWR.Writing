@@ -3,6 +3,7 @@ using LLMW.Writing.Application.Git;
 using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Provider;
+using LLMW.Writing.Application.ProjectPackages;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
@@ -13,13 +14,14 @@ using LLMW.Writing.Infrastructure.FileSystem;
 using LLMW.Writing.Infrastructure.Git;
 using LLMW.Writing.Infrastructure.Docx;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
+using LLMW.Writing.Infrastructure.ProjectPackages;
 using LLMW.Writing.Infrastructure.Sandbox;
 using LLMW.Writing.Infrastructure.Specialists;
 using LLMW.Writing.Infrastructure.Watcher;
 
 namespace LLMW.Writing.Core;
 
-internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
+internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, IDisposable
 {
     private readonly object gate = new();
     private readonly MutableIpcCommandHandler commands;
@@ -32,9 +34,12 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
     private readonly ProjectRunSessionServiceHolder runSessions;
     private readonly EditorRuntimeHolder editors;
     private readonly GitProjectServiceHolder gitProjects;
+    private readonly ProjectPackageServiceHolder packages;
     // Project lifetime ownership. The watcher is deliberately not owned by an EditorSession.
     private ProjectWatcherBatcher? projectWatcher;
     private IDisposable? projectWatcherSubscription;
+    private Timer? dailyBackupTimer;
+    private ProjectPackageService? openedPackages;
     private bool opened;
 
     public CoreOpenProjectHandler(
@@ -47,7 +52,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         TrustedNativePrincipalSource nativeUi,
         ProjectRunSessionServiceHolder runSessions,
         EditorRuntimeHolder editors,
-        GitProjectServiceHolder gitProjects)
+        GitProjectServiceHolder gitProjects,
+        ProjectPackageServiceHolder packages)
     {
         this.commands = commands;
         this.bindings = bindings;
@@ -59,6 +65,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
         this.runSessions = runSessions;
         this.editors = editors;
         this.gitProjects = gitProjects;
+        this.packages = packages;
     }
 
     public Task<IpcApplicationCommandResult?> HandleAsync(IpcApplicationCommandContext context)
@@ -92,6 +99,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
             RunSessionService? published = null;
             EditorRuntime? publishedEditor = null;
             GitProjectService? publishedGit = null;
+            ProjectPackageService? publishedPackages = null;
             ProjectWatcherBatcher? pendingWatcher = null;
             IDisposable? pendingWatcherSubscription = null;
             var runtimeBindingInstalled = false;
@@ -159,7 +167,8 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                         new ProviderInvocationStateHandler(store, scheduler, authorization),
                         workspaceInstanceId),
                     new Wp16IpcCommandHandler(editors, workspaceInstanceId),
-                    new Wp19IpcCommandHandler(gitProjects, workspaceInstanceId));
+                    new Wp19IpcCommandHandler(gitProjects, workspaceInstanceId),
+                    new Wp20IpcCommandHandler(packages, workspaceInstanceId));
                 var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
                 var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
                 var selfWrites = new SelfWriteTracker();
@@ -181,6 +190,26 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                     new GitProjectBinding(bind.ProjectId.ToString("D"), bind.CanonicalRoot));
                 gitProjects.PublishOnce(git);
                 publishedGit = git;
+                var externalPackageRoot = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "LLMW.Writing",
+                    "backups",
+                    bind.ProjectId.ToString("D"));
+                var packageService = new ProjectPackageService(
+                    new ProjectPackageStore(
+                        bind.ProjectId.ToString("D"),
+                        bind.CanonicalRoot,
+                        bind.DatabasePath,
+                        externalPackageRoot),
+                    bind.ProjectId.ToString("D"));
+                packages.PublishOnce(packageService);
+                publishedPackages = packageService;
+                openedPackages = packageService;
+                dailyBackupTimer = new Timer(
+                    static state => ((CoreOpenProjectHandler)state!).CreateAutomaticBackup(),
+                    this,
+                    TimeSpan.FromDays(1),
+                    TimeSpan.FromDays(1));
                 var watcherDispatcher = new ProjectWatcherBatchDispatcher();
                 pendingWatcherSubscription = watcherDispatcher.Subscribe(batch =>
                 {
@@ -216,6 +245,15 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 {
                     gitProjects.TryAbandon(publishedGit);
                 }
+
+                if (publishedPackages is not null)
+                {
+                    packages.TryAbandon(publishedPackages);
+                }
+
+                dailyBackupTimer?.Dispose();
+                dailyBackupTimer = null;
+                openedPackages = null;
 
                 pendingWatcherSubscription?.Dispose();
                 pendingWatcher?.Dispose();
@@ -272,4 +310,47 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler
                 context.CorrelationId,
                 context.RequestId),
             IpcJsonContext.Default.ErrorEnvelope));
+
+    public void Dispose()
+    {
+        ProjectPackageService? packageService;
+        lock (gate)
+        {
+            dailyBackupTimer?.Dispose();
+            dailyBackupTimer = null;
+            packageService = openedPackages;
+            openedPackages = null;
+            projectWatcherSubscription?.Dispose();
+            projectWatcherSubscription = null;
+            projectWatcher?.Dispose();
+            projectWatcher = null;
+        }
+
+        if (packageService is not null)
+        {
+            CreateAutomaticBackup(packageService);
+        }
+    }
+
+    private void CreateAutomaticBackup() => CreateAutomaticBackup(Volatile.Read(ref openedPackages));
+
+    private static void CreateAutomaticBackup(ProjectPackageService? packageService)
+    {
+        if (packageService is null)
+        {
+            return;
+        }
+
+        var result = packageService.Create(
+            CallerPrincipal.CreateCoreInternal("core-project-backup"),
+            explicitlyUserInitiated: false,
+            new ProjectPackageRequest(
+                ProjectPackageKind.Backup,
+                packageService.ProjectId,
+                Guid.NewGuid().ToString("D")));
+        if (!result.Succeeded)
+        {
+            Console.Error.WriteLine("Automatic project backup was not published: " + result.Failure!.Code);
+        }
+    }
 }

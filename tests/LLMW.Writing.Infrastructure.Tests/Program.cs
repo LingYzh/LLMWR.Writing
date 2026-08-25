@@ -44,6 +44,7 @@ internal static partial class Program
             RunWp17DocxAdapterTests();
             RunWp18LocalHistoryInfrastructureTests();
             RunWp19GitWatcherInfrastructureTests();
+            RunWp20ProjectPackageInfrastructureTests();
             if (!OperatingSystem.IsWindows())
             {
                 throw new InvalidOperationException("WP10 Windows sandbox tests cannot be skipped on a non-Windows runner.");

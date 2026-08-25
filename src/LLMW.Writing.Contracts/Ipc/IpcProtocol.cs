@@ -255,6 +255,15 @@ public static class IpcErrorCodes
     public const string GitUserIdentityUnavailable = "GIT_USER_IDENTITY_UNAVAILABLE";
     public const string GitMutationDenied = "GIT_MUTATION_DENIED";
     public const string GitBackendFailure = "GIT_BACKEND_FAILURE";
+    public const string PackageProjectBindingInvalid = "PACKAGE_PROJECT_BINDING_INVALID";
+    public const string PackageMutationDenied = "PACKAGE_MUTATION_DENIED";
+    public const string PackageOperationIdentityConflict = "PACKAGE_OPERATION_IDENTITY_CONFLICT";
+    public const string PackageAcceptedSnapshotInvalid = "PACKAGE_ACCEPTED_SNAPSHOT_INVALID";
+    public const string PackageAcceptedSnapshotNotFound = "PACKAGE_ACCEPTED_SNAPSHOT_NOT_FOUND";
+    public const string PackageStorageFailure = "PACKAGE_STORAGE_FAILURE";
+    public const string PackageNotFound = "PACKAGE_NOT_FOUND";
+    public const string PackageNotFinal = "PACKAGE_NOT_FINAL";
+    public const string PackageVerificationFailed = "PACKAGE_VERIFICATION_FAILED";
 }
 
 public static class IpcServerCapabilities
