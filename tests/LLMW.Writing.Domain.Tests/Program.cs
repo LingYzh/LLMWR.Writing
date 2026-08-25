@@ -48,6 +48,7 @@ internal static partial class Program
             RunWp14DomainTests();
             RunWp20ProjectPackageDomainTests();
             RunWp21ExtensionDomainTests();
+            RunWp22RecoveryDomainTests();
 
             Console.WriteLine($"Domain Authority FSM tests passed ({PassedTests.Count}).");
             foreach (var test in PassedTests)

@@ -5,6 +5,7 @@ using LLMW.Writing.Application.History;
 using LLMW.Writing.Application.Ipc;
 using LLMW.Writing.Application.Provider;
 using LLMW.Writing.Application.ProjectPackages;
+using LLMW.Writing.Application.Recovery;
 using LLMW.Writing.Application.Runtime;
 using LLMW.Writing.Application.Security;
 using LLMW.Writing.Application.Security.Sandbox;
@@ -12,11 +13,14 @@ using LLMW.Writing.Application.Watcher;
 using LLMW.Writing.Contracts.Ipc;
 using LLMW.Writing.Domain.Runtime;
 using LLMW.Writing.Infrastructure.FileSystem;
+using LLMW.Writing.Infrastructure.Authority;
+using LLMW.Writing.Infrastructure.ChapterAuthority;
 using LLMW.Writing.Infrastructure.Git;
 using LLMW.Writing.Infrastructure.Docx;
 using LLMW.Writing.Infrastructure.Extensions;
 using LLMW.Writing.Infrastructure.Persistence.Sqlite;
 using LLMW.Writing.Infrastructure.ProjectPackages;
+using LLMW.Writing.Infrastructure.Recovery;
 using LLMW.Writing.Infrastructure.Sandbox;
 using LLMW.Writing.Infrastructure.Specialists;
 using LLMW.Writing.Infrastructure.Watcher;
@@ -112,6 +116,29 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
             try
             {
                 var scope = new ProjectScope(bind.ProjectId, workspaceInstanceId);
+                var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
+                var recoveryMaterializer = new ChapterAuthorityMaterializer(
+                    bind.DatabasePath,
+                    new AtomicAuthorityMaterializer(bind.CanonicalRoot, blobStore));
+                var authorityTransactions = new AuthorityTransactionCoordinator(
+                    bind.DatabasePath,
+                    blobStore,
+                    recoveryMaterializer);
+                var recovery = new ProjectRecoveryCoordinator(
+                    authorityTransactions,
+                    new SqliteChapterSubmissionRecoveryStore(bind.DatabasePath));
+                var recoveryReport = recovery.RecoverStartup();
+                eventRing.PublishNotice(
+                    "projectRecoveryHealth",
+                    recoveryReport.StableClassification + ";items=" + recoveryReport.Items.Count);
+                foreach (var item in recoveryReport.Items)
+                {
+                    eventRing.PublishNotice(
+                        "projectRecoveryItem",
+                        item.StableClassification + ";transactionId=" + item.TransactionId +
+                        ";lock=" + (item.HoldsSubmissionLock ? "held" : "released"));
+                }
+
                 var sessionStore = new SqliteRunSessionStore(bind.DatabasePath);
                 var store = new SqliteRuntimeStore(bind.DatabasePath);
                 var sessions = new RunSessionService(sessionStore);
@@ -196,7 +223,6 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                     new Wp20IpcCommandHandler(packages, workspaceInstanceId),
                     new Wp21IpcCommandHandler(extensions, workspaceInstanceId));
                 var pathResolver = new ProjectPathResolver(bind.CanonicalRoot);
-                var blobStore = new ImmutableBlobStore(bind.CanonicalRoot);
                 var selfWrites = new SelfWriteTracker();
                 var draftStore = new DraftFileStore(pathResolver, selfWrites);
                 var localHistory = new LocalHistoryService(

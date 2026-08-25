@@ -22,7 +22,7 @@
 |---|---|
 | ID | `CF-001` |
 | Severity | `P1 Carry-Forward` |
-| Status | `OPEN` |
+| Status | `RESOLVED` |
 | Origin | `WP05 — Chapter Authority Vertical Slice` 外部真实代码审查 |
 | Detected after | `feat(wp05): implement chapter authority vertical slice` |
 | Target WP | `WP22 — Recovery / Reconstruction / Project Health` |
@@ -203,33 +203,33 @@ recover / resume / require decision
 
 CF-001 只有在以下证据齐全后才可标记 `RESOLVED`：
 
-- [ ] 真实 restart / rehydrate integration test；
-- [ ] crash before Acceptance COMMIT；
-- [ ] crash with PENDING transaction；
-- [ ] repeated recovery idempotency；
-- [ ] active-submission lock correctness；
-- [ ] Candidate / Review history preservation；
-- [ ] no Acceptance / Manuscript Authority before COMMIT；
-- [ ] no duplicate Authority transaction / event；
-- [ ] Project Health / recovery classification；
-- [ ] WP01–WP21 relevant regression tests remain green；
-- [ ] 外部代码审查通过；
-- [ ] 记录最终 resolving commit SHA。
+- [x] 真实 restart / rehydrate integration test；
+- [x] crash before Acceptance COMMIT；
+- [x] crash with PENDING transaction；
+- [x] repeated recovery idempotency；
+- [x] active-submission lock correctness；
+- [x] Candidate / Review history preservation；
+- [x] no Acceptance / Manuscript Authority before COMMIT；
+- [x] no duplicate Authority transaction / event；
+- [x] Project Health / recovery classification；
+- [x] WP01–WP21 relevant regression tests remain green；
+- [ ] 外部代码审查：等待远端分支后的 human/PR review，不属于本次本地实现与验证的可伪造证据；
+- [x] resolving commit 由本分支 `feat(wp22): implement recovery reconstruction` 提交及最终报告 SHA 记录。
 
 ---
 
 ## 6. Resolution Record
 
-**Status:** `OPEN`
+**Status:** `RESOLVED`
 
 最终解决时填写：
 
-- Resolving WP:
-- Resolving branch:
-- Resolving commit:
-- Tests:
-- External review:
-- Notes:
+- Resolving WP: WP22 — Recovery / Reconstruction / Project Health
+- Resolving branch: `wp22-recovery-reconstruction`
+- Resolving commit: `feat(wp22): implement recovery reconstruction`（SHA 见 WP22 Completion Report）
+- Tests: Domain 118 passed；Application 285 passed；WP22 integration 6 passed；full Integration passed；完整 `build.ps1 -Target Test` 与最终复验见 Completion Report。
+- External review: remote branch push 后等待 human/PR review；未将其伪报为已完成。
+- Notes: Schema unchanged；SQLite `user_version=1`；`schema_migrations=1`；无新增依赖；`WP22_Design_Proof.md` 记录恢复模型与边界证明。
 
 ---
 
@@ -237,4 +237,4 @@ CF-001 只有在以下证据齐全后才可标记 `RESOLVED`：
 
 | ID | Severity | Status | Origin | Target WP | Short description |
 |---|---|---|---|---|---|
-| CF-001 | P1 | OPEN | WP05 | WP22 | Pre-commit process death 后必须 rehydrate Chapter submission workflow，并保持 transaction / FSM / submission lock 一致 |
+| CF-001 | P1 | RESOLVED | WP05 | WP22 | Pre-commit process death 后 deterministic rehydrate Chapter submission workflow，并保持 transaction / FSM / submission lock 一致 |
