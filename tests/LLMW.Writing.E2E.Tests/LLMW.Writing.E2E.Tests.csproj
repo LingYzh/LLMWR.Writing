@@ -1,5 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
+    <OutputType>Exe</OutputType>
     <AssemblyName>LLMW.Writing.E2E.Tests</AssemblyName>
     <RootNamespace>LLMW.Writing.E2E.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
@@ -7,5 +8,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\LLMW.Writing.Contracts\LLMW.Writing.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\LLMW.Writing.Application\LLMW.Writing.Application.csproj" />
+    <ProjectReference Include="..\..\src\LLMW.Writing.Infrastructure\LLMW.Writing.Infrastructure.csproj" />
   </ItemGroup>
 </Project>

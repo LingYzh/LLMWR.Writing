@@ -46,11 +46,12 @@ internal sealed class ProcessBootstrapper
         string primaryBootstrapToken,
         string? secondaryBootstrapToken)
     {
-        var startInfo = new ProcessStartInfo("dotnet", $"\"{assemblyPath}\"")
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
+        var isManagedAssembly = string.Equals(Path.GetExtension(assemblyPath), ".dll", StringComparison.OrdinalIgnoreCase);
+        var startInfo = isManagedAssembly
+            ? new ProcessStartInfo("dotnet", $"\"{assemblyPath}\"")
+            : new ProcessStartInfo(assemblyPath);
+        startInfo.UseShellExecute = false;
+        startInfo.CreateNoWindow = true;
         startInfo.Environment["LLMW_WORKSPACE_INSTANCE_ID"] = workspaceInstanceId;
         startInfo.Environment["LLMW_RUNTIME_BOOTSTRAP_TOKEN"] = primaryBootstrapToken;
         if (secondaryBootstrapToken is not null)
@@ -58,6 +59,8 @@ internal sealed class ProcessBootstrapper
             startInfo.Environment["LLMW_UI_BOOTSTRAP_TOKEN"] = primaryBootstrapToken;
             startInfo.Environment["LLMW_RUNTIME_BOOTSTRAP_TOKEN"] = secondaryBootstrapToken;
         }
+
+        startInfo.Environment["LLMW_APPLICATION_DATA_ROOT"] = DistributionLayout.ApplicationDataRoot;
 
         return Process.Start(startInfo) ?? throw new InvalidOperationException("A process shell did not start.");
     }

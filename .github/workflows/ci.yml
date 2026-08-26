@@ -51,6 +51,16 @@ jobs:
         shell: pwsh
         run: ./.github/scripts/run-hosted-gate.ps1 -Gate Core -Configuration Release
 
+      - name: Upload build and unit-test evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hosted-core-build-and-tests
+          path: |
+            .artifacts/build/
+            .artifacts/test-results/
+          if-no-files-found: error
+
   integration-tests:
     name: Hosted Integration Tests
     runs-on: windows-latest
@@ -73,3 +83,63 @@ jobs:
       - name: Run hosted release integration gate
         shell: pwsh
         run: ./.github/scripts/run-hosted-gate.ps1 -Gate Integration -Configuration Release
+
+      - name: Upload integration-test evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: hosted-integration-tests
+          path: .artifacts/test-results/
+          if-no-files-found: error
+
+  release-packages:
+    name: MSIX Portable Release Gate
+    needs: [core-tests, integration-tests]
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup .NET from global.json
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+
+      - name: Verify controlled native Git runtime
+        shell: pwsh
+        run: ./eng/native/verify-libgit2sharp-nativebinaries.ps1
+
+      - name: Build and verify MSIX and Portable packages
+        shell: pwsh
+        env:
+          LLMW_MSIX_SIGNING_CERT_PATH: ${{ secrets.LLMW_MSIX_SIGNING_CERT_PATH }}
+          LLMW_MSIX_SIGNING_CERT_PASSWORD: ${{ secrets.LLMW_MSIX_SIGNING_CERT_PASSWORD }}
+        run: ./build.ps1 -Target Package -Configuration Release
+
+      - name: Enforce performance baseline
+        shell: pwsh
+        run: ./eng/performance/Measure-Wp23.ps1
+
+      - name: Upload release packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: wp23-release-packages
+          path: .artifacts/release/
+          if-no-files-found: error
+
+      - name: Upload package, E2E, and performance evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: wp23-release-evidence
+          path: |
+            .artifacts/test-results/
+            .artifacts/performance/
+          if-no-files-found: error

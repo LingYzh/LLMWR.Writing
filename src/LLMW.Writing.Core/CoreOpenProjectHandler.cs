@@ -144,19 +144,13 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                 var sessions = new RunSessionService(sessionStore);
                 var extensionCatalog = new FileExtensionCatalog(new ExtensionCatalogRoots(
                     Path.Combine(AppContext.BaseDirectory, "extensions"),
-                    Path.Combine(
-                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                        "LLMW.Writing",
-                        "extensions"),
+                    Path.Combine(ApplicationDataRoot.Resolve(), "extensions"),
                     Path.Combine(bind.CanonicalRoot, "Extensions"),
                     bind.CanonicalRoot));
                 var extensionService = new ExtensionActivationService(
                     extensionCatalog,
                     new FileExtensionSecurityStateStore(
-                        Path.Combine(
-                            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                            "LLMW.Writing",
-                            "extension-security"),
+                        Path.Combine(ApplicationDataRoot.Resolve(), "extension-security"),
                         bind.ProjectId.ToString("D"),
                         bind.CanonicalRoot),
                     bind.ProjectId.ToString("D"));
@@ -188,10 +182,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                     authorization,
                     bindings: bindings,
                     sessions: sessions);
-                var userLibraryRoot = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "LLMW.Writing",
-                    "user-specialists");
+                var userLibraryRoot = Path.Combine(ApplicationDataRoot.Resolve(), "user-specialists");
                 var wp13 = new Wp13RuntimeService(
                     store,
                     scheduler,
@@ -243,8 +234,7 @@ internal sealed class CoreOpenProjectHandler : IIpcApplicationCommandHandler, ID
                 gitProjects.PublishOnce(git);
                 publishedGit = git;
                 var externalPackageRoot = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "LLMW.Writing",
+                    ApplicationDataRoot.Resolve(),
                     "backups",
                     bind.ProjectId.ToString("D"));
                 var packageService = new ProjectPackageService(

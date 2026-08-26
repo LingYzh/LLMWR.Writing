@@ -22,6 +22,15 @@ internal static class HostProcessLocator
             return true;
         }
 
+        var packagedCore = Path.Combine(AppContext.BaseDirectory, "core", "LLMW.Writing.Core.exe");
+        var packagedRuntime = Path.Combine(AppContext.BaseDirectory, "runtime", "LLMW.Writing.AgentRuntime.exe");
+        if (File.Exists(packagedCore) && File.Exists(packagedRuntime))
+        {
+            coreAssembly = packagedCore;
+            runtimeAssembly = packagedRuntime;
+            return true;
+        }
+
         var configuration = InferConfiguration(AppContext.BaseDirectory);
         for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
         {

@@ -27,6 +27,7 @@ internal static class Program
             count += Wp15CorrectivePass3Tests();
             count += Wp15CorrectivePass4Tests();
             count += Wp16UiTests.Run();
+            count += Wp23DistributionTests.Run();
             Console.WriteLine($"UI WebView bridge tests passed ({count}).");
             return 0;
         }

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "targetHardware": "Windows laptop, i5-class, 16GB RAM, SSD",
+  "recommendedProjectScale": "up to 200 chapters / 50MB prose",
+  "thresholdsMs": {
+    "coldStartup": 5000,
+    "warmStartup": 5000,
+    "coldCoreReady": 5000,
+    "warmCoreReady": 5000,
+    "projectOpen": 5000,
+    "startupRecoveryOverhead": 1500,
+    "migration": 3000
+  },
+  "regressionPolicy": "Every measured value must remain at or below its committed threshold; correctness and recovery tests remain release-blocking regardless of timing."
+}

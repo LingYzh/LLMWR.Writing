@@ -133,10 +133,7 @@ internal static class WebViewUserDataFolder
     public const string WebViewFolder = "WebView2";
 
     public static string Resolve()
-        => Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            CompanyFolder,
-            WebViewFolder);
+        => Path.Combine(DistributionLayout.ApplicationDataRoot, WebViewFolder);
 }
 
 internal sealed class RendererAssetLayout
