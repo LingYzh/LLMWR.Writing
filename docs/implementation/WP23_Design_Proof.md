@@ -38,7 +38,7 @@ All WP23 release entry points force the repository-controlled NuGet cache and ve
 - Minimum OS: Windows 10 1809 (`10.0.17763.0`)
 - Desktop runtime: `packagedClassicApp`, `mediumIL`
 - Lifecycle verification: isolated random test identity, clean install of `0.0.9.0`, upgrade to the current package version, package activation, packaged-payload project workflow, and uninstall.
-- Release signing: optional `LLMW_MSIX_SIGNING_CERT_PATH` / `LLMW_MSIX_SIGNING_CERT_PASSWORD`; signing material is read only by CI/release packaging and is never added to the repository, package payload, environment of Core/Runtime/Worker, logs, or renderer.
+- Release signing: optional `LLMW_MSIX_SIGNING_CERT_PATH` / `LLMW_MSIX_SIGNING_CERT_PASSWORD`. The packaging PowerShell process immediately converts the environment password to `SecureString` and clears its plaintext environment/local reference before starting child processes. It imports the PFX temporarily into `Cert:\CurrentUser\My`, validates private key, Code Signing EKU, validity, and exact Subject/manifest Publisher equality, signs by thumbprint, verifies the signature, and removes only certificate entries introduced by that invocation. SignTool receives no password. Signing material is never added to the repository, package payload, Core/Runtime/Worker environment, logs, renderer, or release manifest.
 
 Capability: `runFullTrust`
 
@@ -87,6 +87,7 @@ The existing `Windows Sandbox Security` workflow remains the mandatory self-host
 5. a fresh file-backed project: migration, Core start, authenticated UI/Runtime IPC, Project open, workflow/run/task creation;
 6. a seeded pre-commit transaction: startup recovery convergence without Authority fabrication;
 7. `PRAGMA user_version = 1` and `schema_migrations = 1`.
+8. certificate-store signing, exact Publisher/Subject validation, signature verification, introduced-certificate cleanup, pre-existing-certificate preservation, and a source regression guard against SignTool `/p`.
 
 ## 6. Performance baseline and regression detection
 

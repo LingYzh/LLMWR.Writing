@@ -90,7 +90,9 @@ function Assert-UiLaunch {
 
 $manifestPath = Join-Path $ReleaseRoot 'release-manifest.json'
 Assert-True (Test-Path -LiteralPath $manifestPath) "Release manifest is missing: $manifestPath"
-$release = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$releaseJson = Get-Content -LiteralPath $manifestPath -Raw
+Assert-True (-not ($releaseJson -match '(?i)password|secret|certificatePath')) 'Release manifest contains signing credential metadata.'
+$release = $releaseJson | ConvertFrom-Json
 $portableArtifact = $release.artifacts | Where-Object { $_.name -like '*-portable.zip' } | Select-Object -First 1
 $msixArtifact = $release.artifacts | Where-Object { $_.name -like '*.msix' } | Select-Object -First 1
 Assert-True ($null -ne $portableArtifact) 'Portable artifact is absent from release-manifest.json.'
@@ -127,6 +129,13 @@ $capabilities = @($appxManifest.SelectNodes('/f:Package/f:Capabilities/*', $name
 Assert-True ($capabilities.Count -eq 1 -and $capabilities[0] -eq 'rescap:Capability:runFullTrust') 'MSIX capability declaration changed or escalated.'
 Assert-True (-not ($appxManifest.OuterXml -match 'broadFileSystemAccess|internetClient|documentsLibrary|picturesLibrary|videosLibrary')) 'MSIX declares a forbidden filesystem/network/library capability.'
 Assert-True (-not (Test-Path -LiteralPath (Join-Path $unpacked 'portable.marker'))) 'MSIX must use installed application-data semantics, not portable mode.'
+Assert-True (@(Get-ChildItem -LiteralPath $unpacked -Recurse -Filter '*.pfx' -File).Count -eq 0) 'MSIX payload contains a PFX file.'
+$signTool = Find-WindowsSdkTool 'signtool.exe'
+& (Join-Path $PSScriptRoot 'Test-Wp23SigningSecurity.ps1') `
+    -MsixPath $msix `
+    -ManifestPath (Join-Path $unpacked 'AppxManifest.xml') `
+    -SignToolPath $signTool `
+    -WorkRoot (Join-Path $workRoot 'signing-security')
 
 $lifecycle = 'skipped'
 if (-not $SkipInstallLifecycle) {
@@ -208,6 +217,8 @@ if (-not $SkipInstallLifecycle) {
     portableLaunch = 'passed'
     packagedRuntimeWorkflow = 'passed'
     msixManifestSecurity = 'passed'
+    signingSecurity = 'passed'
+    unsignedPackaging = if ($release.signed) { 'not-applicable-explicit-signing-input' } else { 'passed' }
     msixLifecycle = $lifecycle
     userVersion = (Get-Content -LiteralPath $e2eOutput -Raw | ConvertFrom-Json).userVersion
     migrationCount = (Get-Content -LiteralPath $e2eOutput -Raw | ConvertFrom-Json).migrationCount

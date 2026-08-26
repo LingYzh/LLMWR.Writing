@@ -10,9 +10,7 @@ param(
 
     [string]$OutputRoot,
 
-    [string]$SigningCertificatePath,
-
-    [string]$SigningCertificatePassword
+    [string]$SigningCertificatePath
 )
 
 Set-StrictMode -Version Latest
@@ -21,6 +19,17 @@ $ErrorActionPreference = 'Stop'
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $controlledPackageRoot = Join-Path $repositoryRoot '.artifacts\nuget-packages-wp19-native-8099'
 $env:NUGET_PACKAGES = $controlledPackageRoot
+$signingPassword = $null
+$plainSigningPassword = [Environment]::GetEnvironmentVariable('LLMW_MSIX_SIGNING_CERT_PASSWORD')
+try {
+    if (-not [string]::IsNullOrWhiteSpace($plainSigningPassword)) {
+        $signingPassword = ConvertTo-SecureString $plainSigningPassword -AsPlainText -Force
+    }
+}
+finally {
+    Remove-Item Env:LLMW_MSIX_SIGNING_CERT_PASSWORD -ErrorAction SilentlyContinue
+    $plainSigningPassword = $null
+}
 $nativeAudit = Get-Content -LiteralPath (Join-Path $repositoryRoot 'eng\native\LibGit2Sharp.NativeBinaries.audit.json') -Raw | ConvertFrom-Json
 $controlledNativePackage = Join-Path $controlledPackageRoot 'libgit2sharp.nativebinaries\2.0.324'
 $cachedNative = Join-Path $controlledNativePackage 'runtimes\win-x64\native\git2-5853918.dll'
@@ -30,8 +39,16 @@ if ((Test-Path -LiteralPath $cachedNative) -and
 }
 if ([string]::IsNullOrWhiteSpace($SigningCertificatePath) -and -not [string]::IsNullOrWhiteSpace($env:LLMW_MSIX_SIGNING_CERT_PATH)) {
     $SigningCertificatePath = $env:LLMW_MSIX_SIGNING_CERT_PATH
-    $SigningCertificatePassword = $env:LLMW_MSIX_SIGNING_CERT_PASSWORD
 }
+if ([string]::IsNullOrWhiteSpace($SigningCertificatePath) -and $null -ne $signingPassword) {
+    $signingPassword.Dispose()
+    $signingPassword = $null
+    throw 'An MSIX signing password was supplied without a signing certificate path.'
+}
+if (-not [string]::IsNullOrWhiteSpace($SigningCertificatePath) -and $null -eq $signingPassword) {
+    throw 'An MSIX signing certificate path requires LLMW_MSIX_SIGNING_CERT_PASSWORD.'
+}
+try {
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $repositoryRoot '.artifacts\release'
 }
@@ -175,10 +192,14 @@ if (-not [string]::IsNullOrWhiteSpace($SigningCertificatePath)) {
         throw "Signing certificate not found: $SigningCertificatePath"
     }
     $signTool = Find-WindowsSdkTool 'signtool.exe'
-    & $signTool sign /fd SHA256 /f $SigningCertificatePath /p $SigningCertificatePassword $msixPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "MSIX signing failed with exit code $LASTEXITCODE. Signing arguments are redacted."
-    }
+    . (Join-Path $PSScriptRoot 'Wp23Signing.ps1')
+    Invoke-Wp23MsixSigning `
+        -MsixPath $msixPath `
+        -ManifestPath (Join-Path $msixStage 'AppxManifest.xml') `
+        -PfxPath $SigningCertificatePath `
+        -PfxPassword $signingPassword `
+        -SignToolPath $signTool
+    $signingPassword = $null
 }
 
 $artifacts = @($portableZip, $msixPath) | ForEach-Object {
@@ -203,3 +224,12 @@ $releaseManifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path
 Write-Host "MSIX: $msixPath"
 Write-Host "Portable: $portableZip"
 Write-Host "Release manifest: $(Join-Path $OutputRoot 'release-manifest.json')"
+}
+finally {
+    Remove-Item Env:LLMW_MSIX_SIGNING_CERT_PASSWORD -ErrorAction SilentlyContinue
+    $plainSigningPassword = $null
+    if ($null -ne $signingPassword) {
+        $signingPassword.Dispose()
+        $signingPassword = $null
+    }
+}

@@ -187,8 +187,7 @@ function Invoke-IntegrationTests {
 
 function Invoke-Package {
     $packageScript = Join-Path $repositoryRoot 'eng\packaging\New-Wp23Packages.ps1'
-    $arguments = @('-NoProfile', '-File', $packageScript, '-Configuration', $Configuration)
-    Invoke-CheckedCommand -FilePath 'pwsh' -Arguments $arguments
+    & $packageScript -Configuration $Configuration
 
     $testScript = Join-Path $repositoryRoot 'eng\packaging\Test-Wp23Packages.ps1'
     Invoke-CheckedCommand -FilePath 'pwsh' -Arguments @('-NoProfile', '-File', $testScript) -LogPath (Join-Path $testResultRoot 'package.log')
