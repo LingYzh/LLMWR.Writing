@@ -159,10 +159,26 @@ if (-not $SkipInstallLifecycle) {
         $installed = Get-AppxPackage -Name $testIdentity
         Assert-True ($null -ne $installed -and $installed.Version.ToString() -eq $release.packageVersion) 'MSIX upgrade did not replace the lower test version.'
 
-        Invoke-Checked 'dotnet' @(
-            'run', '--project', (Join-Path $repositoryRoot 'tests\LLMW.Writing.E2E.Tests\LLMW.Writing.E2E.Tests.csproj'),
-            '--configuration', 'Release', '--', '--runtime-root', $installed.InstallLocation,
-            '--output', (Join-Path $repositoryRoot '.artifacts\test-results\wp23-msix-runtime.json'))
+        $installedEvidence = Join-Path $repositoryRoot '.artifacts\test-results\wp23-msix-runtime.json'
+        $installedResult = Join-Path $repositoryRoot '.artifacts\test-results\wp23-msix-command-result.json'
+        Remove-Item -LiteralPath $installedEvidence, $installedResult -Force -ErrorAction SilentlyContinue
+        $installedRunner = Join-Path $PSScriptRoot 'Invoke-Wp23InstalledE2E.ps1'
+        $runnerArguments = '-NoProfile -File "{0}" -RuntimeRoot "{1}" -OutputPath "{2}" -ResultPath "{3}"' -f `
+            $installedRunner, $installed.InstallLocation, $installedEvidence, $installedResult
+        Invoke-CommandInDesktopPackage `
+            -PackageFamilyName $installed.PackageFamilyName `
+            -AppId 'App' `
+            -Command (Get-Command pwsh).Source `
+            -Args $runnerArguments `
+            -PreventBreakaway
+        $installedDeadline = [DateTime]::UtcNow.AddSeconds(90)
+        while ([DateTime]::UtcNow -lt $installedDeadline -and -not (Test-Path -LiteralPath $installedResult)) {
+            Start-Sleep -Milliseconds 250
+        }
+        Assert-True (Test-Path -LiteralPath $installedResult) 'Installed-payload E2E did not report completion from the package context.'
+        $installedCommand = Get-Content -LiteralPath $installedResult -Raw | ConvertFrom-Json
+        Assert-True ($installedCommand.status -eq 'passed') "Installed-payload E2E failed in package context: $($installedCommand.failure)"
+        Assert-True (Test-Path -LiteralPath $installedEvidence) 'Installed-payload E2E did not write runtime evidence.'
 
         $existingIds = @(Get-Process -Name 'LLMW.Writing.UI' -ErrorAction SilentlyContinue | ForEach-Object Id)
         Start-Process explorer.exe -ArgumentList "shell:AppsFolder\$($installed.PackageFamilyName)!App"

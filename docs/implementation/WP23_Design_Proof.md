@@ -83,7 +83,7 @@ The existing `Windows Sandbox Security` workflow remains the mandatory self-host
 1. release-manifest SHA-256 for both artifacts;
 2. Portable extraction, launch, child-process layout, data root, and no MSIX identity;
 3. MSIX unpack/manifest validation and exact capability allowlist;
-4. isolated install, upgrade, activation, installed-payload workflow, and uninstall on an elevated Windows release runner;
+4. isolated install, upgrade, activation, installed-payload workflow in the package identity context, and uninstall on an elevated Windows release runner;
 5. a fresh file-backed project: migration, Core start, authenticated UI/Runtime IPC, Project open, workflow/run/task creation;
 6. a seeded pre-commit transaction: startup recovery convergence without Authority fabrication;
 7. `PRAGMA user_version = 1` and `schema_migrations = 1`.
